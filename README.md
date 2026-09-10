@@ -1,9 +1,13 @@
 # rusidian
 
-Real TikZ and LaTeX rendering inside Neovim, without the terminal graphics protocol.
+A local-first native Markdown app powered by real Neovim.
 
-> **Status: pre-implementation.** There is no code yet. This README describes what is being
-> built and, just as importantly, what is not. The 26-week roadmap lives in `PLAN.html`.
+> **Direction update (2026-09-10):** [`PRODUCT.md`](PRODUCT.md) is the current product decision
+> record, and the GUI framework is not decided. The renderer-first proposal below is retained
+> as historical design input and must not be treated as the current product scope.
+
+> **Status: pre-implementation.** The repository contains only a minimal Cargo bootstrap; no
+> product architecture is implemented. The historical 26-week roadmap lives in `PLAN.html`.
 
 ## The problem
 

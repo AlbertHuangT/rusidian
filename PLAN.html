@@ -325,8 +325,17 @@
 
 <div class="wrap">
 
+  <section>
+    <div class="col">
+      <div class="callout warn">
+        <p class="eyebrow">历史计划提示 · 2026-09-10</p>
+        <p>产品方向已经扩展为本地原生 Markdown 桌面应用，当前决定见 <a href="PRODUCT.md"><code>PRODUCT.md</code></a>。GUI 框架尚未决定；下文的 GPUI 路线仅保留为候选方案和历史学习计划。</p>
+      </div>
+    </div>
+  </section>
+
   <header class="mast">
-    <p class="eyebrow">建造路线 · 26 周</p>
+    <p class="eyebrow">建造路线 · 26 周 · 第 2 版</p>
     <h1>Rusidian</h1>
     <p class="thesis">
       把图形协议从<b>终端转义序列</b>，改成走 <b>Neovim RPC</b>。
@@ -336,10 +345,20 @@
       <div class="fact"><dt>投入</dt><dd>15–20 h / 周</dd></div>
       <div class="fact"><dt>周期</dt><dd>26 周</dd></div>
       <div class="fact"><dt>总预算</dt><dd>390–520 h</dd></div>
-      <div class="fact"><dt>Rust 起点</dt><dd>零</dd></div>
+      <div class="fact"><dt>起点</dt><dd>C 底子 · Rust 零</dd></div>
       <div class="fact"><dt>验收语料</dt><dd>248 篇 / 498 MB</dd></div>
     </dl>
   </header>
+
+  <section>
+    <div class="col">
+      <div class="callout warn">
+        <p class="eyebrow">第 2 版改了什么</p>
+        <p><strong>里程碑顺序倒过来了。</strong> 原计划先写 Markdown 解析（M1）、最后做 GUI。实际动手后确认：解析那部分对你没有吸引力，而<strong>动力是单人半年项目里最稀缺的资源</strong>。所以先做看得见的那一半。</p>
+        <p>另外修正三处旧判断：GPUI 文档不再稀薄（已有教程和两本社区书）；装 TeX 应为 tectonic 而非 MacTeX；nvim 的 <code>ui.txt</code> 已更名 <code>api-ui-events.txt</code>。</p>
+      </div>
+    </div>
+  </section>
 
   <section>
     <div class="col">
@@ -358,15 +377,13 @@
       <p>
         但同一个事实也是警告：一个有多名维护者的成熟项目多年没做成，说明难点不在"把图画出来"，
         而在<strong>滚动、折叠、分屏、缩放时让图始终待在正确的位置</strong>。
-        这是你真正要解决的问题，请从第一天起就这么理解它。
       </p>
 
       <h3>第二个差异化点，几乎是免费的</h3>
       <p>
         预览和 PDF 导出可以共用同一个 TeX 引擎、同一份 preamble——
         <strong>所见即所得不是靠对齐两套渲染器，而是结构上只有一套</strong>。
-        Obsidian 永远做不到：它预览用 MathJax、导出用 Chromium 的 printToPDF，
-        这正是你遇到的导出与预览不一致的根因。
+        Obsidian 永远做不到：它预览用 MathJax、导出用 Chromium 的 printToPDF。
       </p>
     </div>
 
@@ -376,44 +393,33 @@
           <rect class="d-lane" x="8"   y="8" width="704" height="80"  rx="3"/>
           <rect class="d-lane" x="8"   y="110" width="704" height="86" rx="3"/>
           <rect class="d-lane" x="8"   y="218" width="704" height="72" rx="3"/>
-
           <text class="d-t-s" x="20" y="26">NEOVIM · LUA</text>
           <text class="d-t-s" x="20" y="128">RUST 引擎 · 独立进程</text>
           <text class="d-t-s" x="20" y="236">渲染层 · GPU</text>
-
           <rect class="d-box" x="150" y="34" width="150" height="40" rx="3"/>
           <text class="d-t" x="225" y="52" text-anchor="middle">treesitter 定位</text>
           <text class="d-t-s" x="225" y="66" text-anchor="middle">tikz / $$ 块</text>
-
           <rect class="d-box" x="330" y="34" width="160" height="40" rx="3"/>
           <text class="d-t" x="410" y="52" text-anchor="middle">extmark 预留</text>
           <text class="d-t-s" x="410" y="66" text-anchor="middle">virt_lines + 视口</text>
-
           <rect class="d-box-a" x="520" y="34" width="150" height="40" rx="3"/>
           <text class="d-t" x="595" y="58" text-anchor="middle">RPC 通知</text>
-
           <rect class="d-box" x="90" y="136" width="140" height="44" rx="3"/>
           <text class="d-t" x="160" y="154" text-anchor="middle">内容哈希</text>
           <text class="d-t-s" x="160" y="168" text-anchor="middle">源码 + preamble</text>
-
           <rect class="d-box" x="262" y="136" width="130" height="44" rx="3"/>
           <text class="d-t" x="327" y="154" text-anchor="middle">缓存查找</text>
           <text class="d-t-s" x="327" y="168" text-anchor="middle">XDG cache</text>
-
           <rect class="d-box-a" x="424" y="136" width="140" height="44" rx="3"/>
           <text class="d-t" x="494" y="154" text-anchor="middle">tectonic 编译</text>
           <text class="d-t-s" x="494" y="168" text-anchor="middle">异步 · 非阻塞</text>
-
           <rect class="d-box" x="596" y="136" width="96" height="44" rx="3"/>
           <text class="d-t" x="644" y="154" text-anchor="middle">→ SVG</text>
           <text class="d-t-s" x="644" y="168" text-anchor="middle">pdftocairo</text>
-
           <rect class="d-box" x="240" y="240" width="180" height="38" rx="3"/>
           <text class="d-t" x="330" y="264" text-anchor="middle">按矩形贴图 · resvg</text>
-
           <rect class="d-box" x="452" y="240" width="180" height="38" rx="3"/>
           <text class="d-t" x="542" y="264" text-anchor="middle">滚动时重算位置</text>
-
           <path class="d-line"   d="M300 54 H326" marker-end="url(#ah)"/>
           <path class="d-line"   d="M490 54 H516" marker-end="url(#ah)"/>
           <path class="d-line-a" d="M595 78 V104 H160 V132" marker-end="url(#aha)"/>
@@ -424,7 +430,6 @@
           <path class="d-line"   d="M420 259 H448" marker-end="url(#ah)"/>
           <path class="d-line-a" d="M632 259 H688 V96 H676" marker-end="url(#aha)"/>
           <text class="d-t-a" x="694" y="180" text-anchor="middle" transform="rotate(90 694 180)">视口变化回流</text>
-
           <defs>
             <marker id="ah" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
               <path d="M0,0 L6,3 L0,6 z" fill="var(--muted)"/>
@@ -436,8 +441,8 @@
         </svg>
       </div>
       <figcaption>
-        蓝色是跨进程边界。注意最右侧那条回流线——视口一变就要重算所有图的位置，
-        这条线就是 Neovide 多年没做成这件事的原因。
+        蓝色是跨进程边界。最右侧那条回流线是全项目最难的部分——视口一变就要重算所有图的位置。
+        <strong>第 2 版的路线把它推到了更后面</strong>：先做不含 nvim 的静态渲染，把这条线留到协议阶段。
       </figcaption>
     </figure>
   </section>
@@ -446,7 +451,7 @@
     <div class="col">
       <p class="eyebrow">已定</p>
       <h2>决策记录</h2>
-      <p class="lede">四轮追问的结论。每条都是可以推翻的，但推翻时要知道自己在推翻什么。</p>
+      <p class="lede">四轮追问加动手后的修订。每条都可以推翻，但推翻时要知道自己在推翻什么。</p>
     </div>
     <div class="tablewrap">
       <table>
@@ -454,23 +459,18 @@
           <tr><th scope="col">决策</th><th scope="col">结论</th><th scope="col">理由 / 代价</th></tr>
         </thead>
         <tbody>
+          <tr><td>能力顺序</td><td><strong>a → b → c → d</strong>（第 2 版改）</td><td>原为 a→c→b→d，理由是 GPUI 文档稀薄、Rust 不牢会卡在编译器上。前者已不成立；后者仍成立，但可以通过 GUI 项目来学，不必通过 parser。<strong>动力是更稀缺的资源。</strong></td></tr>
+          <tr><td>M1 的内部顺序</td><td>先做"编译并显示"，后做"从 markdown 里找块"</td><td>M1 本是两半：解析 + 渲染。渲染那半有视觉反馈、且不含 nvim 协议，是更好的起点。解析没取消，只是后移。</td></tr>
           <tr><td>渲染范围</td><td>TikZ 块 + <code>$$</code> 块级公式</td><td>两者共用同一条管线，增量成本近零而使用频率高十倍。明确不做 <code>$…$</code> 行内——难点是基线对齐而非解析。</td></tr>
           <tr><td>Markdown 样式</td><td>全部委托 nvim 插件</td><td>粗体、斜体、标题高亮不属于你的问题域。</td></tr>
-          <tr><td>TeX 引擎</td><td>tectonic 优先，trait 抽象 + 系统 TeX fallback</td><td>是 Rust crate、自包含、按需下载宏包，安装说明从「先装 5GB MacTeX」变成「下载即用」。代价：XeTeX 基座、shell-escape 受限。第一周必须实测三个宏包。</td></tr>
-          <tr><td>PDF 导出</td><td>pandoc 转结构，preamble 你自己拥有</td><td>不写导出器，但拥有 preamble——一致性成为结构性保证。自己写 Markdown→PDF 是几百小时且零差异化。</td></tr>
-          <tr><td>wikilink / 索引</td><td>自己写</td><td>理由是学习、图谱依赖这张链接表、进程隔离不卡编辑器。<strong>不是性能</strong>——248 篇笔记下 LuaJIT 和 Rust 都是毫秒级。</td></tr>
-          <tr><td>Vault 兼容</td><td>完全兼容 Obsidian-flavored</td><td>用你真实的 248 篇 vault 当验收集：有脏数据的真语料比造出来的测试用例值钱。代价是 M1／M2 慢一到两周。</td></tr>
-          <tr><td>架构 A／B／C／D</td><td>推迟到第 16 周再定</td><td>引擎与 Lua 协议插件在四条路里通用且不含 GUI 代码。等你有了真实 Rust 能力和对 RPC 的实感再选，才是有信息的决定。</td></tr>
-          <tr><td>能力顺序</td><td>a → c → b → d</td><td>跳过 a 直接上 GPUI 是这个计划最常见的死法：文档稀薄，报错全是生命周期和 trait bound，基础不牢的人会卡在编译器上失去信心。</td></tr>
-          <tr><td>AI 边界</td><td>已写入 <code>CLAUDE.md</code></td><td>可解释、可 review、可查文档、可诊断报错；不产出你没有逐行理解的实现。每个模块完成后关掉 AI 用自己的话写设计说明。</td></tr>
+          <tr><td>TeX 引擎</td><td>tectonic，trait 抽象 + 系统 TeX fallback</td><td>是 Rust crate、自包含、按需下载宏包。<strong>已实测</strong>：首次运行会下载 LaTeX 基础层并构建 format，之后离线。加宏包时会再来一波。</td></tr>
+          <tr><td>PDF 导出</td><td>pandoc 转结构，preamble 你自己拥有</td><td>不写导出器，但拥有 preamble——一致性成为结构性保证。</td></tr>
+          <tr><td>wikilink / 索引</td><td>自己写</td><td>理由是学习、图谱依赖这张链接表、进程隔离不卡编辑器。<strong>不是性能</strong>。</td></tr>
+          <tr><td>Vault 兼容</td><td>完全兼容 Obsidian-flavored</td><td>用你真实的 248 篇 vault 当验收集。代价是解析阶段慢一到两周。</td></tr>
+          <tr><td>架构 A／B／C／D</td><td>推迟到第 16 周再定</td><td><strong>这条没变，而且第 2 版更重要了。</strong>先做的静态渲染器在四条路里通用；一旦现在动"rusidian 的 GUI"，就等于被迫提前选型。</td></tr>
+          <tr><td>AI 边界</td><td>已写入 <code>CLAUDE.md</code></td><td>可解释、可 review、可查文档、可诊断报错；不产出你没有逐行理解的实现。每个模块完成后关掉 AI 写设计说明。</td></tr>
         </tbody>
       </table>
-    </div>
-    <div class="col">
-      <div class="callout warn">
-        <p class="eyebrow">需要提前接受的心理事实</p>
-        <p>M2 之前，你自己写的 wikilink 索引不会比 obsidian.nvim 好用。这段时间你日常照用 obsidian.nvim，自己那个只在测试里跑。不提前认下这件事，第 10 周你会觉得自己在做无用功。</p>
-      </div>
     </div>
   </section>
 
@@ -478,7 +478,7 @@
     <div class="col">
       <p class="eyebrow">26 周</p>
       <h2>时间与里程碑</h2>
-      <p class="lede">每格一周。深浅表示当周主要投入的能力阶段——重叠是刻意的，c 阶段从第 5 周就开始蹭 a 阶段的练习量。</p>
+      <p class="lede">每格一周。深浅表示当周主要投入的能力阶段——重叠是刻意的，GUI 从第 2 周就开始蹭 Rust 基础的练习量。</p>
     </div>
 
     <div class="track">
@@ -487,46 +487,46 @@
           <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
           <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
         </div>
-        <p class="seg-label"><b>a</b> · 系统 Rust · 1–8</p>
-      </div>
-      <div class="seg seg-c" style="flex-grow:8">
-        <div class="seg-cells">
-          <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
-          <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
-        </div>
-        <p class="seg-label"><b>c</b> · 解析与索引 · 9–16</p>
+        <p class="seg-label"><b>a + b</b> · Rust 基础 与 GUI · 1–8</p>
       </div>
       <div class="seg seg-b" style="flex-grow:8">
         <div class="seg-cells">
           <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
           <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
         </div>
-        <p class="seg-label"><b>b</b> · GUI / GPU · 17–24</p>
+        <p class="seg-label"><b>c</b> · 解析、索引与协议 · 9–16</p>
+      </div>
+      <div class="seg seg-c" style="flex-grow:8">
+        <div class="seg-cells">
+          <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
+          <span class="cell"></span><span class="cell"></span><span class="cell"></span><span class="cell"></span>
+        </div>
+        <p class="seg-label">选定架构后实现 · 17–24</p>
       </div>
       <div class="seg seg-d" style="flex-grow:2">
         <div class="seg-cells">
           <span class="cell"></span><span class="cell"></span>
         </div>
-        <p class="seg-label"><b>d</b> · 25–26</p>
+        <p class="seg-label"><b>d</b> · 发布 · 25–26</p>
       </div>
     </div>
 
     <div class="milestones">
       <article class="ms">
         <div class="ms-top"><span class="ms-id">M1</span><span class="ms-wk">第 8 周</span></div>
-        <h3>能跑的渲染器，没有 GUI</h3>
-        <p>一个 CLI：输入 <code>.md</code>，输出其中所有 TikZ 与 <code>$$</code> 块的 SVG。带内容哈希缓存、预编译 preamble，并且能把 TeX 报错映射回原文行号。</p>
-        <p class="check">验收：可发布到 crates.io</p>
+        <h3>看得见的东西</h3>
+        <p>一个 GPUI 窗口：喂给它一段 <code>.tex</code> 片段，调 tectonic 编译，把结果显示出来，能缩放平移，<strong>文件一改就自动重编译重显示</strong>。输入手写，不含任何 markdown 解析。</p>
+        <p class="check">验收：你自己拿它练 TikZ</p>
       </article>
       <article class="ms">
         <div class="ms-top"><span class="ms-id">M2</span><span class="ms-wk">第 16 周</span></div>
-        <h3>协议跑通，架构定案</h3>
-        <p>nvim Lua 插件 + Rust 后端跑通 RPC：能在临时窗口里正确显示，<strong>且滚动时位置正确</strong>。索引器能完整解析你那 248 篇 vault。</p>
+        <h3>接上 Neovim</h3>
+        <p>Markdown 解析与索引跑通你那 248 篇 vault；Lua 插件与 Rust 后端建立 RPC；能在临时窗口里正确显示，<strong>且滚动时位置正确</strong>。</p>
         <p class="check">验收：此时做 A／D 决策</p>
       </article>
       <article class="ms">
         <div class="ms-top"><span class="ms-id">M3</span><span class="ms-wk">第 26 周</span></div>
-        <h3>可用版本，说得出口</h3>
+        <h3>说得出口</h3>
         <p>选定路线的可用版本、README、安装说明，以及一个能发到 r/neovim 的 demo GIF。</p>
         <p class="check">验收：陌生人能装上并跑通</p>
       </article>
@@ -534,9 +534,9 @@
 
     <div class="col">
       <div class="callout">
-        <p class="eyebrow">止损线</p>
-        <p>如果 M1 到<strong>第 12 周</strong>还没完成，停止项目，回去做两个月纯 Rust 练习再回来。</p>
-        <p>这不是失败，这是止损。半年项目最危险的不是做不完，是第 20 周才发现前 19 周的基础不足以支撑剩下的部分。把这条线写进 README，到时候别跟自己讨价还价。</p>
+        <p class="eyebrow">止损线（已随顺序调整重新锚定）</p>
+        <p>如果到<strong>第 12 周</strong>还显示不出一张编译好的 TikZ 图，停止项目，回去做两个月纯 Rust 练习再回来。</p>
+        <p>这条不因为换了顺序而作废——否则整个计划就没有验收点了。把它写进 README，到时候别跟自己讨价还价。</p>
       </div>
     </div>
   </section>
@@ -547,82 +547,78 @@
       <h2>每个阶段具体要会什么</h2>
       <p class="lede">
         标记是你当前的起点：<span class="mk mk-new" style="font-family:var(--mono)">全新</span>
-        表示从零，<span class="mk mk-some" style="font-family:var(--mono)">有底</span>
-        表示有相关经验但没系统用过，<span class="mk mk-have" style="font-family:var(--mono)">已有</span>
-        表示可以直接上手。
+        从零，<span class="mk mk-some" style="font-family:var(--mono)">有底</span>
+        有相关经验但没在 Rust 里用过，<span class="mk mk-have" style="font-family:var(--mono)">已有</span>
+        可直接上手。写过 memory allocator 和 C，所以系统概念普遍是"有底"而非"全新"。
       </p>
     </div>
 
     <div class="phases">
       <article class="phase">
-        <div class="phase-hd"><span class="phase-key">a</span><h3>系统级 Rust</h3></div>
-        <p class="wk">第 1–8 周 · 约 120–160 h</p>
-        <p>不要把这八周当成"学完再开工"。第 3 周起就用 M1 当练习场——所有权是在真实代码里被编译器教会的，不是读会的。</p>
+        <div class="phase-hd"><span class="phase-key">a</span><h3>Rust 基础</h3></div>
+        <p class="wk">第 1–8 周 · 与 GUI 并行</p>
+        <p>读 The Book ch1–13，但<strong>读到 ch9 就开工</strong>，ch10–13 边写边补。ch12 只读结构不敲代码。</p>
         <ul class="skills">
-          <li><span class="mk mk-new">全新</span><span>所有权、借用、生命周期</span></li>
-          <li><span class="mk mk-new">全新</span><span>trait 与泛型 —— TeX 引擎抽象就是你的第一个真实用例</span></li>
-          <li><span class="mk mk-new">全新</span><span>错误处理：<code>Result</code>、<code>?</code>、anyhow 用于应用 / thiserror 用于库</span></li>
-          <li><span class="mk mk-new">全新</span><span>智能指针：<code>Box</code>、<code>Arc</code>、<code>Mutex</code></span></li>
-          <li><span class="mk mk-new">全新</span><span>迭代器与闭包 —— 写不出链式迭代说明还没进入状态</span></li>
-          <li><span class="mk mk-some">有底</span><span>子进程管理、路径与文件 IO</span></li>
-          <li><span class="mk mk-new">全新</span><span>测试：单元 / 集成 / 快照测试（渲染器天生适合快照）</span></li>
+          <li><span class="mk mk-new">全新</span><span><strong>所有权、借用、生命周期</strong> —— 唯一真正陌生的东西，C 经验在这里帮不上忙甚至有反作用</span></li>
+          <li><span class="mk mk-new">全新</span><span>trait 与泛型 —— TeX 引擎抽象是第一个真实用例</span></li>
+          <li><span class="mk mk-some">有底</span><span>错误处理：<code>Result</code>、<code>?</code>、anyhow / thiserror</span></li>
+          <li><span class="mk mk-some">有底</span><span>结构体、枚举、集合、模块 —— 概念同 C，语法要熟</span></li>
+          <li><span class="mk mk-new">全新</span><span>迭代器与闭包</span></li>
+          <li><span class="mk mk-new">全新</span><span>测试：单元 / 集成 / 快照</span></li>
         </ul>
         <div class="crates">
           <p class="eyebrow">crates</p>
-          <div class="chips"><span class="chip">anyhow</span><span class="chip">thiserror</span><span class="chip">clap</span><span class="chip">insta</span><span class="chip">tracing</span></div>
+          <div class="chips"><span class="chip">anyhow</span><span class="chip">thiserror</span><span class="chip">clap</span><span class="chip">insta</span></div>
         </div>
       </article>
 
       <article class="phase">
-        <div class="phase-hd"><span class="phase-key">c</span><h3>解析、索引与 TeX 管线</h3></div>
-        <p class="wk">第 5–16 周（与 a 重叠）</p>
-        <p>这是纯逻辑、不含图形的部分，最适合把 Rust 练扎实。也是 M1 与 M2 的主体。</p>
+        <div class="phase-hd"><span class="phase-key">b</span><h3>GUI 与 GPU</h3></div>
+        <p class="wk">第 2–8 周 · M1 的主体</p>
+        <p>五级阶梯，每级都是能跑的完整程序：空窗口 → 显示静态 SVG → 缩放平移 → 调 tectonic → 文件监听自动刷新。</p>
         <ul class="skills">
-          <li><span class="mk mk-new">全新</span><span>Markdown 解析，并<strong>自己扩展 wikilink</strong>（pulldown-cmark 不支持）</span></li>
+          <li><span class="mk mk-new">全新</span><span>GPUI 的 app / window / element 模型与 <code>Context</code></span></li>
+          <li><span class="mk mk-new">全新</span><span>SVG 光栅化（resvg）→ GPU 纹理上传</span></li>
+          <li><span class="mk mk-some">有底</span><span>坐标变换、缩放时重新光栅化</span></li>
+          <li><span class="mk mk-some">有底</span><span>子进程管理，且不阻塞 UI 线程</span></li>
+          <li><span class="mk mk-new">全新</span><span>文件监听与去抖</span></li>
+        </ul>
+        <div class="crates">
+          <p class="eyebrow">crates（GPUI 仍 pre-1.0，版本要钉死）</p>
+          <div class="chips"><span class="chip">gpui</span><span class="chip">gpui-component</span><span class="chip">resvg</span><span class="chip">tiny-skia</span><span class="chip">notify</span></div>
+        </div>
+      </article>
+
+      <article class="phase">
+        <div class="phase-hd"><span class="phase-key">c</span><h3>解析、索引与协议</h3></div>
+        <p class="wk">第 9–16 周 · M2 的主体</p>
+        <p>纯逻辑、不含图形的部分。到这里你已经有视觉反馈撑着动力了，做枯燥的部分会容易得多。</p>
+        <ul class="skills">
+          <li><span class="mk mk-new">全新</span><span>Markdown 解析，并自己扩展 wikilink</span></li>
           <li><span class="mk mk-new">全新</span><span>链接解析规则：别名、标题锚点、块 id、嵌入、最短唯一路径</span></li>
-          <li><span class="mk mk-new">全新</span><span>增量索引与反向链接表；文件监听与去抖</span></li>
-          <li><span class="mk mk-new">全新</span><span>内容寻址缓存；缓存<strong>绝不写进 vault</strong></span></li>
-          <li><span class="mk mk-new">全新</span><span>tectonic 作为库调用；预编译 preamble</span></li>
-          <li><span class="mk mk-new">全新</span><span>解析 TeX <code>.log</code>，把报错映射回笔记行号 —— 多数实现在这里放弃，做好就是卖点</span></li>
-          <li><span class="mk mk-some">有底</span><span>macOS 大小写不敏感文件系统、中文文件名的 Unicode 归一化</span></li>
+          <li><span class="mk mk-some">有底</span><span>增量索引与反向链接表；内容寻址缓存</span></li>
+          <li><span class="mk mk-new">全新</span><span>msgpack-RPC 与 <code>nvim_ui_attach</code>；extmark 与 <code>virt_lines</code></span></li>
+          <li><span class="mk mk-new">全新</span><span><strong>视口事件 → 屏幕矩形的坐标换算</strong>（最难，也最值钱）</span></li>
+          <li><span class="mk mk-new">全新</span><span>解析 TeX <code>.log</code>，报错映射回笔记行号</span></li>
         </ul>
         <div class="crates">
           <p class="eyebrow">crates</p>
-          <div class="chips"><span class="chip">pulldown-cmark</span><span class="chip">notify</span><span class="chip">blake3</span><span class="chip">directories</span><span class="chip">serde</span><span class="chip">walkdir</span><span class="chip">tectonic</span><span class="chip">resvg</span><span class="chip">rayon</span></div>
-        </div>
-      </article>
-
-      <article class="phase">
-        <div class="phase-hd"><span class="phase-key">b</span><h3>协议、GUI 与 GPU</h3></div>
-        <p class="wk">第 17–24 周</p>
-        <p>到这里你已经能读懂 GPUI 的源码，而不是照抄示例——这正是把 b 放在 a、c 之后的全部理由。</p>
-        <ul class="skills">
-          <li><span class="mk mk-new">全新</span><span>msgpack-RPC 与 <code>nvim_ui_attach</code>；redraw 事件流</span></li>
-          <li><span class="mk mk-some">有底</span><span>nvim Lua API：extmark、<code>virt_lines</code>、treesitter、autocmd</span></li>
-          <li><span class="mk mk-new">全新</span><span>视口事件 → 屏幕矩形的坐标换算（<strong>这条最难，也最值钱</strong>）</span></li>
-          <li><span class="mk mk-new">全新</span><span>GPU 纹理上传与缩放时的重栅格化</span></li>
-          <li><span class="mk mk-new">全新</span><span>若选 A：字体整形、CJK 双宽字符、光标语义</span></li>
-          <li><span class="mk mk-new">全新</span><span>力导向布局（图谱，最后再碰）</span></li>
-        </ul>
-        <div class="crates">
-          <p class="eyebrow">crates</p>
-          <div class="chips"><span class="chip">nvim-rs</span><span class="chip">rmpv</span><span class="chip">gpui</span><span class="chip">gpui-component</span><span class="chip">tiny-skia</span><span class="chip">tokio</span></div>
+          <div class="chips"><span class="chip">pulldown-cmark</span><span class="chip">nvim-rs</span><span class="chip">rmpv</span><span class="chip">blake3</span><span class="chip">directories</span><span class="chip">serde</span></div>
         </div>
       </article>
 
       <article class="phase">
         <div class="phase-hd"><span class="phase-key">d</span><h3>发布与维护</h3></div>
         <p class="wk">第 25–26 周及以后</p>
-        <p>你做过 Homebrew tap，这部分是你唯一有真实经验的环节。别在这里花超过两周。</p>
+        <p>你做过 Homebrew tap，这是唯一有真实经验的环节。别在这里花超过两周。</p>
         <ul class="skills">
           <li><span class="mk mk-have">已有</span><span>Homebrew tap 分发</span></li>
           <li><span class="mk mk-some">有底</span><span>GitHub Actions CI、交叉编译到 Linux</span></li>
           <li><span class="mk mk-new">全新</span><span>README 与安装说明——对采纳率的影响大于任何一行渲染代码</span></li>
-          <li><span class="mk mk-new">全新</span><span>issue 分诊与对外沟通</span></li>
         </ul>
         <div class="crates">
           <p class="eyebrow">工具</p>
-          <div class="chips"><span class="chip">cargo-dist</span><span class="chip">GitHub Actions</span><span class="chip">cargo-deny</span></div>
+          <div class="chips"><span class="chip">cargo-dist</span><span class="chip">GitHub Actions</span></div>
         </div>
       </article>
     </div>
@@ -632,49 +628,49 @@
     <div class="col">
       <p class="eyebrow">前置</p>
       <h2>非 Rust 的能力缺口</h2>
-      <p class="lede">这些不在 a–d 四阶段里，但缺了任何一个都会在中途卡住你。第一周就把它们补上。</p>
+      <p class="lede">这些不在 a–d 里，但缺了任何一个都会在中途卡住你。</p>
     </div>
     <div class="gaps">
       <div class="gap">
-        <span class="gap-lv lv-0">零</span>
+        <span class="gap-lv lv-2">已解决</span>
         <div>
           <p>本机 TeX 工具链</p>
-          <p class="sub">你机器上没有任何 TeX。第一周装好，手工跑通 tikz-cd／circuitikz／pgfplots，故意制造几次编译错误看 log 长什么样。</p>
+          <p class="sub">tectonic 已装并跑通，缓存在 <code>~/Library/Caches/TectonicProject.Tectonic</code>。</p>
         </div>
       </div>
       <div class="gap">
         <span class="gap-lv lv-1">薄</span>
         <div>
           <p>TikZ 本身</p>
-          <p class="sub">你说 TikZ 不太会。写渲染器的人必须先是熟练用户，否则你不知道什么样的失败值得处理。</p>
+          <p class="sub">M1 做完你会有一个实时预览器——正好拿它练。工具帮你学 TikZ，学会 TikZ 又告诉你渲染器该处理什么。</p>
+        </div>
+      </div>
+      <div class="gap">
+        <span class="gap-lv lv-0">零</span>
+        <div>
+          <p>GUI 编程</p>
+          <p class="sub">从没写过。这是第 2 版把它提前的主要理由——学习价值最高的正是这块。</p>
         </div>
       </div>
       <div class="gap">
         <span class="gap-lv lv-1">薄</span>
         <div>
           <p>Lua 与 nvim 插件开发</p>
-          <p class="sub">你会配 nvim，但没写过插件。extmark 与 treesitter 查询是 M2 的前提。</p>
+          <p class="sub">会配 nvim，没写过插件。第 9 周才需要。</p>
         </div>
       </div>
       <div class="gap">
         <span class="gap-lv lv-0">零</span>
         <div>
           <p>协议设计</p>
-          <p class="sub">你要设计的是一套跨进程协议，不只是调 API。先读 <code>:h ui.txt</code> 和 <code>:h api-extmark</code>。</p>
+          <p class="sub">要设计的是跨进程协议，不只是调 API。第 13 周前不用碰。</p>
         </div>
       </div>
       <div class="gap">
         <span class="gap-lv lv-2">尚可</span>
         <div>
-          <p>Neovim 日常操作</p>
-          <p class="sub">配置是两天前建的，还装着 vim-be-good。继续练，但不构成阻塞。</p>
-        </div>
-      </div>
-      <div class="gap">
-        <span class="gap-lv lv-2">尚可</span>
-        <div>
-          <p>开源分发</p>
-          <p class="sub">已有 Homebrew tap 经验，是你现成的优势。</p>
+          <p>系统概念</p>
+          <p class="sub">写过 memory allocator，内存布局、生命周期管理这些不陌生——但要注意 C 的习惯会和借用检查器打架。</p>
         </div>
       </div>
     </div>
@@ -684,32 +680,45 @@
     <div class="col">
       <p class="eyebrow">读什么</p>
       <h2>源码与规范阅读清单</h2>
-      <p class="lede">按需要的时间点排列。读源码的收益在这个项目里高于读教程——你要做的事已经有人做过一半。</p>
+      <p class="lede">
+        按需要的时间点排列。<strong>不要提前读</strong>——第 1 版把协议文档排在第 1 周是个排序错误，
+        那些是查阅型文档，不是入门材料。
+      </p>
       <ul class="reading">
         <li>
-          <span class="r-when">第 1 周</span>
-          <span class="r-what"><a href="https://neovim.io/doc/user/ui.html"><code>:h ui.txt</code></a> 与 <code>:h api-extmark</code></span>
-          <span class="r-why">nvim 的 UI 协议与 extmark 是整个项目的地基，先读规范再读实现。</span>
+          <span class="r-when">第 1–2 周</span>
+          <span class="r-what"><a href="https://github.com/hedge-ops/gpui-tutorial">gpui-tutorial</a> 与 <a href="https://matinaniss.github.io/gpui-book/getting-started/index.html">GPUI Book</a></span>
+          <span class="r-why">Hello World → 状态管理 → 组件 → 键位。M1 第 1 级直接跟着走。</span>
         </li>
         <li>
-          <span class="r-when">第 2 周</span>
+          <span class="r-when">第 3 周</span>
+          <span class="r-what">gpui-component 的 <code>gallery.rs</code> 与 <code>stories/</code></span>
+          <span class="r-why">现成组件长什么样、怎么组合，比读 API 文档快。</span>
+        </li>
+        <li>
+          <span class="r-when">第 5 周</span>
           <span class="r-what"><a href="https://github.com/tectonic-typesetting/tectonic">tectonic</a> 的库 API</span>
-          <span class="r-why">确认它能不能被当作库调用、宏包按需下载怎么触发、错误怎么拿到。</span>
+          <span class="r-why">从命令行调用切到库调用时再读，确认宏包按需下载怎么触发、错误怎么拿。</span>
         </li>
         <li>
           <span class="r-when">第 9 周</span>
-          <span class="r-what"><a href="https://github.com/3rd/image.nvim">image.nvim</a></span>
-          <span class="r-why">Lua 侧怎么算位置、怎么处理滚动与折叠——它的做法你要照搬思路，不照搬机制。</span>
+          <span class="r-what"><code>:h api-extmark</code>（在 <code>api.txt</code> 里）</span>
+          <span class="r-why">Lua 侧怎么占位。<code>virt_lines</code> 是给图预留垂直空间的机制。</span>
+        </li>
+        <li>
+          <span class="r-when">第 11 周</span>
+          <span class="r-what"><code>:h api-ui-events</code><span class="chip" style="margin-left:.4rem">原 ui.txt，已更名</span></span>
+          <span class="r-why"><code>win_viewport</code> 告诉你窗口当前显示缓冲区的哪一段——定位的关键。</span>
         </li>
         <li>
           <span class="r-when">第 13 周</span>
-          <span class="r-what"><a href="https://github.com/neovide/neovide/issues/2117">neovide#2117</a> 与 <a href="https://github.com/yatli/gui-widgets.nvim">gui-widgets.nvim</a></span>
-          <span class="r-why">别人已经把协议设计讨论过一轮。你的协议不必从白纸开始。</span>
+          <span class="r-what"><a href="https://github.com/3rd/image.nvim">image.nvim</a>、<a href="https://github.com/neovide/neovide/issues/2117">neovide#2117</a>、<a href="https://github.com/yatli/gui-widgets.nvim">gui-widgets.nvim</a></span>
+          <span class="r-why">别人已经把协议设计讨论过一轮，你的协议不必从白纸开始。</span>
         </li>
         <li>
           <span class="r-when">第 17 周</span>
           <span class="r-what"><a href="https://github.com/neovide/neovide">Neovide</a> 的 bridge 与 renderer</span>
-          <span class="r-why">15.2k star 的 Rust nvim GUI 是怎么组织的。若最终选 D，这是你要提 PR 的地方。</span>
+          <span class="r-why">若最终选 D，这是你要提 PR 的地方。</span>
         </li>
       </ul>
     </div>
@@ -719,20 +728,20 @@
     <div class="col">
       <p class="eyebrow">最后</p>
       <h2>三个我不替你解决的风险</h2>
-      <p><strong>一、你还在学 vim 本身。</strong> 配置是两天前建的。在尚未定型的工作流之上造工具，风险是你现在不知道半年后想要什么。缓解办法只有一个：这半年高强度用 nvim 写你的课程笔记，让需求自己浮出来。</p>
-      <p><strong>二、公开项目的采纳不取决于代码质量。</strong> 取决于安装门槛、README 的第一屏、和那个 demo GIF。这是 M3 的真正内容，不是附赠品。</p>
-      <p><strong>三、最大的风险是我。</strong> 你上一个 Rust 项目是 AI 写的，结果是"我都不会"。规则已经写进 <code>CLAUDE.md</code>，但规则挡不住第 14 周某个深夜你想让我"就这一次，直接把这个文件写完"。到那时你要自己按住。</p>
+      <p><strong>一、你还在学 vim 本身。</strong> 配置是新建的，还装着 vim-be-good。在尚未定型的工作流之上造工具，风险是你现在不知道半年后想要什么。缓解办法只有一个：这半年高强度用 nvim 写课程笔记，让需求自己浮出来。</p>
+      <p><strong>二、GPUI 是 pre-1.0，破坏性变更频繁。</strong> 版本钉死，升级要挑时间，别在赶里程碑的当口升。</p>
+      <p><strong>三、最大的风险是我。</strong> 上一个 Rust 项目是 AI 写的，结果是"我都不会"。规则已写进 <code>CLAUDE.md</code>，但规则挡不住某个深夜你想让我"就这一次，直接把这个文件写完"。到那时你要自己按住。</p>
     </div>
     <div class="col">
       <div class="callout warn">
         <p class="eyebrow">自检</p>
-        <p>每完成一个模块，关掉 AI，用自己的话写一段设计说明提交进 repo。写不出来就说明没真懂——那就回去重写那个模块，而不是继续往前赶。这是整个计划里唯一一条无法被绕过的验收标准。</p>
+        <p>每完成一个模块，关掉 AI，用自己的话写一段设计说明提交进 repo。写不出来就说明没真懂——回去重写那个模块，而不是继续往前赶。这是整个计划里唯一无法被绕过的验收标准。</p>
       </div>
     </div>
   </section>
 
   <footer>
-    <p>基于四轮设计追问确定 · 决策可推翻，但推翻前请先读该行的「理由 / 代价」栏。</p>
+    <p>第 2 版 · 顺序依动手反馈调整 · 决策可推翻，但推翻前请先读该行的「理由 / 代价」栏。</p>
   </footer>
 
 </div>
