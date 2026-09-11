@@ -1,11 +1,11 @@
 # Rusidian Product Decisions
 
-> 状态：2026-09-10 设计访谈中的已确认决定。与当前 `README.md` 冲突的内容代表新的产品方向；`README.md` 尚未同步。未列为“已确认”的事项不得当作决定。
+> 状态：截至 2026-09-11 的已确认决定。与历史计划冲突时以本文件为准；未列为“已确认”的事项不得当作决定。
 
 ## Product direction
 
 - Rusidian 是独立的、本地优先的原生 Markdown 桌面应用，不是 Electron 应用，也不只是 Neovim 的 TikZ 渲染插件。
-- Rust 已确定；GUI 框架尚未决定。GPUI、eframe 或其他候选均不代表当前决定。
+- Rust 与 GPUI 已确定；GPUI 负责应用生命周期、窗口、控件和文档绘制。
 - 源码视图运行用户本机的真实 Neovim，完整目标是加载用户的 `init.lua` 或 `init.vim`；传统 `.vimrc` 只承诺 Neovim 本身能够兼容的部分。
 - 阅读视图负责渲染 Markdown；同一窗口不会同时显示源码和阅读视图。长期允许同一文档在多个窗口中分别显示源码和阅读视图。
 - macOS 首发，之后支持 Linux；Windows 是明确的非目标。
@@ -62,6 +62,19 @@
 - TikZ 默认显示在白色背景卡片中。
 - 技术原型同时支持命令行打开、菜单“文件 → 打开文件”，以及系统右键“打开方式”。
 
+## GUI architecture
+
+- 使用 GPUI，不使用 WebView，也不维护 AppKit 或 SwiftUI Adapter。GPUI 内部的平台实现不属于 Rusidian 自有 Adapter。
+- GPUI 拥有应用生命周期、窗口和全部界面；Liquid Glass 仅是视觉参考，不是产品承诺。
+- 技术原型只使用原始 GPUI，不引入 `gpui-component`，也不复用或复制 Zed 的内部 UI 控件。
+- 依赖锁定到经过构建验证的 Zed Git 提交；不跟随浮动主分支，只在需要修复时人工升级。
+- GUI 依赖必须允许商业使用和再分发；优先宽松许可证，必要时可以接受 LGPL。GPUI 当前采用 Apache-2.0。
+- Apple Silicon macOS 首发；Linux x86-64 后续支持。Intel Mac 和 Windows 不承诺。
+- macOS 通过签名、公证安装包和 Homebrew 分发，不以 Mac App Store 为目标。
+- 技术原型必须验证中文输入法、中文字体回退、Emoji、组合字符和高分屏。无障碍不作为当前选型门槛。
+- 应用包不超过 50 MB，不含 Tectonic 离线资源；在 `nvim --clean` 下，Rusidian 与 Neovim 合计空闲内存不超过 150 MB；冷启动到可编辑不超过 1 秒；交互不得出现明显输入延迟。
+- GPUI 未通过中文输入、稳定性或性能硬门槛时，先进行一次有明确上限的定位；仍不满足则重新选型，优先重新评估 Iced，而不是放宽要求或长期维护分支。
+
 ## Technical prototype acceptance
 
 - 单个 Markdown 文件、单个窗口；不包含文件树、多窗口、搜索、反向链接和数学公式。
@@ -88,7 +101,6 @@
 
 ## Deferred decisions
 
-- GUI 框架的选择。
 - Rusidian 自有插件系统与主题插件的具体设计。
 - 自动检查更新是否可由用户选择开启。
 - 技术原型之后各里程碑的精确验收标准。

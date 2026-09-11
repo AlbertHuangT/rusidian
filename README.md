@@ -2,9 +2,10 @@
 
 A local-first native Markdown app powered by real Neovim.
 
-> **Direction update (2026-09-10):** [`PRODUCT.md`](PRODUCT.md) is the current product decision
-> record, and the GUI framework is not decided. The renderer-first proposal below is retained
-> as historical design input and must not be treated as the current product scope.
+> **Direction update (2026-09-11):** [`PRODUCT.md`](PRODUCT.md) is the current product decision
+> record. GPUI is the selected GUI framework; see
+> [`docs/adr/0001-use-gpui-for-gui.md`](docs/adr/0001-use-gpui-for-gui.md). The renderer-first
+> proposal below is retained as historical design input and is not the current product scope.
 
 > **Status: pre-implementation.** The repository contains only a minimal Cargo bootstrap; no
 > product architecture is implemented. The historical 26-week roadmap lives in `PLAN.html`.
@@ -69,5 +70,5 @@ will not hold.
 ## Stack
 
 Rust. [tectonic](https://github.com/tectonic-typesetting/tectonic) for TeX, so there is no 5 GB
-TeX Live prerequisite. Neovim RPC for the protocol. The GUI framework decision is deliberately
-deferred until M2: the engine and the protocol are the same whichever way it goes.
+TeX Live prerequisite. Neovim RPC for the protocol. GPUI is the selected GUI framework; the
+renderer and protocol remain isolated from its implementation details.

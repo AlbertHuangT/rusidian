@@ -3,7 +3,9 @@ CLAUDE.md
 .omx/
 
 scratchpad/
-docs/
+docs/*
+!docs/adr/
+!docs/adr/**
 
 # Added by cargo
 

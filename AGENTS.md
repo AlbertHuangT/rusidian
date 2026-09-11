@@ -12,7 +12,9 @@ Use these sources of truth:
 
 ## Design constraints
 
-- Rust is fixed; the GUI framework is deliberately undecided. Treat GPUI, eframe, and other frameworks as candidates until the owner explicitly chooses one.
+- Rust and GPUI are fixed. Read `docs/adr/0001-use-gpui-for-gui.md` before changing GUI dependencies, window ownership, platform integration, or performance gates.
+- GPUI owns the application lifecycle, windows, controls, and document rendering. Keep the technical prototype on raw GPUI without WebView, Rusidian-owned AppKit/SwiftUI adapters, `gpui-component`, or copied Zed UI code.
+- Pin GPUI to an exact, build-verified Zed Git revision and upgrade it only for a concrete need.
 - The source view must run the user's real Neovim rather than emulate Vim behavior or parse configuration files.
 - The technical prototype uses Tectonic for TikZ. Surface its compatibility and package trade-offs instead of expanding the prototype silently.
 - Local processing, low disk use, and low memory use are product requirements and tiebreakers.
