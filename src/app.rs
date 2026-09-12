@@ -1,6 +1,8 @@
+use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use gpui::{
-    App, Bounds, Context, KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, Window,
-    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    AnyElement, App, Bounds, Context, FontStyle, FontWeight, HighlightStyle, KeyBinding, Menu,
+    MenuItem, PathPromptOptions, SharedString, StyledText, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use std::path::{Path, PathBuf};
@@ -37,7 +39,7 @@ pub fn run(initial_path: Option<PathBuf>) {
 struct Document {
     name: SharedString,
     path: SharedString,
-    content: SharedString,
+    markdown: MarkdownDocument,
 }
 
 struct RusidianApp {
@@ -64,7 +66,7 @@ impl RusidianApp {
                         .into_owned()
                         .into(),
                     path: path.to_string_lossy().into_owned().into(),
-                    content: content.into(),
+                    markdown: crate::markdown::parse(&content),
                 }),
                 error: None,
             },
@@ -121,7 +123,7 @@ impl Render for RusidianApp {
                         .w_full()
                         .max_w(px(820.0))
                         .text_base()
-                        .child(document.content.clone()),
+                        .children(document.markdown.blocks.iter().map(render_block)),
                 )
                 .into_any_element()
         } else {
@@ -179,6 +181,42 @@ impl Render for RusidianApp {
     }
 }
 
+fn render_block(block: &Block) -> AnyElement {
+    let text =
+        StyledText::new(block.text.clone()).with_highlights(block.spans.iter().map(|span| {
+            (
+                span.range.clone(),
+                HighlightStyle {
+                    font_weight: span.bold.then_some(FontWeight::BOLD),
+                    font_style: span.italic.then_some(FontStyle::Italic),
+                    ..Default::default()
+                },
+            )
+        }));
+
+    match block.kind {
+        BlockKind::Heading(level) => div()
+            .mb_4()
+            .text_size(px(match level {
+                1 => 32.0,
+                2 => 27.0,
+                3 => 23.0,
+                _ => 19.0,
+            }))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(text)
+            .into_any_element(),
+        BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
+        BlockKind::Code => div()
+            .mb_4()
+            .p_4()
+            .rounded_md()
+            .bg(rgb(0x1c2229))
+            .child(text)
+            .into_any_element(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +224,7 @@ mod tests {
     #[test]
     fn opens_text_file_and_reports_missing_file() {
         let opened = RusidianApp::open(Some(Path::new("README.md")));
-        assert!(opened.document.unwrap().content.contains("rusidian"));
+        assert!(!opened.document.unwrap().markdown.blocks.is_empty());
 
         let missing = RusidianApp::open(Some(Path::new("missing-rusidian-test-file.md")));
         assert!(missing.error.is_some());

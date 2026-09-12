@@ -11,3 +11,4 @@ runtime-shaders = ["gpui_platform/runtime_shaders"]
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "d9e1c024f393832765a03f4de204d6c8cd9abcb2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d9e1c024f393832765a03f4de204d6c8cd9abcb2", features = ["font-kit"] }
+pulldown-cmark = "0.13.4"
