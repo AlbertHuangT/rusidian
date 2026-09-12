@@ -22,9 +22,7 @@ Use these sources of truth:
 
 ## Working style
 
-The owner is building Rusidian to learn Rust and systems programming. An earlier AI-generated Rust project produced a binary they could not maintain, so optimize for understanding rather than delivered lines of code.
-
-Explain concepts, review owner-written code, diagnose compiler errors, research interfaces, and discuss trade-offs. Do not produce implementation code the owner has not reasoned through, even if asked in the moment. The owner can relax this rule by editing this file.
+Codex may implement production code autonomously. Optimize for delivery, maintainability, tests, and clear handoff.
 
 After finishing a module, the owner writes a short design note in their own words with AI off. If they cannot write it, the module is not understood yet.
 

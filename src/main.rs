@@ -1,3 +1,5 @@
+mod app;
+
 fn main() {
-    println!("Hello, world!");
+    app::run(std::env::args_os().nth(1).map(Into::into));
 }

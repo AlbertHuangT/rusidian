@@ -2,6 +2,16 @@
 
 A local-first native Markdown app powered by real Neovim.
 
+## Development build on macOS
+
+With Command Line Tools but no standalone Metal compiler, the default build
+uses GPUI's upstream runtime shader compilation path through the system Metal
+API. Run the current shell with `cargo run --locked`, or open a text file with
+`cargo run --locked -- path/to/note.md`. Runtime shader compilation may
+increase startup time; release performance has not been validated with this
+option. Building with `--no-default-features` requires `xcrun metal` and
+`xcrun metallib`.
+
 > **Direction update (2026-09-11):** [`PRODUCT.md`](PRODUCT.md) is the current product decision
 > record. GPUI is the selected GUI framework; see
 > [`docs/adr/0001-use-gpui-for-gui.md`](docs/adr/0001-use-gpui-for-gui.md). The renderer-first
