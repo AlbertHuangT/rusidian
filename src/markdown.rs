@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::ops::Range;
 
 #[derive(Debug)]
@@ -13,11 +13,11 @@ pub struct Block {
     pub spans: Vec<Span>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum BlockKind {
     Paragraph,
     Heading(u8),
-    Code,
+    Code(Option<String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,7 +39,13 @@ pub fn parse(source: &str) -> MarkdownDocument {
             Event::Start(Tag::Heading { level, .. }) => {
                 current = Some(Block::new(BlockKind::Heading(heading_level(level))))
             }
-            Event::Start(Tag::CodeBlock(_)) => current = Some(Block::new(BlockKind::Code)),
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let language = match kind {
+                    CodeBlockKind::Fenced(language) => Some(language.into_string()),
+                    CodeBlockKind::Indented => None,
+                };
+                current = Some(Block::new(BlockKind::Code(language)));
+            }
             Event::Start(Tag::Strong) => bold += 1,
             Event::Start(Tag::Emphasis) => italic += 1,
             Event::End(TagEnd::Strong) => bold -= 1,
@@ -114,6 +120,9 @@ mod tests {
         assert_eq!(document.blocks[0].kind, BlockKind::Heading(1));
         assert_eq!(document.blocks[1].text, "普通 粗体 和 斜体。");
         assert_eq!(document.blocks[1].spans.len(), 2);
-        assert_eq!(document.blocks[2].kind, BlockKind::Code);
+        assert_eq!(
+            document.blocks[2].kind,
+            BlockKind::Code(Some("rust".into()))
+        );
     }
 }

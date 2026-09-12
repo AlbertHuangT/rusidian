@@ -4358,6 +4358,7 @@ dependencies = [
 name = "rusidian"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "gpui",
  "gpui_platform",
  "pulldown-cmark",
