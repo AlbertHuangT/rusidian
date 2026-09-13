@@ -66,6 +66,7 @@ struct RusidianApp {
     nvim: Option<NvimClient>,
     grid: NvimGrid,
     nvim_error: Option<SharedString>,
+    nvim_size: (i64, i64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -91,6 +92,7 @@ impl RusidianApp {
                 nvim: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
+                nvim_size: (120, 40),
             };
         };
 
@@ -113,6 +115,7 @@ impl RusidianApp {
                 nvim: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
+                nvim_size: (120, 40),
             },
             Err(error) => Self {
                 document: None,
@@ -122,6 +125,7 @@ impl RusidianApp {
                 nvim: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
+                nvim_size: (120, 40),
             },
         }
     }
@@ -291,10 +295,28 @@ impl RusidianApp {
             }))
             .into_any_element()
     }
+
+    fn resize_nvim(&mut self, window: &Window) {
+        let viewport = window.viewport_size();
+        let width = ((f32::from(viewport.width) - 32.0) / 8.0).floor().max(20.0) as i64;
+        let height = ((f32::from(viewport.height) - 84.0) / 18.0)
+            .floor()
+            .max(8.0) as i64;
+        let size = (width, height);
+        if size != self.nvim_size {
+            self.nvim_size = size;
+            if let Some(nvim) = &self.nvim {
+                nvim.resize(width, height);
+            }
+        }
+    }
 }
 
 impl Render for RusidianApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.view == View::Source {
+            self.resize_nvim(window);
+        }
         let title = self
             .document
             .as_ref()

@@ -19,6 +19,7 @@ pub enum Event {
 
 enum Command {
     Input(String),
+    Resize(i64, i64),
 }
 
 #[derive(Clone)]
@@ -92,6 +93,13 @@ impl Client {
                                     .await;
                             }
                         }
+                        Command::Resize(width, height) => {
+                            if let Err(error) = nvim.ui_try_resize(width, height).await {
+                                let _ = event_sender
+                                    .send(Event::Error(format!("Neovim 调整尺寸失败：{error}")))
+                                    .await;
+                            }
+                        }
                     }
                 }
 
@@ -104,6 +112,10 @@ impl Client {
 
     pub fn input(&self, keys: impl Into<String>) {
         let _ = self.commands.send(Command::Input(keys.into()));
+    }
+
+    pub fn resize(&self, width: i64, height: i64) {
+        let _ = self.commands.send(Command::Resize(width, height));
     }
 }
 
@@ -171,6 +183,11 @@ impl Grid {
 
     pub fn is_normal(&self) -> bool {
         self.mode.starts_with("normal")
+    }
+
+    #[cfg(test)]
+    fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
     }
 
     fn set_mode(&mut self, args: &[Value]) {
@@ -401,6 +418,23 @@ mod tests {
 
         assert!(grid.lines().any(|(line, _)| line.contains("TikZ preview")));
         assert!(grid.is_normal());
+
+        client.resize(80, 24);
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while grid.size() != (80, 24) {
+                        match client.events.recv().await.unwrap() {
+                            Event::Redraw(events) => {
+                                grid.apply_redraw(&events);
+                            }
+                            Event::Error(error) => panic!("{error}"),
+                        }
+                    }
+                })
+                .await
+            })
+            .expect("Neovim did not resize within five seconds");
 
         client.input("i");
         let mode = runtime
