@@ -1,8 +1,9 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
+use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
 use gpui::{
     AnyElement, App, Bounds, Context, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
-    KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, StyledText, Window, WindowBounds,
-    WindowOptions, actions, div, img, prelude::*, px, rgb, size,
+    KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, SharedString,
+    StyledText, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use std::{
@@ -14,11 +15,14 @@ use std::{
 const WINDOW_WIDTH: f32 = 960.0;
 const WINDOW_HEIGHT: f32 = 640.0;
 
-actions!(rusidian, [OpenFile, Quit]);
+actions!(rusidian, [OpenFile, Quit, EnterSourceNormal]);
 
 pub fn run(initial_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("cmd-o", OpenFile, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-o", OpenFile, None),
+            KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus([
             Menu::new("Rusidian").items([MenuItem::action("退出 Rusidian", Quit)]),
@@ -36,6 +40,7 @@ pub fn run(initial_path: Option<PathBuf>) {
                 cx.new(|cx| {
                     let mut app = RusidianApp::open(initial_path.as_deref());
                     app.compile_tikz(cx);
+                    app.start_nvim(cx);
                     app
                 })
             },
@@ -47,6 +52,7 @@ pub fn run(initial_path: Option<PathBuf>) {
 }
 
 struct Document {
+    file: PathBuf,
     name: SharedString,
     path: SharedString,
     markdown: MarkdownDocument,
@@ -56,6 +62,16 @@ struct RusidianApp {
     document: Option<Document>,
     error: Option<SharedString>,
     tikz: HashMap<usize, TikzState>,
+    view: View,
+    nvim: Option<NvimClient>,
+    grid: NvimGrid,
+    nvim_error: Option<SharedString>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Reading,
+    Source,
 }
 
 enum TikzState {
@@ -71,12 +87,17 @@ impl RusidianApp {
                 document: None,
                 error: None,
                 tikz: HashMap::new(),
+                view: View::Reading,
+                nvim: None,
+                grid: NvimGrid::default(),
+                nvim_error: None,
             };
         };
 
         match std::fs::read_to_string(path) {
             Ok(content) => Self {
                 document: Some(Document {
+                    file: path.to_path_buf(),
                     name: path
                         .file_name()
                         .unwrap_or(path.as_os_str())
@@ -88,11 +109,19 @@ impl RusidianApp {
                 }),
                 error: None,
                 tikz: HashMap::new(),
+                view: View::Reading,
+                nvim: None,
+                grid: NvimGrid::default(),
+                nvim_error: None,
             },
             Err(error) => Self {
                 document: None,
                 error: Some(format!("无法打开 {}：{error}", path.display()).into()),
                 tikz: HashMap::new(),
+                view: View::Reading,
+                nvim: None,
+                grid: NvimGrid::default(),
+                nvim_error: None,
             },
         }
     }
@@ -148,6 +177,35 @@ impl RusidianApp {
         }
     }
 
+    fn start_nvim(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.document.as_ref().map(|document| document.file.clone()) else {
+            return;
+        };
+        let client = NvimClient::start(path);
+        let events = client.events.clone();
+        self.nvim = Some(client);
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let result = this.update(cx, |this, cx| match event {
+                    NvimEvent::Redraw(events) => {
+                        if this.grid.apply_redraw(&events) {
+                            cx.notify();
+                        }
+                    }
+                    NvimEvent::Error(error) => {
+                        this.nvim_error = Some(error.into());
+                        cx.notify();
+                    }
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn choose_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
         let selected = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -167,11 +225,71 @@ impl RusidianApp {
             this.update_in(cx, |this, _, cx| {
                 *this = Self::open(Some(&path));
                 this.compile_tikz(cx);
+                this.start_nvim(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn enter_source_normal(
+        &mut self,
+        _: &EnterSourceNormal,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.view = View::Source;
+        if let Some(nvim) = &self.nvim {
+            nvim.input("<Esc>");
+        }
+        cx.notify();
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.view != View::Source {
+            return;
+        }
+        if event.keystroke.key == "escape" && self.grid.is_normal() {
+            self.view = View::Reading;
+            cx.notify();
+        } else if let Some(nvim) = &self.nvim {
+            nvim.input(nvim_key(&event.keystroke));
+        }
+    }
+
+    fn render_source(&self) -> AnyElement {
+        if let Some(error) = &self.nvim_error {
+            return div()
+                .flex_1()
+                .p_8()
+                .text_color(rgb(0xffa7b2))
+                .child(error.clone())
+                .into_any_element();
+        }
+
+        div()
+            .flex_1()
+            .id("nvim-grid")
+            .overflow_scroll()
+            .p_4()
+            .bg(rgb(0x0c0f12))
+            .font_family("SFMono-Regular")
+            .text_sm()
+            .children(self.grid.lines().map(|(line, cursor)| {
+                let text = StyledText::new(line).with_highlights(cursor.map(|range| {
+                    (
+                        range,
+                        HighlightStyle {
+                            color: Some(rgb(0x0c0f12).into()),
+                            background_color: Some(rgb(0xe6e9ed).into()),
+                            ..Default::default()
+                        },
+                    )
+                }));
+                div().whitespace_nowrap().child(text)
+            }))
+            .into_any_element()
     }
 }
 
@@ -183,7 +301,7 @@ impl Render for RusidianApp {
             .map(|document| document.name.clone())
             .unwrap_or_else(|| "Rusidian".into());
 
-        let body =
+        let reading =
             if let Some(document) = &self.document {
                 div()
                     .flex_1()
@@ -224,9 +342,21 @@ impl Render for RusidianApp {
                     .into_any_element()
             };
 
+        let body = if self.view == View::Source {
+            self.render_source()
+        } else {
+            reading
+        };
+
         div()
-            .key_context("Rusidian")
+            .key_context(if self.view == View::Source {
+                "Source"
+            } else {
+                "Reading"
+            })
             .on_action(cx.listener(Self::choose_file))
+            .on_action(cx.listener(Self::enter_source_normal))
+            .on_key_down(cx.listener(Self::key_down))
             .flex()
             .flex_col()
             .size_full()
@@ -258,6 +388,43 @@ impl Render for RusidianApp {
             )
             .child(body)
     }
+}
+
+fn nvim_key(key: &Keystroke) -> String {
+    let key_name = match key.key.as_str() {
+        "enter" => "CR",
+        "escape" => "Esc",
+        "backspace" => "BS",
+        "delete" => "Del",
+        "tab" => "Tab",
+        "left" => "Left",
+        "right" => "Right",
+        "up" => "Up",
+        "down" => "Down",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        "home" => "Home",
+        "end" => "End",
+        _ if !key.modifiers.modified() => {
+            return key.key_char.clone().unwrap_or_else(|| key.key.clone());
+        }
+        other => other,
+    };
+
+    let mut modifiers = String::new();
+    if key.modifiers.control {
+        modifiers.push_str("C-");
+    }
+    if key.modifiers.alt {
+        modifiers.push_str("M-");
+    }
+    if key.modifiers.shift {
+        modifiers.push_str("S-");
+    }
+    if key.modifiers.platform {
+        modifiers.push_str("D-");
+    }
+    format!("<{modifiers}{key_name}>")
 }
 
 fn render_block(block: &Block, tikz: Option<&TikzState>) -> AnyElement {
@@ -341,5 +508,12 @@ mod tests {
 
         let missing = RusidianApp::open(Some(Path::new("missing-rusidian-test-file.md")));
         assert!(missing.error.is_some());
+    }
+
+    #[test]
+    fn translates_gpui_keys_for_neovim() {
+        assert_eq!(nvim_key(&Keystroke::parse("a").unwrap()), "a");
+        assert_eq!(nvim_key(&Keystroke::parse("ctrl-a").unwrap()), "<C-a>");
+        assert_eq!(nvim_key(&Keystroke::parse("left").unwrap()), "<Left>");
     }
 }

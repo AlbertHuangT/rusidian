@@ -1,5 +1,6 @@
 mod app;
 mod markdown;
+mod nvim;
 mod tikz;
 
 fn main() {
