@@ -181,7 +181,7 @@ impl RusidianApp {
         let Some(path) = self.document.as_ref().map(|document| document.file.clone()) else {
             return;
         };
-        let client = NvimClient::start(path);
+        let client = NvimClient::start(path, false);
         let events = client.events.clone();
         self.nvim = Some(client);
 

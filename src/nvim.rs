@@ -36,7 +36,7 @@ impl Handler for EventHandler {
 }
 
 impl Client {
-    pub fn start(path: PathBuf) -> Self {
+    pub fn start(path: PathBuf, clean: bool) -> Self {
         let (event_sender, events) = async_channel::unbounded();
         let (commands, mut command_receiver) = mpsc::unbounded_channel();
 
@@ -55,7 +55,11 @@ impl Client {
             runtime.block_on(async move {
                 let handler = EventHandler(event_sender.clone());
                 let mut command = tokio::process::Command::new("nvim");
-                command.args(["--clean", "--embed"]).arg(path);
+                command.arg("--embed");
+                if clean {
+                    command.arg("--clean");
+                }
+                command.arg(path);
                 let (nvim, io, _child) = match create::new_child_cmd(&mut command, handler).await {
                     Ok(session) => session,
                     Err(error) => {
@@ -370,7 +374,7 @@ mod tests {
     #[test]
     #[ignore = "requires the external Neovim installation"]
     fn starts_neovim_and_receives_redraw() {
-        let client = Client::start(PathBuf::from("examples/tikz.md"));
+        let client = Client::start(PathBuf::from("examples/tikz.md"), true);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
