@@ -185,6 +185,12 @@ impl Grid {
         self.mode.starts_with("normal")
     }
 
+    pub fn accepts_text_input(&self) -> bool {
+        self.mode.starts_with("insert")
+            || self.mode.starts_with("replace")
+            || self.mode.starts_with("cmdline")
+    }
+
     #[cfg(test)]
     fn size(&self) -> (usize, usize) {
         (self.width, self.height)
@@ -456,6 +462,23 @@ mod tests {
             })
             .expect("Neovim did not enter Insert within five seconds");
         assert!(mode.starts_with("insert"));
+
+        client.input("中文");
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !grid.lines().any(|(line, _)| line.contains("中文")) {
+                        match client.events.recv().await.unwrap() {
+                            Event::Redraw(events) => {
+                                grid.apply_redraw(&events);
+                            }
+                            Event::Error(error) => panic!("{error}"),
+                        }
+                    }
+                })
+                .await
+            })
+            .expect("Neovim did not display committed Chinese text within five seconds");
 
         client.input("<Esc>");
         runtime

@@ -17,6 +17,7 @@
 - 阅读视图中：`Enter` 进入源码 Normal。
 - 源码 Normal 中：默认用 `Esc` 返回阅读视图。进入源码后，Insert、Visual、用户映射及其他按键行为全部由真实 Neovim 决定；Rusidian 不绑定 `i` 等 Neovim 按键。
 - Rusidian 必须启动真实 Neovim 后检查全局映射及 Markdown buffer 的局部映射；发生冲突时让用户修改 Rusidian 快捷键，或展示由用户自行修改的 Neovim 配置。不得静态猜测或自动改写用户配置。
+- Rusidian 只负责把系统输入法的预编辑与最终文字交给 Neovim，不负责切换系统输入源。Insert/Normal 间的中英文输入源自动切换由用户的 Neovim 配置负责；后续健康检查可以识别并推荐 `im-select.nvim` 等方案，但不得把特定插件设为运行前提。
 - 阅读视图采用字符级逻辑光标。隐藏的 Markdown 标记没有光标位置；可见字符精确映射回对应源码字符。
 - 图片是原子对象；独占一段的图片作为图片块，行内图片作为段落中的一个原子位置。
 - `j/k` 按源码物理行移动，`gj/gk` 按屏幕折行移动。

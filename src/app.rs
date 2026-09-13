@@ -1,9 +1,11 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
 use gpui::{
-    AnyElement, App, Bounds, Context, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
-    KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, SharedString,
-    StyledText, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px, rgb, size,
+    AnyElement, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
+    FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding, KeyDownEvent, Keystroke,
+    Menu, MenuItem, PathPromptOptions, Pixels, Point, SharedString, StyledText, UTF16Selection,
+    Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb,
+    size,
 };
 use gpui_platform::application;
 use std::{
@@ -36,13 +38,19 @@ pub fn run(initial_path: Option<PathBuf>) {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| {
-                cx.new(|cx| {
+            |window, cx| {
+                let app = cx.new(|cx| {
                     let mut app = RusidianApp::open(initial_path.as_deref());
+                    app.focus_handle = Some(cx.focus_handle());
                     app.compile_tikz(cx);
                     app.start_nvim(cx);
                     app
-                })
+                });
+                let focus = app.read(cx).focus_handle.clone();
+                if let Some(focus) = focus {
+                    window.focus(&focus, cx);
+                }
+                app
             },
         )
         .expect("failed to open Rusidian window");
@@ -67,6 +75,9 @@ struct RusidianApp {
     grid: NvimGrid,
     nvim_error: Option<SharedString>,
     nvim_size: (i64, i64),
+    focus_handle: Option<FocusHandle>,
+    marked_text: String,
+    marked_selection: std::ops::Range<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -93,6 +104,9 @@ impl RusidianApp {
                 grid: NvimGrid::default(),
                 nvim_error: None,
                 nvim_size: (120, 40),
+                focus_handle: None,
+                marked_text: String::new(),
+                marked_selection: 0..0,
             };
         };
 
@@ -116,6 +130,9 @@ impl RusidianApp {
                 grid: NvimGrid::default(),
                 nvim_error: None,
                 nvim_size: (120, 40),
+                focus_handle: None,
+                marked_text: String::new(),
+                marked_selection: 0..0,
             },
             Err(error) => Self {
                 document: None,
@@ -126,6 +143,9 @@ impl RusidianApp {
                 grid: NvimGrid::default(),
                 nvim_error: None,
                 nvim_size: (120, 40),
+                focus_handle: None,
+                marked_text: String::new(),
+                marked_selection: 0..0,
             },
         }
     }
@@ -227,7 +247,9 @@ impl RusidianApp {
             };
 
             this.update_in(cx, |this, _, cx| {
+                let focus_handle = this.focus_handle.clone();
                 *this = Self::open(Some(&path));
+                this.focus_handle = focus_handle;
                 this.compile_tikz(cx);
                 this.start_nvim(cx);
                 cx.notify();
@@ -240,10 +262,13 @@ impl RusidianApp {
     fn enter_source_normal(
         &mut self,
         _: &EnterSourceNormal,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.view = View::Source;
+        if let Some(focus) = &self.focus_handle {
+            window.focus(focus, cx);
+        }
         if let Some(nvim) = &self.nvim {
             nvim.input("<Esc>");
         }
@@ -257,12 +282,19 @@ impl RusidianApp {
         if event.keystroke.key == "escape" && self.grid.is_normal() {
             self.view = View::Reading;
             cx.notify();
+        } else if self.grid.accepts_text_input()
+            && event.keystroke.key_char.is_some()
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+        {
+            // Printable text is committed through EntityInputHandler so IME composition is not duplicated.
         } else if let Some(nvim) = &self.nvim {
             nvim.input(nvim_key(&event.keystroke));
         }
     }
 
-    fn render_source(&self) -> AnyElement {
+    fn render_source(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(error) = &self.nvim_error {
             return div()
                 .flex_1()
@@ -272,27 +304,57 @@ impl RusidianApp {
                 .into_any_element();
         }
 
+        let view = cx.entity();
+        let focus = self.focus_handle.clone();
+        let marked_text = self.marked_text.clone();
+
         div()
             .flex_1()
             .id("nvim-grid")
+            .relative()
             .overflow_scroll()
             .p_4()
             .bg(rgb(0x0c0f12))
             .font_family("SFMono-Regular")
             .text_sm()
-            .children(self.grid.lines().map(|(line, cursor)| {
-                let text = StyledText::new(line).with_highlights(cursor.map(|range| {
-                    (
-                        range,
-                        HighlightStyle {
-                            color: Some(rgb(0x0c0f12).into()),
-                            background_color: Some(rgb(0xe6e9ed).into()),
-                            ..Default::default()
-                        },
-                    )
-                }));
+            .children(self.grid.lines().map(|(mut line, cursor)| {
+                let highlight = cursor.map(|range| {
+                    if marked_text.is_empty() {
+                        (
+                            range,
+                            HighlightStyle {
+                                color: Some(rgb(0x0c0f12).into()),
+                                background_color: Some(rgb(0xe6e9ed).into()),
+                                ..Default::default()
+                            },
+                        )
+                    } else {
+                        let start = range.start;
+                        line.insert_str(start, &marked_text);
+                        (
+                            start..start + marked_text.len(),
+                            HighlightStyle {
+                                background_color: Some(rgb(0x284d75).into()),
+                                ..Default::default()
+                            },
+                        )
+                    }
+                });
+                let text = StyledText::new(line).with_highlights(highlight);
                 div().whitespace_nowrap().child(text)
             }))
+            .when_some(focus, |element, focus| {
+                element.track_focus(&focus).child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .into_any_element()
     }
 
@@ -309,6 +371,112 @@ impl RusidianApp {
                 nvim.resize(width, height);
             }
         }
+    }
+}
+
+impl EntityInputHandler for RusidianApp {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let length = self.marked_text.encode_utf16().count();
+        adjusted.replace(0..length);
+        Some(self.marked_text.clone())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.marked_selection.clone(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        (!self.marked_text.is_empty()).then(|| 0..self.marked_text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        if let Some(nvim) = &self.nvim {
+            nvim.input(text);
+        }
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        selected: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text.clear();
+        self.marked_text.push_str(new_text);
+        let length = new_text.encode_utf16().count();
+        self.marked_selection = selected.unwrap_or(length..length);
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            point(
+                element_bounds.left() + px(16.0 + self.grid.cursor.1 as f32 * 8.0),
+                element_bounds.top() + px(16.0 + self.grid.cursor.0 as f32 * 18.0),
+            ),
+            size(px(8.0), px(18.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        Some(self.marked_text.encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.view == View::Source && self.grid.accepts_text_input()
     }
 }
 
@@ -365,7 +533,7 @@ impl Render for RusidianApp {
             };
 
         let body = if self.view == View::Source {
-            self.render_source()
+            self.render_source(cx)
         } else {
             reading
         };
