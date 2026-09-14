@@ -213,6 +213,9 @@ pub fn parse(source: &str) -> MarkdownDocument {
                     lists.pop();
                 }
                 TagEnd::Item => {
+                    if current.is_none() && items.last().is_some_and(|item| !item.used) {
+                        current = Some(new_block(BlockKind::Paragraph, quote_depth, &mut items));
+                    }
                     push_current(&mut blocks, &mut current);
                     items.pop();
                     if let Some(number) = lists.last_mut().and_then(|list| list.next.as_mut()) {
@@ -443,6 +446,8 @@ mod tests {
                 .all(|block| block.list_marker.as_deref() == Some("•"))
         );
         assert_eq!(document.blocks[2].task, Some(true));
+        let empty_item = parse("-\n");
+        assert_eq!(empty_item.blocks[0].list_marker.as_deref(), Some("•"));
     }
 
     #[test]

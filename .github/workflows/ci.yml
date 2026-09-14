@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -55,12 +55,13 @@ jobs:
       - name: Package prototype
         run: |
           mkdir -p dist/rusidian-macos-arm64
-          cp target/release/rusidian README.md dist/rusidian-macos-arm64/
-          cp -R examples dist/rusidian-macos-arm64/
+          cp target/release/rusidian README.md PRODUCT.md CONTEXT.md PLAN.html dist/rusidian-macos-arm64/
+          cp -R examples assets docs dist/rusidian-macos-arm64/
           file dist/rusidian-macos-arm64/rusidian | grep -q arm64
           otool -L dist/rusidian-macos-arm64/rusidian
           tar -czf dist/rusidian-macos-arm64.tar.gz -C dist rusidian-macos-arm64
-          shasum -a 256 dist/rusidian-macos-arm64.tar.gz > dist/SHA256SUMS
+          cd dist
+          shasum -a 256 rusidian-macos-arm64.tar.gz > SHA256SUMS
       - name: Upload prototype
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -76,6 +77,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: macos
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
