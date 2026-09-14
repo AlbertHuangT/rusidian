@@ -4,8 +4,8 @@ use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, Pixels, Point, ScrollHandle,
-    SharedString, StyledText, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas,
-    div, img, point, prelude::*, px, rgb, size,
+    SharedString, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use std::{
@@ -42,7 +42,7 @@ pub fn run(initial_path: Option<PathBuf>) {
                 let app = cx.new(|cx| {
                     let mut app = RusidianApp::open(initial_path.as_deref());
                     app.focus_handle = Some(cx.focus_handle());
-                    app.compile_tikz(cx);
+                    app.compile_visuals(cx);
                     app.start_nvim(cx);
                     app
                 });
@@ -71,6 +71,7 @@ struct RusidianApp {
     document: Option<Document>,
     error: Option<SharedString>,
     tikz: HashMap<usize, TikzState>,
+    math: HashMap<(usize, usize), TikzState>,
     view: View,
     nvim: Option<NvimClient>,
     grid: NvimGrid,
@@ -141,6 +142,7 @@ impl RusidianApp {
                 document: None,
                 error: None,
                 tikz: HashMap::new(),
+                math: HashMap::new(),
                 view: View::Reading,
                 nvim: None,
                 grid: NvimGrid::default(),
@@ -180,6 +182,7 @@ impl RusidianApp {
                     }),
                     error: None,
                     tikz: HashMap::new(),
+                    math: HashMap::new(),
                     view: View::Reading,
                     nvim: None,
                     grid: NvimGrid::default(),
@@ -204,6 +207,7 @@ impl RusidianApp {
                 document: None,
                 error: Some(format!("无法打开 {}：{error}", path.display()).into()),
                 tikz: HashMap::new(),
+                math: HashMap::new(),
                 view: View::Reading,
                 nvim: None,
                 grid: NvimGrid::default(),
@@ -277,6 +281,67 @@ impl RusidianApp {
         }
     }
 
+    fn compile_math(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let mut jobs = Vec::new();
+        for (block_index, block) in document.markdown.blocks.iter().enumerate() {
+            if block.kind == BlockKind::Math {
+                jobs.push(((block_index, usize::MAX), block.text.clone(), true));
+            }
+            jobs.extend(
+                block.maths.iter().enumerate().map(|(math_index, math)| {
+                    ((block_index, math_index), math.source.clone(), false)
+                }),
+            );
+        }
+
+        for (key, source, display) in jobs {
+            self.math.insert(key, TikzState::Loading);
+            let expected = source.clone();
+            let executor = cx.background_executor().clone();
+            cx.spawn(async move |this, cx| {
+                let result = executor
+                    .spawn(async move { crate::tikz::compile_math(&source, display) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    let is_current = this.document.as_ref().is_some_and(|document| {
+                        let Some(block) = document.markdown.blocks.get(key.0) else {
+                            return false;
+                        };
+                        if key.1 == usize::MAX {
+                            block.kind == BlockKind::Math && block.text == expected
+                        } else {
+                            block
+                                .maths
+                                .get(key.1)
+                                .is_some_and(|math| math.source == expected)
+                        }
+                    });
+                    if !is_current {
+                        return;
+                    }
+                    let state = match result {
+                        Ok(bytes) => {
+                            TikzState::Ready(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+                        }
+                        Err(error) => TikzState::Failed(error.into()),
+                    };
+                    this.math.insert(key, state);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn compile_visuals(&mut self, cx: &mut Context<Self>) {
+        self.compile_tikz(cx);
+        self.compile_math(cx);
+    }
+
     fn start_nvim(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.document.as_ref().map(|document| document.file.clone()) else {
             return;
@@ -301,8 +366,9 @@ impl RusidianApp {
                     } => {
                         if this.update_buffer(first, last, lines, more) && !more {
                             this.tikz.clear();
+                            this.math.clear();
                             if this.view == View::Reading {
-                                this.compile_tikz(cx);
+                                this.compile_visuals(cx);
                             }
                             cx.notify();
                         }
@@ -344,7 +410,7 @@ impl RusidianApp {
                 let focus_handle = this.focus_handle.clone();
                 *this = Self::open(Some(&path));
                 this.focus_handle = focus_handle;
-                this.compile_tikz(cx);
+                this.compile_visuals(cx);
                 this.start_nvim(cx);
                 cx.notify();
             })
@@ -447,6 +513,11 @@ impl RusidianApp {
             {
                 return Some(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
             }
+            if let Some((index, _)) = inline_math_at_offset(block, bounds.0.offset)
+                && let Some(TikzState::Ready(image)) = self.math.get(&(bounds.0.block, index))
+            {
+                return Some(ClipboardItem::new_image(image));
+            }
             match &block.kind {
                 BlockKind::Image(source) => {
                     if let Some(path) = local_image_path(&document.file, source)
@@ -458,6 +529,13 @@ impl RusidianApp {
                 }
                 BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
                     if let Some(TikzState::Ready(image)) = self.tikz.get(&bounds.0.block) {
+                        return Some(ClipboardItem::new_image(image));
+                    }
+                }
+                BlockKind::Math => {
+                    if let Some(TikzState::Ready(image)) =
+                        self.math.get(&(bounds.0.block, usize::MAX))
+                    {
                         return Some(ClipboardItem::new_image(image));
                     }
                 }
@@ -534,6 +612,56 @@ impl RusidianApp {
         };
         for _ in 0..lines {
             self.move_reading_line(down);
+        }
+    }
+
+    fn current_link(&self) -> Option<String> {
+        let block = self
+            .document
+            .as_ref()?
+            .markdown
+            .blocks
+            .get(self.reading_cursor.block)?;
+        let byte = text_range(&block.text, self.reading_cursor.offset)?.start;
+        block
+            .links
+            .iter()
+            .find(|link| link.range.contains(&byte))
+            .map(|link| link.destination.clone())
+    }
+
+    fn open_internal_link(&mut self, cx: &mut Context<Self>) {
+        let Some(destination) = self.current_link() else {
+            return;
+        };
+        if destination.contains("://") || destination.starts_with("mailto:") {
+            return;
+        }
+        let destination = destination.split('#').next().unwrap_or_default();
+        let Some(document) = &self.document else {
+            return;
+        };
+        let path = document
+            .file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(destination);
+        if !path.is_file() {
+            self.nvim_warning = Some(format!("找不到链接文件：{}", path.display()).into());
+            return;
+        }
+        let focus = self.focus_handle.clone();
+        *self = Self::open(Some(&path));
+        self.focus_handle = focus;
+        self.compile_visuals(cx);
+        self.start_nvim(cx);
+    }
+
+    fn open_external_link(&self, cx: &mut Context<Self>) {
+        if let Some(destination) = self.current_link()
+            && (destination.contains("://") || destination.starts_with("mailto:"))
+        {
+            cx.open_url(&destination);
         }
     }
 
@@ -799,6 +927,31 @@ impl RusidianApp {
                 self.reading_count = Some(append_count(self.reading_count.unwrap_or(0), digit));
                 return;
             }
+            if self.reading_pending_g {
+                self.reading_pending_g = false;
+                match key {
+                    Some("g") => {
+                        self.move_reading_document_edge(false);
+                        let count = self.take_reading_count();
+                        for _ in 1..count {
+                            self.move_reading_line(true);
+                        }
+                        self.reveal_reading_cursor();
+                        cx.notify();
+                    }
+                    Some("f") => {
+                        self.open_internal_link(cx);
+                        cx.notify();
+                    }
+                    Some("x") => self.open_external_link(cx),
+                    _ => self.reading_count = None,
+                }
+                return;
+            }
+            if key == Some("g") {
+                self.reading_pending_g = true;
+                return;
+            }
             if let Some(find) = match key {
                 Some("f") => Some(FindPending {
                     forward: true,
@@ -820,21 +973,6 @@ impl RusidianApp {
             } {
                 self.reading_find = Some(find);
                 self.reading_pending_g = false;
-                return;
-            }
-            if key == Some("g") {
-                if self.reading_pending_g {
-                    self.move_reading_document_edge(false);
-                    let count = self.take_reading_count();
-                    for _ in 1..count {
-                        self.move_reading_line(true);
-                    }
-                    self.reading_pending_g = false;
-                    self.reveal_reading_cursor();
-                    cx.notify();
-                } else {
-                    self.reading_pending_g = true;
-                }
                 return;
             }
             self.reading_pending_g = false;
@@ -901,7 +1039,7 @@ impl RusidianApp {
         }
         if event.keystroke.key == "escape" && self.grid.is_normal() {
             self.view = View::Reading;
-            self.compile_tikz(cx);
+            self.compile_visuals(cx);
             cx.notify();
         } else if self.grid.accepts_text_input()
             && event.keystroke.key_char.is_some()
@@ -1192,6 +1330,8 @@ impl Render for RusidianApp {
                                 .child(render_block(
                                     block,
                                     self.tikz.get(&index),
+                                    &self.math,
+                                    index,
                                     &document.file,
                                     (reading_cursor.block == index)
                                         .then_some(reading_cursor.offset),
@@ -1377,6 +1517,8 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
 fn render_block(
     block: &Block,
     tikz: Option<&TikzState>,
+    math: &HashMap<(usize, usize), TikzState>,
+    block_index: usize,
     note: &Path,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
@@ -1384,7 +1526,7 @@ fn render_block(
     let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
     let text = styled_fragment(block, 0..block.text.len(), cursor, selection);
 
-    match &block.kind {
+    let content = match &block.kind {
         BlockKind::Heading(level) => div()
             .mb_4()
             .text_size(px(match level {
@@ -1397,23 +1539,29 @@ fn render_block(
             .child(text)
             .into_any_element(),
         BlockKind::Paragraph if !block.images.is_empty() => {
-            render_inline_paragraph(block, note, cursor, selection)
+            render_inline_paragraph(block, math, block_index, note, cursor, selection)
+        }
+        BlockKind::Paragraph if !block.maths.is_empty() => {
+            render_inline_paragraph(block, math, block_index, note, cursor, selection)
         }
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
         BlockKind::Image(source) => {
             let source_label = source.clone();
             let alt = block.text.clone();
             let Some(path) = local_image_path(note, source) else {
-                return div()
-                    .mb_4()
-                    .p_4()
-                    .rounded_md()
-                    .when(object_cursor, |element| {
-                        element.border_2().border_color(rgb(0x88c0d0))
-                    })
-                    .bg(rgb(0x1c2229))
-                    .child(format!("![{alt}]({source_label})"))
-                    .into_any_element();
+                return decorate_block(
+                    block,
+                    div()
+                        .mb_4()
+                        .p_4()
+                        .rounded_md()
+                        .when(object_cursor, |element| {
+                            element.border_2().border_color(rgb(0x88c0d0))
+                        })
+                        .bg(rgb(0x1c2229))
+                        .child(format!("![{alt}]({source_label})"))
+                        .into_any_element(),
+                );
             };
             div()
                 .mb_4()
@@ -1482,6 +1630,117 @@ fn render_block(
             })
             .child(text)
             .into_any_element(),
+        BlockKind::Html | BlockKind::Metadata => div()
+            .mb_4()
+            .p_4()
+            .rounded_md()
+            .bg(rgb(0x1c2229))
+            .font_family("SFMono-Regular")
+            .child(text)
+            .into_any_element(),
+        BlockKind::Rule => div()
+            .my_4()
+            .h(px(1.0))
+            .w_full()
+            .bg(rgb(0x3a424d))
+            .into_any_element(),
+        BlockKind::Table { header } => div()
+            .flex()
+            .w_full()
+            .children(block.cells.iter().enumerate().map(|(index, range)| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .p_2()
+                    .border_1()
+                    .border_color(rgb(0x3a424d))
+                    .when(*header, |element| element.font_weight(FontWeight::BOLD))
+                    .when(
+                        block.table_alignments.get(index)
+                            == Some(&pulldown_cmark::Alignment::Center),
+                        |element| element.text_center(),
+                    )
+                    .when(
+                        block.table_alignments.get(index)
+                            == Some(&pulldown_cmark::Alignment::Right),
+                        |element| element.text_right(),
+                    )
+                    .child(styled_fragment(block, range.clone(), cursor, selection))
+            }))
+            .into_any_element(),
+        BlockKind::Math => match math.get(&(block_index, usize::MAX)) {
+            Some(TikzState::Ready(image)) => div()
+                .mb_4()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(0xffffff))
+                .child(img(image.clone()).max_w_full())
+                .into_any_element(),
+            Some(TikzState::Failed(error)) => div()
+                .mb_4()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(0x3a1f24))
+                .text_color(rgb(0xffa7b2))
+                .child(error.clone())
+                .into_any_element(),
+            _ => div()
+                .mb_4()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(0x1c2229))
+                .text_color(rgb(0x98a2ad))
+                .child("正在编译公式…")
+                .into_any_element(),
+        },
+        BlockKind::Footnote(label) => div()
+            .mb_3()
+            .flex()
+            .text_sm()
+            .child(
+                div()
+                    .mr_2()
+                    .text_color(rgb(0x88c0d0))
+                    .child(format!("[^{label}]")),
+            )
+            .child(text)
+            .into_any_element(),
+        BlockKind::DefinitionTitle => div()
+            .mt_3()
+            .font_weight(FontWeight::BOLD)
+            .child(text)
+            .into_any_element(),
+        BlockKind::Definition => div().mb_3().ml_6().child(text).into_any_element(),
+    };
+    decorate_block(block, content)
+}
+
+fn decorate_block(block: &Block, content: AnyElement) -> AnyElement {
+    let marker: Option<SharedString> = if let Some(checked) = block.task {
+        Some(if checked { "☑" } else { "☐" }.into())
+    } else {
+        block.list_marker.clone().map(Into::into)
+    };
+    let content = if let Some(marker) = marker {
+        div()
+            .flex()
+            .ml(px(block.list_depth as f32 * 24.0))
+            .child(div().w(px(30.0)).flex_none().child(marker))
+            .child(div().flex_1().min_w_0().child(content))
+            .into_any_element()
+    } else {
+        content
+    };
+    if block.quote_depth > 0 {
+        div()
+            .pl(px(12.0 * block.quote_depth as f32))
+            .border_l_2()
+            .border_color(rgb(0x56606d))
+            .text_color(rgb(0xb8c0cc))
+            .child(content)
+            .into_any_element()
+    } else {
+        content
     }
 }
 
@@ -1502,12 +1761,32 @@ fn styled_fragment(
                         font_weight: span.bold.then_some(FontWeight::BOLD),
                         font_style: span.italic.then_some(FontStyle::Italic),
                         background_color: span.code.then_some(rgb(0x242a32).into()),
+                        strikethrough: span.strike.then_some(StrikethroughStyle {
+                            thickness: px(1.0),
+                            color: None,
+                        }),
                         ..Default::default()
                     },
                 )
             })
         })
         .collect::<Vec<_>>();
+    highlights.extend(block.links.iter().filter_map(|link| {
+        clipped_range(&link.range, &range).map(|range| {
+            (
+                range,
+                HighlightStyle {
+                    color: Some(rgb(0x88c0d0).into()),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: None,
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+        })
+    }));
     if let Some((start, end)) = selection
         && let (Some(start), Some(end)) =
             (text_range(&block.text, start), text_range(&block.text, end))
@@ -1543,50 +1822,93 @@ fn clipped_range(
 ) -> Option<std::ops::Range<usize>> {
     let start = subject.start.max(container.start);
     let end = subject.end.min(container.end);
-    (start < end).then_some(start - container.start..end - container.start)
+    (start < end).then(|| start - container.start..end - container.start)
+}
+
+enum InlineAtom<'a> {
+    Image(&'a crate::markdown::InlineImage),
+    Math(usize, &'a crate::markdown::InlineMath),
 }
 
 fn render_inline_paragraph(
     block: &Block,
+    math: &HashMap<(usize, usize), TikzState>,
+    block_index: usize,
     note: &Path,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
     let mut children = Vec::new();
     let mut start = 0;
-    for image in &block.images {
-        if start < image.range.start {
+    let mut atoms = block
+        .images
+        .iter()
+        .map(|image| (image.range.clone(), InlineAtom::Image(image)))
+        .chain(
+            block
+                .maths
+                .iter()
+                .enumerate()
+                .map(|(index, math)| (math.range.clone(), InlineAtom::Math(index, math))),
+        )
+        .collect::<Vec<_>>();
+    atoms.sort_by_key(|(range, _)| range.start);
+
+    for (range, atom) in atoms {
+        if start < range.start {
             children.push(
                 div()
                     .child(styled_fragment(
                         block,
-                        start..image.range.start,
+                        start..range.start,
                         cursor,
                         selection,
                     ))
                     .into_any_element(),
             );
         }
-        let offset = block.text[..image.range.start]
+        let offset = block.text[..range.start]
             .chars()
             .filter(|character| *character != '\n')
             .count();
         let active = cursor == Some(offset)
             || selection.is_some_and(|(from, to)| from <= offset && offset <= to);
-        let alt = image.alt.clone();
-        let source = image.source.clone();
-        let child = if let Some(path) = local_image_path(note, &image.source) {
-            img(path)
-                .h(px(24.0))
-                .max_w_full()
-                .with_fallback(move || div().child(alt.clone()).into_any_element())
-                .into_any_element()
-        } else {
-            div()
-                .px_1()
-                .bg(rgb(0x242a32))
-                .child(format!("![{alt}]({source})"))
-                .into_any_element()
+        let child = match atom {
+            InlineAtom::Image(image) => {
+                let alt = image.alt.clone();
+                let source = image.source.clone();
+                if let Some(path) = local_image_path(note, &image.source) {
+                    img(path)
+                        .h(px(24.0))
+                        .max_w_full()
+                        .with_fallback(move || div().child(alt.clone()).into_any_element())
+                        .into_any_element()
+                } else {
+                    div()
+                        .px_1()
+                        .bg(rgb(0x242a32))
+                        .child(format!("![{alt}]({source})"))
+                        .into_any_element()
+                }
+            }
+            InlineAtom::Math(index, formula) => match math.get(&(block_index, index)) {
+                Some(TikzState::Ready(image)) => div()
+                    .px_1()
+                    .bg(rgb(0xffffff))
+                    .child(img(image.clone()).h(px(24.0)).max_w_full())
+                    .into_any_element(),
+                Some(TikzState::Failed(error)) => div()
+                    .px_1()
+                    .bg(rgb(0x3a1f24))
+                    .text_color(rgb(0xffa7b2))
+                    .child(error.clone())
+                    .into_any_element(),
+                _ => div()
+                    .px_1()
+                    .bg(rgb(0x242a32))
+                    .child(format!("${}$", formula.source))
+                    .into_any_element(),
+            },
         };
         children.push(
             div()
@@ -1597,7 +1919,7 @@ fn render_inline_paragraph(
                 .child(child)
                 .into_any_element(),
         );
-        start = image.range.end;
+        start = range.end;
     }
     if start < block.text.len() {
         children.push(
@@ -1622,6 +1944,7 @@ fn render_inline_paragraph(
 
 fn is_object(block: &Block) -> bool {
     matches!(&block.kind, BlockKind::Image(_))
+        || block.kind == BlockKind::Math
         || matches!(&block.kind, BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz"))
 }
 
@@ -1805,9 +2128,18 @@ fn selection_text(blocks: &[Block], selection: ReadingSelection, cursor: Reading
             BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
                 output.push_str("[TikZ]")
             }
+            BlockKind::Math => {
+                output.push_str("$$");
+                output.push_str(&block.text);
+                output.push_str("$$");
+            }
             _ => {
                 if let Some(image) = inline_image_at_offset(block, position.offset) {
                     output.push_str(&image.alt);
+                } else if let Some((_, math)) = inline_math_at_offset(block, position.offset) {
+                    output.push('$');
+                    output.push_str(&math.source);
+                    output.push('$');
                 } else if let Some(character) = cursor_character(blocks, position) {
                     output.push(character);
                 }
@@ -1853,6 +2185,19 @@ fn cursor_character(blocks: &[Block], cursor: ReadingCursor) -> Option<char> {
 fn inline_image_at_offset(block: &Block, offset: usize) -> Option<&crate::markdown::InlineImage> {
     block.images.iter().find(|image| {
         block.text[..image.range.start]
+            .chars()
+            .filter(|character| *character != '\n')
+            .count()
+            == offset
+    })
+}
+
+fn inline_math_at_offset(
+    block: &Block,
+    offset: usize,
+) -> Option<(usize, &crate::markdown::InlineMath)> {
+    block.maths.iter().enumerate().find(|(_, math)| {
+        block.text[..math.range.start]
             .chars()
             .filter(|character| *character != '\n')
             .count()
@@ -2399,5 +2744,15 @@ mod tests {
             .as_deref(),
             Some("beta")
         );
+        assert_eq!(clipped_range(&(0..2), &(4..6)), None);
+
+        let mut app = RusidianApp::open(Some(Path::new("examples/markdown.md")));
+        let link_block = &app.document.as_ref().unwrap().markdown.blocks[1];
+        let byte = link_block.text.find("本地链接").unwrap();
+        app.reading_cursor = ReadingCursor {
+            block: 1,
+            offset: link_block.text[..byte].chars().count(),
+        };
+        assert_eq!(app.current_link().as_deref(), Some("linked.md"));
     }
 }

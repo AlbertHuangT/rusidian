@@ -6,17 +6,28 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const TEMPLATE_VERSION: u8 = 1;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn compile(source: &str) -> Result<Vec<u8>, String> {
+    compile_tex(source, 1, document(source))
+}
+
+pub fn compile_math(source: &str, display: bool) -> Result<Vec<u8>, String> {
+    compile_tex(
+        source,
+        if display { 5 } else { 4 },
+        math_document(source, display),
+    )
+}
+
+fn compile_tex(source: &str, template_version: u8, tex: String) -> Result<Vec<u8>, String> {
     let cache = dirs::cache_dir()
         .ok_or("无法确定系统缓存目录")?
         .join("rusidian/tikz");
     fs::create_dir_all(&cache).map_err(|error| format!("无法创建 TikZ 缓存：{error}"))?;
 
     let mut hasher = DefaultHasher::new();
-    TEMPLATE_VERSION.hash(&mut hasher);
+    template_version.hash(&mut hasher);
     source.hash(&mut hasher);
     let key = format!("{:016x}", hasher.finish());
     let pdf = cache.join(format!("{key}.pdf"));
@@ -30,8 +41,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let result = (|| {
         if !pdf.exists() {
             let input = job.join("input.tex");
-            fs::write(&input, document(source))
-                .map_err(|error| format!("无法写入 TeX：{error}"))?;
+            fs::write(&input, &tex).map_err(|error| format!("无法写入 TeX：{error}"))?;
 
             let output = Command::new("tectonic")
                 .args(["--untrusted", "--color", "never", "--outdir"])
@@ -108,6 +118,17 @@ fn document(source: &str) -> String {
     )
 }
 
+fn math_document(source: &str, display: bool) -> String {
+    let math = if display {
+        format!("$\\displaystyle {source}$")
+    } else {
+        format!("${source}$")
+    };
+    format!(
+        "\\documentclass[border=2pt]{{standalone}}\n\\usepackage{{amsmath,amssymb}}\n\\begin{{document}}\n{math}\n\\end{{document}}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +138,7 @@ mod tests {
         let tex = document("\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}");
         assert!(tex.contains("\\usepackage{tikz}"));
         assert!(tex.contains("\\begin{document}"));
+        assert!(math_document("x^2", false).contains("$x^2$"));
     }
 
     #[test]
@@ -144,5 +166,7 @@ mod tests {
         let png = compile("\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}")
             .expect("TikZ should compile");
         assert!(png.starts_with(b"\x89PNG"));
+        let math = compile_math("x^2 + y^2", true).expect("math should compile");
+        assert!(math.starts_with(b"\x89PNG"));
     }
 }
