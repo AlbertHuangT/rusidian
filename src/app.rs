@@ -1,11 +1,11 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
 use gpui::{
-    AnyElement, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
-    FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding, KeyDownEvent, Keystroke,
-    Menu, MenuItem, PathPromptOptions, Pixels, Point, SharedString, StyledText, UTF16Selection,
-    Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb,
-    size,
+    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
+    FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
+    KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, Pixels, Point, SharedString,
+    StyledText, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas, div, img,
+    point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use std::{
@@ -82,6 +82,7 @@ struct RusidianApp {
     reading_pending_g: bool,
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
+    reading_selection: Option<ReadingSelection>,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -93,10 +94,16 @@ enum View {
     Source,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct ReadingCursor {
     block: usize,
     offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ReadingSelection {
+    anchor: ReadingCursor,
+    linewise: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +143,7 @@ impl RusidianApp {
                 reading_pending_g: false,
                 reading_count: None,
                 reading_find: None,
+                reading_selection: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -171,6 +179,7 @@ impl RusidianApp {
                     reading_pending_g: false,
                     reading_count: None,
                     reading_find: None,
+                    reading_selection: None,
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -191,6 +200,7 @@ impl RusidianApp {
                 reading_pending_g: false,
                 reading_count: None,
                 reading_find: None,
+                reading_selection: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -521,11 +531,16 @@ impl RusidianApp {
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Reading {
             let key = event.keystroke.key_char.as_deref();
-            if let Some(find) = self.reading_find.take() {
-                if event.keystroke.key == "escape" {
-                    self.reading_count = None;
-                    return;
+            if event.keystroke.key == "escape" {
+                self.reading_find = None;
+                self.reading_pending_g = false;
+                self.reading_count = None;
+                if self.reading_selection.take().is_some() {
+                    cx.notify();
                 }
+                return;
+            }
+            if let Some(find) = self.reading_find.take() {
                 if let Some(target) = key.and_then(single_character) {
                     let count = self.take_reading_count();
                     if let Some(blocks) = self
@@ -540,6 +555,36 @@ impl RusidianApp {
                         cx.notify();
                     }
                 }
+                return;
+            }
+            if key == Some("v") || key == Some("V") {
+                let linewise = key == Some("V");
+                self.reading_selection = match self.reading_selection {
+                    Some(selection) if selection.linewise == linewise => None,
+                    _ => Some(ReadingSelection {
+                        anchor: self.reading_cursor,
+                        linewise,
+                    }),
+                };
+                self.reading_count = None;
+                cx.notify();
+                return;
+            }
+            if key == Some("y") {
+                if let Some(selection) = self.reading_selection.take()
+                    && let Some(blocks) = self
+                        .document
+                        .as_ref()
+                        .map(|document| &document.markdown.blocks)
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selection_text(
+                        blocks,
+                        selection,
+                        self.reading_cursor,
+                    )));
+                    cx.notify();
+                }
+                self.reading_count = None;
                 return;
             }
             if let Some(digit) = key.and_then(|key| key.parse::<usize>().ok())
@@ -889,6 +934,9 @@ impl Render for RusidianApp {
         let reading_cursor = self.reading_cursor;
 
         let reading = if let Some(document) = &self.document {
+            let selection = self.reading_selection.and_then(|selection| {
+                selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
+            });
             div()
                 .flex_1()
                 .id("document")
@@ -910,6 +958,9 @@ impl Render for RusidianApp {
                                     &document.file,
                                     (reading_cursor.block == index)
                                         .then_some(reading_cursor.offset),
+                                    selection.and_then(|bounds| {
+                                        selection_for_block(bounds, index, block_len(block))
+                                    }),
                                 )
                             },
                         )),
@@ -1033,8 +1084,9 @@ fn render_block(
     tikz: Option<&TikzState>,
     note: &Path,
     cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
 ) -> AnyElement {
-    let object_cursor = cursor.is_some() && is_object(block);
+    let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
     let mut highlights = block
         .spans
         .iter()
@@ -1050,6 +1102,19 @@ fn render_block(
             )
         })
         .collect::<Vec<_>>();
+    if !object_cursor
+        && let Some((start, end)) = selection
+        && let (Some(start), Some(end)) =
+            (text_range(&block.text, start), text_range(&block.text, end))
+    {
+        highlights.push((
+            start.start..end.end,
+            HighlightStyle {
+                background_color: Some(rgb(0x315b7d).into()),
+                ..Default::default()
+            },
+        ));
+    }
     if !object_cursor && let Some(range) = cursor.and_then(|offset| text_range(&block.text, offset))
     {
         highlights.push((
@@ -1280,6 +1345,95 @@ fn step_cursor(blocks: &[Block], cursor: ReadingCursor, right: bool) -> Option<R
                 offset: block_len(value) - 1,
             })
     }
+}
+
+fn selection_bounds(
+    blocks: &[Block],
+    selection: ReadingSelection,
+    cursor: ReadingCursor,
+) -> Option<(ReadingCursor, ReadingCursor)> {
+    let (mut start, mut end) = if selection.anchor <= cursor {
+        (selection.anchor, cursor)
+    } else {
+        (cursor, selection.anchor)
+    };
+    if selection.linewise {
+        let start_block = blocks.get(start.block)?;
+        let end_block = blocks.get(end.block)?;
+        start = cursor_for_line(
+            start_block,
+            start.block,
+            cursor_line(start_block, start.offset).0,
+            0,
+        )?;
+        end = cursor_for_line(
+            end_block,
+            end.block,
+            cursor_line(end_block, end.offset).0,
+            usize::MAX,
+        )?;
+    }
+    Some((start, end))
+}
+
+fn selection_for_block(
+    (start, end): (ReadingCursor, ReadingCursor),
+    block: usize,
+    length: usize,
+) -> Option<(usize, usize)> {
+    if length == 0 || block < start.block || block > end.block {
+        return None;
+    }
+    Some((
+        if block == start.block {
+            start.offset
+        } else {
+            0
+        },
+        if block == end.block {
+            end.offset
+        } else {
+            length - 1
+        },
+    ))
+}
+
+fn selection_text(blocks: &[Block], selection: ReadingSelection, cursor: ReadingCursor) -> String {
+    let Some((start, end)) = selection_bounds(blocks, selection, cursor) else {
+        return String::new();
+    };
+    let mut output = String::new();
+    let mut position = start;
+    loop {
+        let Some(block) = blocks.get(position.block) else {
+            break;
+        };
+        match &block.kind {
+            BlockKind::Image(_) => output.push_str(&block.text),
+            BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
+                output.push_str("[TikZ]")
+            }
+            _ => {
+                if let Some(character) = cursor_character(blocks, position) {
+                    output.push(character);
+                }
+            }
+        }
+        if position == end {
+            break;
+        }
+        let Some(next) = step_cursor(blocks, position, true) else {
+            break;
+        };
+        if !same_line(blocks, position, next) {
+            output.push('\n');
+        }
+        position = next;
+    }
+    if selection.linewise {
+        output.push('\n');
+    }
+    output
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1606,5 +1760,45 @@ mod tests {
         );
         assert_eq!(single_character("中"), Some('中'));
         assert_eq!(single_character("中文"), None);
+    }
+
+    #[test]
+    fn selects_rendered_text() {
+        let document = crate::markdown::parse("one two\nthree\n\nfour");
+        let blocks = &document.blocks;
+        assert_eq!(
+            selection_text(
+                blocks,
+                ReadingSelection {
+                    anchor: ReadingCursor {
+                        block: 0,
+                        offset: 1
+                    },
+                    linewise: false,
+                },
+                ReadingCursor {
+                    block: 0,
+                    offset: 5
+                },
+            ),
+            "ne tw"
+        );
+        assert_eq!(
+            selection_text(
+                blocks,
+                ReadingSelection {
+                    anchor: ReadingCursor {
+                        block: 0,
+                        offset: 4
+                    },
+                    linewise: true,
+                },
+                ReadingCursor {
+                    block: 0,
+                    offset: 8
+                },
+            ),
+            "one two\nthree\n"
+        );
     }
 }
