@@ -2,6 +2,8 @@
 
 This paragraph has **bold text** and *italic text*.
 
+![Local image](rusidian.svg)
+
 ```tikz
 \begin{tikzpicture}
   \draw[thick, blue] (0,0) circle (1cm);

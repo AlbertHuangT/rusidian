@@ -532,46 +532,45 @@ impl Render for RusidianApp {
             .map(|document| document.name.clone())
             .unwrap_or_else(|| "Rusidian".into());
 
-        let reading =
-            if let Some(document) = &self.document {
-                div()
-                    .flex_1()
-                    .id("document")
-                    .overflow_y_scroll()
-                    .p_8()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .mx_auto()
-                            .w_full()
-                            .max_w(px(820.0))
-                            .text_base()
-                            .children(
-                                document.markdown.blocks.iter().enumerate().map(
-                                    |(index, block)| render_block(block, self.tikz.get(&index)),
-                                ),
-                            ),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .child(div().text_2xl().child("本地 Markdown，真实 Neovim"))
-                    .child(
-                        div().text_sm().text_color(rgb(0x98a2ad)).child(
-                            self.error
-                                .clone()
-                                .unwrap_or_else(|| "运行 rusidian path/to/note.md".into()),
-                        ),
-                    )
-                    .into_any_element()
-            };
+        let reading = if let Some(document) = &self.document {
+            div()
+                .flex_1()
+                .id("document")
+                .overflow_y_scroll()
+                .p_8()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .mx_auto()
+                        .w_full()
+                        .max_w(px(820.0))
+                        .text_base()
+                        .children(document.markdown.blocks.iter().enumerate().map(
+                            |(index, block)| {
+                                render_block(block, self.tikz.get(&index), &document.file)
+                            },
+                        )),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(div().text_2xl().child("本地 Markdown，真实 Neovim"))
+                .child(
+                    div().text_sm().text_color(rgb(0x98a2ad)).child(
+                        self.error
+                            .clone()
+                            .unwrap_or_else(|| "运行 rusidian path/to/note.md".into()),
+                    ),
+                )
+                .into_any_element()
+        };
 
         let body = if self.view == View::Source {
             self.render_source(cx)
@@ -667,7 +666,7 @@ fn source_lines(source: &str) -> Vec<String> {
     }
 }
 
-fn render_block(block: &Block, tikz: Option<&TikzState>) -> AnyElement {
+fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElement {
     let text =
         StyledText::new(block.text.clone()).with_highlights(block.spans.iter().map(|span| {
             (
@@ -693,6 +692,33 @@ fn render_block(block: &Block, tikz: Option<&TikzState>) -> AnyElement {
             .child(text)
             .into_any_element(),
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
+        BlockKind::Image(source) => {
+            let source_label = source.clone();
+            let alt = block.text.clone();
+            let path = Path::new(source);
+            if path.is_absolute() || source.contains("://") || source.starts_with("data:") {
+                return div()
+                    .mb_4()
+                    .p_4()
+                    .rounded_md()
+                    .bg(rgb(0x1c2229))
+                    .child(format!("![{alt}]({source_label})"))
+                    .into_any_element();
+            }
+            let path = note.parent().unwrap_or_else(|| Path::new(".")).join(path);
+            div()
+                .mb_4()
+                .child(img(path).max_w_full().with_fallback(move || {
+                    div()
+                        .p_4()
+                        .rounded_md()
+                        .bg(rgb(0x3a1f24))
+                        .text_color(rgb(0xffa7b2))
+                        .child(format!("无法加载图片：{source_label}"))
+                        .into_any_element()
+                }))
+                .into_any_element()
+        }
         BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => match tikz {
             Some(TikzState::Ready(image)) => div()
                 .mb_4()

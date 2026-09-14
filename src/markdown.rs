@@ -18,6 +18,7 @@ pub enum BlockKind {
     Paragraph,
     Heading(u8),
     Code(Option<String>),
+    Image(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -32,6 +33,7 @@ pub fn parse(source: &str) -> MarkdownDocument {
     let mut current = None;
     let mut bold = 0;
     let mut italic = 0;
+    let mut in_image = false;
 
     for event in Parser::new_ext(source, Options::all()) {
         match event {
@@ -46,10 +48,18 @@ pub fn parse(source: &str) -> MarkdownDocument {
                 };
                 current = Some(Block::new(BlockKind::Code(language)));
             }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
+                if block.kind == BlockKind::Paragraph && block.text.is_empty() {
+                    block.kind = BlockKind::Image(dest_url.into_string());
+                }
+                in_image = true;
+            }
             Event::Start(Tag::Strong) => bold += 1,
             Event::Start(Tag::Emphasis) => italic += 1,
             Event::End(TagEnd::Strong) => bold -= 1,
             Event::End(TagEnd::Emphasis) => italic -= 1,
+            Event::End(TagEnd::Image) => in_image = false,
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock) => {
                 if let Some(block) = current.take() {
                     blocks.push(block);
@@ -57,6 +67,9 @@ pub fn parse(source: &str) -> MarkdownDocument {
             }
             Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
+                if !in_image && matches!(&block.kind, BlockKind::Image(_)) {
+                    block.kind = BlockKind::Paragraph;
+                }
                 block.push(&text, bold > 0, italic > 0);
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -124,5 +137,13 @@ mod tests {
             document.blocks[2].kind,
             BlockKind::Code(Some("rust".into()))
         );
+
+        let images = parse("![图](assets/image.png)\n\n前 ![图](inline.png) 后\n");
+        assert_eq!(
+            images.blocks[0].kind,
+            BlockKind::Image("assets/image.png".into())
+        );
+        assert_eq!(images.blocks[0].text, "图");
+        assert_eq!(images.blocks[1].kind, BlockKind::Paragraph);
     }
 }
