@@ -81,6 +81,7 @@ struct RusidianApp {
     reading_column: Option<usize>,
     reading_pending_g: bool,
     reading_count: Option<usize>,
+    reading_find: Option<FindPending>,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -96,6 +97,12 @@ enum View {
 struct ReadingCursor {
     block: usize,
     offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FindPending {
+    forward: bool,
+    till: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +135,7 @@ impl RusidianApp {
                 reading_column: None,
                 reading_pending_g: false,
                 reading_count: None,
+                reading_find: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -162,6 +170,7 @@ impl RusidianApp {
                     reading_column: None,
                     reading_pending_g: false,
                     reading_count: None,
+                    reading_find: None,
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -181,6 +190,7 @@ impl RusidianApp {
                 reading_column: None,
                 reading_pending_g: false,
                 reading_count: None,
+                reading_find: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -511,10 +521,54 @@ impl RusidianApp {
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Reading {
             let key = event.keystroke.key_char.as_deref();
+            if let Some(find) = self.reading_find.take() {
+                if event.keystroke.key == "escape" {
+                    self.reading_count = None;
+                    return;
+                }
+                if let Some(target) = key.and_then(single_character) {
+                    let count = self.take_reading_count();
+                    if let Some(blocks) = self
+                        .document
+                        .as_ref()
+                        .map(|document| &document.markdown.blocks)
+                        && let Some(cursor) =
+                            find_character(blocks, self.reading_cursor, target, find, count)
+                    {
+                        self.reading_cursor = cursor;
+                        self.reading_column = None;
+                        cx.notify();
+                    }
+                }
+                return;
+            }
             if let Some(digit) = key.and_then(|key| key.parse::<usize>().ok())
                 && (digit != 0 || self.reading_count.is_some())
             {
                 self.reading_count = Some(append_count(self.reading_count.unwrap_or(0), digit));
+                return;
+            }
+            if let Some(find) = match key {
+                Some("f") => Some(FindPending {
+                    forward: true,
+                    till: false,
+                }),
+                Some("F") => Some(FindPending {
+                    forward: false,
+                    till: false,
+                }),
+                Some("t") => Some(FindPending {
+                    forward: true,
+                    till: true,
+                }),
+                Some("T") => Some(FindPending {
+                    forward: false,
+                    till: true,
+                }),
+                _ => None,
+            } {
+                self.reading_find = Some(find);
+                self.reading_pending_g = false;
                 return;
             }
             if key == Some("g") {
@@ -1262,6 +1316,40 @@ fn append_count(current: usize, digit: usize) -> usize {
     current.saturating_mul(10).saturating_add(digit).min(9999)
 }
 
+fn single_character(text: &str) -> Option<char> {
+    let mut characters = text.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then_some(character)
+}
+
+fn find_character(
+    blocks: &[Block],
+    start: ReadingCursor,
+    target: char,
+    find: FindPending,
+    count: usize,
+) -> Option<ReadingCursor> {
+    let mut cursor = start;
+    let mut matches = 0;
+    while let Some(next) = step_cursor(blocks, cursor, find.forward) {
+        if !same_line(blocks, start, next) {
+            break;
+        }
+        cursor = next;
+        if cursor_character(blocks, cursor) == Some(target) {
+            matches += 1;
+            if matches == count {
+                return if find.till {
+                    step_cursor(blocks, cursor, !find.forward)
+                } else {
+                    Some(cursor)
+                };
+            }
+        }
+    }
+    None
+}
+
 fn cursor_word_class(blocks: &[Block], cursor: ReadingCursor) -> Option<WordClass> {
     cursor_character(blocks, cursor).map(word_class)
 }
@@ -1483,5 +1571,40 @@ mod tests {
         );
         assert_eq!(append_count(12, 3), 123);
         assert_eq!(append_count(9999, 9), 9999);
+    }
+
+    #[test]
+    fn finds_characters_with_vim_semantics() {
+        let document = crate::markdown::parse("a.b.a");
+        let blocks = &document.blocks;
+        let forward = FindPending {
+            forward: true,
+            till: false,
+        };
+        assert_eq!(
+            find_character(blocks, ReadingCursor::default(), '.', forward, 2),
+            Some(ReadingCursor {
+                block: 0,
+                offset: 3
+            })
+        );
+        assert_eq!(
+            find_character(
+                blocks,
+                ReadingCursor::default(),
+                '.',
+                FindPending {
+                    till: true,
+                    ..forward
+                },
+                2,
+            ),
+            Some(ReadingCursor {
+                block: 0,
+                offset: 2
+            })
+        );
+        assert_eq!(single_character("中"), Some('中'));
+        assert_eq!(single_character("中文"), None);
     }
 }
