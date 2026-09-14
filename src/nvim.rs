@@ -14,6 +14,12 @@ pub struct Client {
 
 pub enum Event {
     Redraw(Vec<Value>),
+    BufferLines {
+        first: usize,
+        last: Option<usize>,
+        lines: Vec<String>,
+        more: bool,
+    },
     Error(String),
 }
 
@@ -30,8 +36,34 @@ impl Handler for EventHandler {
     type Writer = Compat<ChildStdin>;
 
     async fn handle_notify(&self, name: String, args: Vec<Value>, _: Neovim<Self::Writer>) {
-        if name == "redraw" {
-            let _ = self.0.try_send(Event::Redraw(args));
+        match name.as_str() {
+            "redraw" => {
+                let _ = self.0.try_send(Event::Redraw(args));
+            }
+            "nvim_buf_lines_event" if args.get(1).is_some_and(|tick| !tick.is_nil()) => {
+                let Some(first) = args.get(2).and_then(Value::as_u64) else {
+                    return;
+                };
+                let Some(last) = args.get(3).and_then(Value::as_i64) else {
+                    return;
+                };
+                let Some(lines) = args.get(4).and_then(Value::as_array) else {
+                    return;
+                };
+                let lines = lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let more = args.get(5).and_then(Value::as_bool).unwrap_or(false);
+                let _ = self.0.try_send(Event::BufferLines {
+                    first: first as usize,
+                    last: (last >= 0).then_some(last as usize),
+                    lines,
+                    more,
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -76,6 +108,21 @@ impl Client {
                 if let Err(error) = nvim.ui_attach(120, 40, &options).await {
                     let _ = event_sender
                         .send(Event::Error(format!("无法连接 Neovim UI：{error}")))
+                        .await;
+                    return;
+                }
+                let buffer = match nvim.get_current_buf().await {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        let _ = event_sender
+                            .send(Event::Error(format!("无法读取 Neovim buffer：{error}")))
+                            .await;
+                        return;
+                    }
+                };
+                if let Err(error) = buffer.attach(true, Vec::new()).await {
+                    let _ = event_sender
+                        .send(Event::Error(format!("无法监听 Neovim buffer：{error}")))
                         .await;
                     return;
                 }
@@ -406,14 +453,21 @@ mod tests {
             .block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     let mut grid = Grid::default();
+                    let mut saw_buffer = false;
                     loop {
                         match client.events.recv().await.unwrap() {
-                            Event::Redraw(events)
-                                if grid.apply_redraw(&events) && grid.width > 0 =>
-                            {
-                                break grid;
+                            Event::Redraw(events) => {
+                                grid.apply_redraw(&events);
+                                if grid.width > 0 && saw_buffer {
+                                    break grid;
+                                }
                             }
-                            Event::Redraw(_) => {}
+                            Event::BufferLines { lines, .. } => {
+                                saw_buffer = lines.iter().any(|line| line.contains("TikZ preview"));
+                                if grid.width > 0 && saw_buffer {
+                                    break grid;
+                                }
+                            }
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -434,6 +488,7 @@ mod tests {
                             Event::Redraw(events) => {
                                 grid.apply_redraw(&events);
                             }
+                            Event::BufferLines { .. } => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -453,6 +508,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                                 mode.clone_from(&grid.mode);
                             }
+                            Event::BufferLines { .. } => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -472,6 +528,7 @@ mod tests {
                             Event::Redraw(events) => {
                                 grid.apply_redraw(&events);
                             }
+                            Event::BufferLines { .. } => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -489,6 +546,7 @@ mod tests {
                             Event::Redraw(events) => {
                                 grid.apply_redraw(&events);
                             }
+                            Event::BufferLines { .. } => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }

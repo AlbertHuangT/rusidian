@@ -63,6 +63,7 @@ struct Document {
     file: PathBuf,
     name: SharedString,
     path: SharedString,
+    lines: Vec<String>,
     markdown: MarkdownDocument,
 }
 
@@ -111,29 +112,33 @@ impl RusidianApp {
         };
 
         match std::fs::read_to_string(path) {
-            Ok(content) => Self {
-                document: Some(Document {
-                    file: path.to_path_buf(),
-                    name: path
-                        .file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                        .into(),
-                    path: path.to_string_lossy().into_owned().into(),
-                    markdown: crate::markdown::parse(&content),
-                }),
-                error: None,
-                tikz: HashMap::new(),
-                view: View::Reading,
-                nvim: None,
-                grid: NvimGrid::default(),
-                nvim_error: None,
-                nvim_size: (120, 40),
-                focus_handle: None,
-                marked_text: String::new(),
-                marked_selection: 0..0,
-            },
+            Ok(content) => {
+                let lines = source_lines(&content);
+                Self {
+                    document: Some(Document {
+                        file: path.to_path_buf(),
+                        name: path
+                            .file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned()
+                            .into(),
+                        path: path.to_string_lossy().into_owned().into(),
+                        lines,
+                        markdown: crate::markdown::parse(&content),
+                    }),
+                    error: None,
+                    tikz: HashMap::new(),
+                    view: View::Reading,
+                    nvim: None,
+                    grid: NvimGrid::default(),
+                    nvim_error: None,
+                    nvim_size: (120, 40),
+                    focus_handle: None,
+                    marked_text: String::new(),
+                    marked_selection: 0..0,
+                }
+            }
             Err(error) => Self {
                 document: None,
                 error: Some(format!("无法打开 {}：{error}", path.display()).into()),
@@ -217,6 +222,20 @@ impl RusidianApp {
                             cx.notify();
                         }
                     }
+                    NvimEvent::BufferLines {
+                        first,
+                        last,
+                        lines,
+                        more,
+                    } => {
+                        if this.update_buffer(first, last, lines, more) && !more {
+                            this.tikz.clear();
+                            if this.view == View::Reading {
+                                this.compile_tikz(cx);
+                            }
+                            cx.notify();
+                        }
+                    }
                     NvimEvent::Error(error) => {
                         this.nvim_error = Some(error.into());
                         cx.notify();
@@ -259,6 +278,27 @@ impl RusidianApp {
         .detach();
     }
 
+    fn update_buffer(
+        &mut self,
+        first: usize,
+        last: Option<usize>,
+        replacement: Vec<String>,
+        more: bool,
+    ) -> bool {
+        let Some(document) = &mut self.document else {
+            return false;
+        };
+        let end = last.unwrap_or(document.lines.len());
+        if first > end || end > document.lines.len() {
+            return false;
+        }
+        document.lines.splice(first..end, replacement);
+        if !more {
+            document.markdown = crate::markdown::parse(&document.lines.join("\n"));
+        }
+        true
+    }
+
     fn enter_source_normal(
         &mut self,
         _: &EnterSourceNormal,
@@ -281,6 +321,7 @@ impl RusidianApp {
         }
         if event.keystroke.key == "escape" && self.grid.is_normal() {
             self.view = View::Reading;
+            self.compile_tikz(cx);
             cx.notify();
         } else if self.grid.accepts_text_input()
             && event.keystroke.key_char.is_some()
@@ -617,6 +658,15 @@ fn nvim_key(key: &Keystroke) -> String {
     format!("<{modifiers}{key_name}>")
 }
 
+fn source_lines(source: &str) -> Vec<String> {
+    let lines = source.lines().map(str::to_owned).collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
 fn render_block(block: &Block, tikz: Option<&TikzState>) -> AnyElement {
     let text =
         StyledText::new(block.text.clone()).with_highlights(block.spans.iter().map(|span| {
@@ -705,5 +755,15 @@ mod tests {
         assert_eq!(nvim_key(&Keystroke::parse("a").unwrap()), "a");
         assert_eq!(nvim_key(&Keystroke::parse("ctrl-a").unwrap()), "<C-a>");
         assert_eq!(nvim_key(&Keystroke::parse("left").unwrap()), "<Left>");
+    }
+
+    #[test]
+    fn updates_preview_from_neovim_lines() {
+        let mut app = RusidianApp::open(Some(Path::new("README.md")));
+        assert!(app.update_buffer(0, None, vec!["# 未保存标题".into()], false));
+        assert_eq!(
+            app.document.unwrap().markdown.blocks[0].kind,
+            BlockKind::Heading(1)
+        );
     }
 }
