@@ -22,11 +22,14 @@ pub enum Event {
     },
     Warning(String),
     Error(String),
+    CloseRefused(String),
+    Exited,
 }
 
 enum Command {
     Input(String),
     Resize(i64, i64),
+    Close,
 }
 
 #[derive(Clone)]
@@ -89,11 +92,12 @@ impl Client {
             runtime.block_on(async move {
                 let handler = EventHandler(event_sender.clone());
                 let mut command = tokio::process::Command::new("nvim");
+                command.kill_on_drop(true);
                 command.arg("--embed");
                 if clean {
                     command.arg("--clean");
                 }
-                command.arg(path);
+                command.arg("--").arg(path);
                 let (nvim, io, _child) = match create::new_child_cmd(&mut command, handler).await {
                     Ok(session) => session,
                     Err(error) => {
@@ -154,14 +158,25 @@ impl Client {
                     let _ = event_sender.send(Event::Warning(warnings.join("\n"))).await;
                 }
 
+                let exit_sender = event_sender.clone();
                 tokio::spawn(async move {
                     let _ = io.await;
+                    let _ = exit_sender.send(Event::Exited).await;
                 });
 
                 while let Some(command) = command_receiver.recv().await {
                     match command {
+                        Command::Close => {
+                            if let Err(error) = nvim.command("qall").await
+                                && !error.is_channel_closed()
+                            {
+                                let _ = event_sender.send(Event::CloseRefused(format!(
+                                    "Neovim 拒绝关闭：{error}。请用 :w 保存，或自行用 :q! 放弃修改。"
+                                ))).await;
+                            }
+                        }
                         Command::Input(keys) => {
-                            if let Err(error) = nvim.input(&keys).await {
+                            if let Err(error) = send_input(&nvim, &keys).await {
                                 let _ = event_sender
                                     .send(Event::Error(format!("Neovim 输入失败：{error}")))
                                     .await;
@@ -188,9 +203,34 @@ impl Client {
         let _ = self.commands.send(Command::Input(keys.into()));
     }
 
+    pub fn input_text(&self, text: &str) {
+        self.input(text.replace('<', "<lt>"));
+    }
+
+    pub fn close(&self) -> bool {
+        self.commands.send(Command::Close).is_ok()
+    }
+
     pub fn resize(&self, width: i64, height: i64) {
         let _ = self.commands.send(Command::Resize(width, height));
     }
+}
+
+async fn send_input(nvim: &Neovim<Compat<ChildStdin>>, mut keys: &str) -> Result<(), String> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !keys.is_empty() {
+            let consumed = nvim.input(keys).await.map_err(|error| error.to_string())?;
+            keys = keys
+                .get(consumed as usize..)
+                .ok_or("Neovim 返回了无效的输入长度")?;
+            if consumed == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Neovim 输入超时，部分文字可能未送达".to_owned())?
 }
 
 fn escape_mapping(maps: &[Vec<(Value, Value)>]) -> Option<String> {
@@ -235,6 +275,8 @@ pub struct Highlight {
     pub italic: bool,
 }
 
+type StyledLine = (String, Vec<(Range<usize>, Highlight)>, Option<Range<usize>>);
+
 impl Grid {
     pub fn apply_redraw(&mut self, events: &[Value]) -> bool {
         let mut flush = false;
@@ -271,10 +313,7 @@ impl Grid {
         self.styled_lines().map(|(text, _, cursor)| (text, cursor))
     }
 
-    pub fn styled_lines(
-        &self,
-    ) -> impl Iterator<Item = (String, Vec<(Range<usize>, Highlight)>, Option<Range<usize>>)> + '_
-    {
+    pub fn styled_lines(&self) -> impl Iterator<Item = StyledLine> + '_ {
         self.cells.iter().enumerate().map(|(row, cells)| {
             let content_end = cells
                 .iter()
@@ -659,7 +698,8 @@ mod tests {
                                 }
                             }
                             Event::Warning(_) => {}
-                            Event::Error(error) => panic!("{error}"),
+                            Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                            Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
                     }
                 })
@@ -681,7 +721,8 @@ mod tests {
                             }
                             Event::BufferLines { .. } => {}
                             Event::Warning(_) => {}
-                            Event::Error(error) => panic!("{error}"),
+                            Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                            Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
                     }
                 })
@@ -702,7 +743,8 @@ mod tests {
                             }
                             Event::BufferLines { .. } => {}
                             Event::Warning(_) => {}
-                            Event::Error(error) => panic!("{error}"),
+                            Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                            Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
                     }
                     mode
@@ -723,7 +765,8 @@ mod tests {
                             }
                             Event::BufferLines { .. } => {}
                             Event::Warning(_) => {}
-                            Event::Error(error) => panic!("{error}"),
+                            Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                            Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
                     }
                 })
@@ -742,12 +785,60 @@ mod tests {
                             }
                             Event::BufferLines { .. } => {}
                             Event::Warning(_) => {}
-                            Event::Error(error) => panic!("{error}"),
+                            Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                            Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
                     }
                 })
                 .await
             })
             .expect("Neovim did not return to Normal within five seconds");
+
+        // Exercise literal key notation and input larger than Neovim's input queue.
+        let literal = format!("<Esc>{}", "中文-".repeat(2048));
+        client.input("A");
+        client.input_text(&literal);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match client.events.recv().await.unwrap() {
+                        Event::BufferLines { lines, .. }
+                            if lines.iter().any(|line| line.ends_with(&literal)) =>
+                        {
+                            break;
+                        }
+                        Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                        Event::Exited => panic!("Neovim exited before receiving all input"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("literal input was truncated or interpreted as keys");
+        });
+        client.input("<Esc>");
+        assert!(client.close());
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match client.events.recv().await.unwrap() {
+                        Event::CloseRefused(_) => break,
+                        Event::Exited => panic!("closing discarded unsaved edits"),
+                        Event::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("Neovim did not reject closing a modified buffer");
+        });
+        client.input(":qall!<CR>");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(client.events.recv().await.unwrap(), Event::Exited) {}
+            })
+            .await
+            .expect("Neovim exit was not reported");
+        });
     }
 }

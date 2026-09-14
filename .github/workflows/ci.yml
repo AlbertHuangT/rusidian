@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  macos:
+    name: macOS ARM64
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "$RELEASE_TAG" = "v$version"
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked
+      - name: Install integration dependencies
+        run: brew install neovim tectonic
+      - name: Neovim and Tectonic integration tests
+        run: cargo test --locked -- --ignored --test-threads=1
+      - name: Build prototype
+        run: cargo build --locked --release
+      - name: Package prototype
+        run: |
+          mkdir -p dist/rusidian-macos-arm64
+          cp target/release/rusidian README.md PRODUCT.md CONTEXT.md PLAN.html dist/rusidian-macos-arm64/
+          cp -R examples assets docs dist/rusidian-macos-arm64/
+          file dist/rusidian-macos-arm64/rusidian | grep -q arm64
+          otool -L dist/rusidian-macos-arm64/rusidian
+          tar -czf dist/rusidian-macos-arm64.tar.gz -C dist rusidian-macos-arm64
+          cd dist
+          shasum -a 256 rusidian-macos-arm64.tar.gz > SHA256SUMS
+      - name: Upload prototype
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rusidian-macos-arm64-${{ github.sha }}
+          path: |
+            dist/rusidian-macos-arm64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Draft prerelease
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rusidian-macos-arm64-${{ github.sha }}
+          path: dist
+      - name: Create draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; leaving existing assets unchanged.'
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" dist/rusidian-macos-arm64.tar.gz dist/SHA256SUMS \
+            --verify-tag --draft --prerelease --title "Rusidian $RELEASE_TAG — technical prototype" \
+            --notes 'Unsigned macOS ARM64 prototype. Requires Neovim; TikZ and math require Tectonic. This is not a signed or notarized application bundle. See README for setup and current limitations.'

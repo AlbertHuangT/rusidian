@@ -6,17 +6,34 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const TEMPLATE_VERSION: u8 = 1;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn compile(source: &str) -> Result<Vec<u8>, String> {
+    compile_tex(source, 1, document(source), 1)
+}
+
+pub fn compile_math(source: &str, display: bool) -> Result<Vec<u8>, String> {
+    compile_tex(
+        source,
+        if display { 7 } else { 6 },
+        math_document(source, display),
+        4,
+    )
+}
+
+fn compile_tex(
+    source: &str,
+    template_version: u8,
+    tex: String,
+    raster_scale: u32,
+) -> Result<Vec<u8>, String> {
     let cache = dirs::cache_dir()
         .ok_or("无法确定系统缓存目录")?
         .join("rusidian/tikz");
     fs::create_dir_all(&cache).map_err(|error| format!("无法创建 TikZ 缓存：{error}"))?;
 
     let mut hasher = DefaultHasher::new();
-    TEMPLATE_VERSION.hash(&mut hasher);
+    template_version.hash(&mut hasher);
     source.hash(&mut hasher);
     let key = format!("{:016x}", hasher.finish());
     let pdf = cache.join(format!("{key}.pdf"));
@@ -30,8 +47,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let result = (|| {
         if !pdf.exists() {
             let input = job.join("input.tex");
-            fs::write(&input, document(source))
-                .map_err(|error| format!("无法写入 TeX：{error}"))?;
+            fs::write(&input, &tex).map_err(|error| format!("无法写入 TeX：{error}"))?;
 
             let output = Command::new("tectonic")
                 .args(["--untrusted", "--color", "never", "--outdir"])
@@ -54,8 +70,18 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
         }
 
         let preview = job.join("preview.png");
-        let output = Command::new("sips")
-            .args(["-s", "format", "png"])
+        let mut command = Command::new("sips");
+        command.args(["-s", "format", "png"]);
+        if raster_scale > 1
+            && let Some((width, height)) = pdf_dimensions(&pdf)
+        {
+            command.args([
+                "-z",
+                &(height * raster_scale).to_string(),
+                &(width * raster_scale).to_string(),
+            ]);
+        }
+        let output = command
             .arg(&pdf)
             .arg("--out")
             .arg(&preview)
@@ -73,6 +99,30 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let _ = fs::remove_dir_all(&job);
 
     result
+}
+
+fn pdf_dimensions(pdf: &std::path::Path) -> Option<(u32, u32)> {
+    let output = Command::new("sips")
+        .args(["-g", "pixelWidth", "-g", "pixelHeight"])
+        .arg(pdf)
+        .output()
+        .ok()?;
+    let output = String::from_utf8(output.stdout).ok()?;
+    parse_dimensions(&output)
+}
+
+fn parse_dimensions(output: &str) -> Option<(u32, u32)> {
+    let value = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(name))?
+            .trim_start_matches(':')
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| value.ceil() as u32)
+    };
+    Some((value("pixelWidth")?, value("pixelHeight")?))
 }
 
 fn prune_cache(cache: &std::path::Path, max_bytes: u64) -> Result<(), String> {
@@ -108,6 +158,17 @@ fn document(source: &str) -> String {
     )
 }
 
+fn math_document(source: &str, display: bool) -> String {
+    let math = if display {
+        format!("$\\displaystyle {source}$")
+    } else {
+        format!("${source}$")
+    };
+    format!(
+        "\\documentclass[border=2pt]{{standalone}}\n\\usepackage{{amsmath,amssymb,xcolor}}\n\\begin{{document}}\n\\color{{white}}{math}\n\\end{{document}}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +178,11 @@ mod tests {
         let tex = document("\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}");
         assert!(tex.contains("\\usepackage{tikz}"));
         assert!(tex.contains("\\begin{document}"));
+        assert!(math_document("x^2", false).contains("$x^2$"));
+        assert_eq!(
+            parse_dimensions("  pixelWidth: 63\n  pixelHeight: 29\n"),
+            Some((63, 29))
+        );
     }
 
     #[test]
@@ -144,5 +210,8 @@ mod tests {
         let png = compile("\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}")
             .expect("TikZ should compile");
         assert!(png.starts_with(b"\x89PNG"));
+        let math = compile_math("x^2 + y^2", true).expect("math should compile");
+        assert!(math.starts_with(b"\x89PNG"));
+        assert!(u32::from_be_bytes(math[16..20].try_into().unwrap()) > 100);
     }
 }
