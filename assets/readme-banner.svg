@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="title desc">
+  <title id="title">Rusidian — Your notes. Your Neovim.</title>
+  <desc id="desc">Local Markdown files connect real Neovim editing with a dedicated native reading view.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1">
+      <stop stop-color="#111d27"/>
+      <stop offset="1" stop-color="#142d32"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="400" rx="24" fill="url(#bg)"/>
+  <circle cx="1100" cy="-40" r="285" fill="none" stroke="#254449"/>
+  <circle cx="1100" cy="-40" r="225" fill="none" stroke="#254449"/>
+  <rect x="64" y="60" width="48" height="48" rx="13" fill="#a4e4c7"/>
+  <g font-family="system-ui, -apple-system, sans-serif">
+    <text x="88" y="94" text-anchor="middle" font-size="32" font-weight="750" fill="#122b2b">R</text>
+    <text x="130" y="94" font-size="30" font-weight="650" fill="#f3f7f5">Rusidian</text>
+    <text x="64" y="190" font-size="56" font-weight="650" letter-spacing="-2" fill="#f3f7f5">Your notes.</text>
+    <text x="64" y="252" font-size="56" font-weight="650" letter-spacing="-2" fill="#a4e4c7">Your Neovim.</text>
+    <text x="66" y="306" font-size="19" fill="#aac0c3">Native Markdown. A quieter place to think.</text>
+    <text x="66" y="357" font-size="12" letter-spacing="3" fill="#8fa9ad">RUST + GPUI  /  LOCAL FIRST</text>
+    <rect x="742" y="124" width="380" height="168" rx="18" fill="#102126" stroke="#345458"/>
+    <text x="932" y="162" text-anchor="middle" font-size="12" letter-spacing="3" fill="#8fa9ad">PLAIN MARKDOWN FILES</text>
+    <path d="M932 181v22m-95 0h190m-190 0v20m190-20v20" fill="none" stroke="#608984" stroke-width="2"/>
+    <rect x="772" y="224" width="132" height="40" rx="8" fill="#25453f"/>
+    <rect x="962" y="224" width="132" height="40" rx="8" fill="#25453f"/>
+    <text x="838" y="250" text-anchor="middle" font-size="16" fill="#dceee5">Neovim</text>
+    <text x="1028" y="250" text-anchor="middle" font-size="16" fill="#dceee5">Reading view</text>
+  </g>
+</svg>

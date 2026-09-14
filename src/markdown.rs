@@ -147,7 +147,6 @@ pub fn parse(source: &str) -> MarkdownDocument {
                         depth: lists.len().saturating_sub(1),
                         used: false,
                     });
-                    current = Some(new_block(BlockKind::Paragraph, quote_depth, &mut items));
                 }
                 Tag::TableHead => {
                     let mut block =
@@ -206,7 +205,10 @@ pub fn parse(source: &str) -> MarkdownDocument {
                 | TagEnd::CodeBlock
                 | TagEnd::HtmlBlock
                 | TagEnd::MetadataBlock(_) => push_current(&mut blocks, &mut current),
-                TagEnd::BlockQuote(_) => quote_depth = quote_depth.saturating_sub(1),
+                TagEnd::BlockQuote(_) => {
+                    push_current(&mut blocks, &mut current);
+                    quote_depth = quote_depth.saturating_sub(1);
+                }
                 TagEnd::List(_) => {
                     lists.pop();
                 }
@@ -275,6 +277,7 @@ pub fn parse(source: &str) -> MarkdownDocument {
                     .push_math(text.into_string());
             }
             Event::DisplayMath(text) => {
+                push_current(&mut blocks, &mut current);
                 let mut block = new_block(BlockKind::Math, quote_depth, &mut items);
                 block.push(&text, false, false, false, false, None);
                 blocks.push(block);
@@ -293,9 +296,9 @@ pub fn parse(source: &str) -> MarkdownDocument {
             }
             Event::Rule => blocks.push(new_block(BlockKind::Rule, quote_depth, &mut items)),
             Event::TaskListMarker(checked) => {
-                if let Some(block) = &mut current {
-                    block.task = Some(checked);
-                }
+                current
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .task = Some(checked);
             }
             Event::FootnoteReference(label) => {
                 current
@@ -336,6 +339,12 @@ fn new_block(kind: BlockKind, quote_depth: usize, items: &mut [ItemState]) -> Bl
 
 fn push_current(blocks: &mut Vec<Block>, current: &mut Option<Block>) {
     if let Some(mut block) = current.take() {
+        if block.kind == BlockKind::Paragraph
+            && block.text.is_empty()
+            && block.list_marker.is_none()
+        {
+            return;
+        }
         block.finish();
         blocks.push(block);
     }
@@ -413,6 +422,28 @@ fn heading_level(level: HeadingLevel) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_display_math_order_and_list_markers() {
+        let document = parse("before $$x$$ after");
+        assert_eq!(
+            document
+                .blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            ["before ", "x", " after"]
+        );
+        let document = parse("- # Heading\n\n- ```rust\n  code\n  ```\n\n- [x] done\n");
+        assert_eq!(document.blocks.len(), 3);
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| block.list_marker.as_deref() == Some("•"))
+        );
+        assert_eq!(document.blocks[2].task, Some(true));
+    }
 
     #[test]
     fn parses_commonmark_and_gfm_blocks() {

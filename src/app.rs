@@ -25,7 +25,6 @@ pub fn run(initial_path: Option<PathBuf>) {
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
         ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus([
             Menu::new("Rusidian").items([MenuItem::action("退出 Rusidian", Quit)]),
             Menu::new("文件").items([MenuItem::action("打开文件…", OpenFile)]),
@@ -50,6 +49,19 @@ pub fn run(initial_path: Option<PathBuf>) {
                 if let Some(focus) = focus {
                     window.focus(&focus, cx);
                 }
+                let quit_app = app.downgrade();
+                cx.on_action(move |_: &Quit, cx| {
+                    quit_app
+                        .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
+                        .ok();
+                });
+                let close_app = app.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    close_app
+                        .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
+                        .ok();
+                    false
+                });
                 app
             },
         )
@@ -74,6 +86,7 @@ struct RusidianApp {
     math: HashMap<(usize, usize), TikzState>,
     view: View,
     nvim: Option<NvimClient>,
+    pending_close: Option<PendingClose>,
     grid: NvimGrid,
     nvim_error: Option<SharedString>,
     nvim_warning: Option<SharedString>,
@@ -96,6 +109,11 @@ struct RusidianApp {
 enum View {
     Reading,
     Source,
+}
+
+enum PendingClose {
+    Open(PathBuf),
+    Quit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -145,6 +163,7 @@ impl RusidianApp {
                 math: HashMap::new(),
                 view: View::Reading,
                 nvim: None,
+                pending_close: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
                 nvim_warning: None,
@@ -185,6 +204,7 @@ impl RusidianApp {
                     math: HashMap::new(),
                     view: View::Reading,
                     nvim: None,
+                    pending_close: None,
                     grid: NvimGrid::default(),
                     nvim_error: None,
                     nvim_warning: None,
@@ -210,6 +230,7 @@ impl RusidianApp {
                 math: HashMap::new(),
                 view: View::Reading,
                 nvim: None,
+                pending_close: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
                 nvim_warning: None,
@@ -352,42 +373,94 @@ impl RusidianApp {
 
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
-                let result = this.update(cx, |this, cx| match event {
-                    NvimEvent::Redraw(events) => {
-                        if this.grid.apply_redraw(&events) {
-                            cx.notify();
-                        }
+                let result = this.update(cx, |this, cx| {
+                    if !this
+                        .nvim
+                        .as_ref()
+                        .is_some_and(|client| client.events.same_channel(&events))
+                    {
+                        return false;
                     }
-                    NvimEvent::BufferLines {
-                        first,
-                        last,
-                        lines,
-                        more,
-                    } => {
-                        if this.update_buffer(first, last, lines, more) && !more {
-                            this.tikz.clear();
-                            this.math.clear();
-                            if this.view == View::Reading {
-                                this.compile_visuals(cx);
+                    match event {
+                        NvimEvent::Redraw(events) => {
+                            if this.grid.apply_redraw(&events) {
+                                cx.notify();
                             }
+                        }
+                        NvimEvent::BufferLines {
+                            first,
+                            last,
+                            lines,
+                            more,
+                        } => {
+                            if this.update_buffer(first, last, lines, more) && !more {
+                                this.tikz.clear();
+                                this.math.clear();
+                                if this.view == View::Reading {
+                                    this.compile_visuals(cx);
+                                }
+                                cx.notify();
+                            }
+                        }
+                        NvimEvent::Error(error) => {
+                            this.nvim_error = Some(error.into());
                             cx.notify();
                         }
+                        NvimEvent::Warning(warning) => {
+                            this.nvim_warning = Some(warning.into());
+                            cx.notify();
+                        }
+                        NvimEvent::CloseRefused(warning) => {
+                            this.pending_close = None;
+                            this.nvim_warning = Some(warning.into());
+                            this.view = View::Source;
+                            cx.notify();
+                        }
+                        NvimEvent::Exited => {
+                            this.nvim = None;
+                            if let Some(action) = this.pending_close.take() {
+                                this.request_close(action, cx);
+                            } else {
+                                this.nvim_error =
+                                    Some("Neovim 已退出；按 Enter 可重新打开源码视图".into());
+                                this.view = View::Reading;
+                                cx.notify();
+                            }
+                            return false;
+                        }
                     }
-                    NvimEvent::Error(error) => {
-                        this.nvim_error = Some(error.into());
-                        cx.notify();
-                    }
-                    NvimEvent::Warning(warning) => {
-                        this.nvim_warning = Some(warning.into());
-                        cx.notify();
-                    }
+                    true
                 });
-                if result.is_err() {
+                if !matches!(result, Ok(true)) {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    fn request_close(&mut self, action: PendingClose, cx: &mut Context<Self>) {
+        if let Some(nvim) = &self.nvim {
+            if self.pending_close.is_some() {
+                return;
+            }
+            if nvim.close() {
+                self.pending_close = Some(action);
+                return;
+            }
+            self.nvim = None;
+        }
+        match action {
+            PendingClose::Open(path) => {
+                let focus = self.focus_handle.clone();
+                *self = Self::open(Some(&path));
+                self.focus_handle = focus;
+                self.compile_visuals(cx);
+                self.start_nvim(cx);
+                cx.notify();
+            }
+            PendingClose::Quit => cx.quit(),
+        }
     }
 
     fn choose_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -407,12 +480,7 @@ impl RusidianApp {
             };
 
             this.update_in(cx, |this, _, cx| {
-                let focus_handle = this.focus_handle.clone();
-                *this = Self::open(Some(&path));
-                this.focus_handle = focus_handle;
-                this.compile_visuals(cx);
-                this.start_nvim(cx);
-                cx.notify();
+                this.request_close(PendingClose::Open(path), cx);
             })
             .ok();
         })
@@ -650,11 +718,7 @@ impl RusidianApp {
             self.nvim_warning = Some(format!("找不到链接文件：{}", path.display()).into());
             return;
         }
-        let focus = self.focus_handle.clone();
-        *self = Self::open(Some(&path));
-        self.focus_handle = focus;
-        self.compile_visuals(cx);
-        self.start_nvim(cx);
+        self.request_close(PendingClose::Open(path), cx);
     }
 
     fn open_external_link(&self, cx: &mut Context<Self>) {
@@ -795,6 +859,11 @@ impl RusidianApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.nvim.is_none() {
+            self.nvim_error = None;
+            self.grid = NvimGrid::default();
+            self.start_nvim(cx);
+        }
         self.view = View::Source;
         if let Some(focus) = &self.focus_handle {
             window.focus(focus, cx);
@@ -1118,7 +1187,7 @@ impl RusidianApp {
                         ));
                     } else {
                         let start = range.start;
-                        line.insert_str(start, &marked_text);
+                        insert_marked_text(&mut line, &mut highlights, start, &marked_text);
                         highlights.push((
                             start..start + marked_text.len(),
                             HighlightStyle {
@@ -1214,7 +1283,7 @@ impl EntityInputHandler for RusidianApp {
         if let Some(search) = &mut self.reading_search {
             search.query.push_str(text);
         } else if let Some(nvim) = &self.nvim {
-            nvim.input(text);
+            nvim.input_text(text);
         }
         window.invalidate_character_coordinates();
         cx.notify();
@@ -1442,6 +1511,23 @@ impl Render for RusidianApp {
                     )
                 },
             )
+    }
+}
+
+fn insert_marked_text(
+    line: &mut String,
+    highlights: &mut [(std::ops::Range<usize>, HighlightStyle)],
+    at: usize,
+    marked: &str,
+) {
+    line.insert_str(at, marked);
+    for (range, _) in highlights {
+        if range.start >= at {
+            range.start += marked.len();
+            range.end += marked.len();
+        } else if range.end > at {
+            range.end += marked.len();
+        }
     }
 }
 
@@ -2128,10 +2214,7 @@ fn selection_text(blocks: &[Block], selection: ReadingSelection, cursor: Reading
     };
     let mut output = String::new();
     let mut position = start;
-    loop {
-        let Some(block) = blocks.get(position.block) else {
-            break;
-        };
+    while let Some(block) = blocks.get(position.block) {
         match &block.kind {
             BlockKind::Image(_) => output.push_str(&block.text),
             BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
@@ -2442,6 +2525,28 @@ fn end_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composition_keeps_highlights_on_character_boundaries() {
+        let mut line = "abc中文".to_owned();
+        let mut highlights = vec![
+            (0..2, HighlightStyle::default()),
+            (1..3, HighlightStyle::default()),
+            (3..9, HighlightStyle::default()),
+        ];
+        insert_marked_text(&mut line, &mut highlights, 1, "输入");
+        assert_eq!(line, "a输入bc中文");
+        assert_eq!(
+            highlights
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            [0..8, 7..9, 9..15]
+        );
+        for (range, _) in highlights {
+            assert!(line.is_char_boundary(range.start) && line.is_char_boundary(range.end));
+        }
+    }
 
     #[test]
     fn opens_text_file_and_reports_missing_file() {
