@@ -1750,11 +1750,21 @@ fn styled_fragment(
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> StyledText {
+    let highlights = fragment_highlights(block, &range, cursor, selection);
+    StyledText::new(block.text[range].to_owned()).with_highlights(highlights)
+}
+
+fn fragment_highlights(
+    block: &Block,
+    range: &std::ops::Range<usize>,
+    cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
     let mut highlights = block
         .spans
         .iter()
         .filter_map(|span| {
-            clipped_range(&span.range, &range).map(|span_range| {
+            clipped_range(&span.range, range).map(|span_range| {
                 (
                     span_range,
                     HighlightStyle {
@@ -1772,7 +1782,7 @@ fn styled_fragment(
         })
         .collect::<Vec<_>>();
     highlights.extend(block.links.iter().filter_map(|link| {
-        clipped_range(&link.range, &range).map(|range| {
+        clipped_range(&link.range, range).map(|range| {
             (
                 range,
                 HighlightStyle {
@@ -1790,7 +1800,7 @@ fn styled_fragment(
     if let Some((start, end)) = selection
         && let (Some(start), Some(end)) =
             (text_range(&block.text, start), text_range(&block.text, end))
-        && let Some(selection_range) = clipped_range(&(start.start..end.end), &range)
+        && let Some(selection_range) = clipped_range(&(start.start..end.end), range)
     {
         highlights.push((
             selection_range,
@@ -1802,7 +1812,7 @@ fn styled_fragment(
     }
     if let Some(cursor_range) = cursor
         .and_then(|offset| text_range(&block.text, offset))
-        .and_then(|cursor| clipped_range(&cursor, &range))
+        .and_then(|cursor| clipped_range(&cursor, range))
     {
         highlights.push((
             cursor_range,
@@ -1813,7 +1823,7 @@ fn styled_fragment(
             },
         ));
     }
-    StyledText::new(block.text[range.clone()].to_owned()).with_highlights(highlights)
+    highlights
 }
 
 fn clipped_range(
@@ -2754,5 +2764,31 @@ mod tests {
             offset: link_block.text[..byte].chars().count(),
         };
         assert_eq!(app.current_link().as_deref(), Some("linked.md"));
+    }
+
+    #[test]
+    fn highlight_ranges_stay_on_utf8_boundaries() {
+        let source = std::fs::read_to_string("examples/markdown.md").unwrap();
+        let document = crate::markdown::parse(&source);
+        for block in &document.blocks {
+            let mut boundaries = block
+                .text
+                .char_indices()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            boundaries.push(block.text.len());
+            for pair in boundaries.windows(2) {
+                let range = pair[0]..pair[1];
+                let fragment = &block.text[range.clone()];
+                for cursor in 0..block_len(block) {
+                    for (highlight, _) in
+                        fragment_highlights(block, &range, Some(cursor), Some((0, cursor)))
+                    {
+                        assert!(fragment.is_char_boundary(highlight.start));
+                        assert!(fragment.is_char_boundary(highlight.end));
+                    }
+                }
+            }
+        }
     }
 }
