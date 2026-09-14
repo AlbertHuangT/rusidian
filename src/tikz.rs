@@ -7,6 +7,7 @@ use std::{
 };
 
 const TEMPLATE_VERSION: u8 = 1;
+const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let cache = dirs::cache_dir()
@@ -64,13 +65,41 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
 
-        fs::read(preview).map_err(|error| format!("无法读取 TikZ 预览：{error}"))
+        let image = fs::read(preview).map_err(|error| format!("无法读取 TikZ 预览：{error}"))?;
+        let _ = prune_cache(&cache, MAX_CACHE_BYTES);
+        Ok(image)
     })();
 
     let _ = fs::remove_dir_all(&job);
 
-    // ponytail: add LRU eviction when UI integration provides real cache-size measurements.
     result
+}
+
+fn prune_cache(cache: &std::path::Path, max_bytes: u64) -> Result<(), String> {
+    let mut files = fs::read_dir(cache)
+        .map_err(|error| format!("无法读取 TikZ 缓存：{error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|value| value.to_str()) == Some("pdf"))
+                .then(|| entry.metadata().ok().map(|metadata| (path, metadata)))?
+        })
+        .collect::<Vec<_>>();
+    let mut bytes = files
+        .iter()
+        .map(|(_, metadata)| metadata.len())
+        .sum::<u64>();
+    files.sort_by_key(|(_, metadata)| metadata.modified().unwrap_or(UNIX_EPOCH));
+
+    for (path, metadata) in files {
+        if bytes <= max_bytes {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            bytes = bytes.saturating_sub(metadata.len());
+        }
+    }
+    Ok(())
 }
 
 fn document(source: &str) -> String {
@@ -88,6 +117,25 @@ mod tests {
         let tex = document("\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}");
         assert!(tex.contains("\\usepackage{tikz}"));
         assert!(tex.contains("\\begin{document}"));
+    }
+
+    #[test]
+    fn bounds_pdf_cache_size() {
+        let cache =
+            std::env::temp_dir().join(format!("rusidian-cache-test-{}", std::process::id()));
+        fs::create_dir_all(&cache).unwrap();
+        for name in ["a.pdf", "b.pdf", "c.pdf"] {
+            fs::write(cache.join(name), [0_u8; 2]).unwrap();
+        }
+
+        prune_cache(&cache, 4).unwrap();
+        let bytes = fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(bytes <= 4);
+        fs::remove_dir_all(cache).unwrap();
     }
 
     #[test]
