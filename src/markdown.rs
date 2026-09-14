@@ -26,6 +26,7 @@ pub struct Span {
     pub range: Range<usize>,
     pub bold: bool,
     pub italic: bool,
+    pub code: bool,
 }
 
 pub fn parse(source: &str) -> MarkdownDocument {
@@ -65,17 +66,24 @@ pub fn parse(source: &str) -> MarkdownDocument {
                     blocks.push(block);
                 }
             }
-            Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
+            Event::Text(text) => {
                 let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
                 if !in_image && matches!(&block.kind, BlockKind::Image(_)) {
                     block.kind = BlockKind::Paragraph;
                 }
-                block.push(&text, bold > 0, italic > 0);
+                block.push(&text, bold > 0, italic > 0, false);
+            }
+            Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
+                if !in_image && matches!(&block.kind, BlockKind::Image(_)) {
+                    block.kind = BlockKind::Paragraph;
+                }
+                block.push(&text, bold > 0, italic > 0, true);
             }
             Event::SoftBreak | Event::HardBreak => {
                 current
                     .get_or_insert_with(|| Block::new(BlockKind::Paragraph))
-                    .push("\n", bold > 0, italic > 0);
+                    .push("\n", bold > 0, italic > 0, false);
             }
             _ => {}
         }
@@ -97,14 +105,15 @@ impl Block {
         }
     }
 
-    fn push(&mut self, text: &str, bold: bool, italic: bool) {
+    fn push(&mut self, text: &str, bold: bool, italic: bool, code: bool) {
         let start = self.text.len();
         self.text.push_str(text);
-        if bold || italic {
+        if bold || italic || code {
             self.spans.push(Span {
                 range: start..self.text.len(),
                 bold,
                 italic,
+                code,
             });
         }
     }
@@ -145,5 +154,8 @@ mod tests {
         );
         assert_eq!(images.blocks[0].text, "图");
         assert_eq!(images.blocks[1].kind, BlockKind::Paragraph);
+
+        let raw = parse("`code` <span>raw</span> <!-- comment -->");
+        assert!(raw.blocks[0].spans.iter().all(|span| span.code));
     }
 }

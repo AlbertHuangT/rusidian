@@ -674,6 +674,7 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
                 HighlightStyle {
                     font_weight: span.bold.then_some(FontWeight::BOLD),
                     font_style: span.italic.then_some(FontStyle::Italic),
+                    background_color: span.code.then_some(rgb(0x242a32).into()),
                     ..Default::default()
                 },
             )
@@ -749,6 +750,7 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
             .p_4()
             .rounded_md()
             .bg(rgb(0x1c2229))
+            .font_family("SFMono-Regular")
             .when_some(language.as_ref(), |element, language| {
                 element.child(
                     div()
