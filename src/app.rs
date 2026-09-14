@@ -78,6 +78,8 @@ struct RusidianApp {
     nvim_warning: Option<SharedString>,
     nvim_size: (i64, i64),
     reading_cursor: ReadingCursor,
+    reading_column: Option<usize>,
+    reading_pending_g: bool,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -115,6 +117,8 @@ impl RusidianApp {
                 nvim_warning: None,
                 nvim_size: (120, 40),
                 reading_cursor: ReadingCursor::default(),
+                reading_column: None,
+                reading_pending_g: false,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -146,6 +150,8 @@ impl RusidianApp {
                     nvim_warning: None,
                     nvim_size: (120, 40),
                     reading_cursor: ReadingCursor::default(),
+                    reading_column: None,
+                    reading_pending_g: false,
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -162,6 +168,8 @@ impl RusidianApp {
                 nvim_warning: None,
                 nvim_size: (120, 40),
                 reading_cursor: ReadingCursor::default(),
+                reading_column: None,
+                reading_pending_g: false,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -379,6 +387,102 @@ impl RusidianApp {
         }
     }
 
+    fn move_reading_line(&mut self, down: bool) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            return;
+        };
+        let Some(current) = blocks.get(self.reading_cursor.block) else {
+            return;
+        };
+        let (line, column) = cursor_line(current, self.reading_cursor.offset);
+        let column = *self.reading_column.get_or_insert(column);
+
+        let target = if down {
+            ((line + 1)..block_line_count(current))
+                .find_map(|line| cursor_for_line(current, self.reading_cursor.block, line, column))
+                .or_else(|| {
+                    blocks
+                        .iter()
+                        .enumerate()
+                        .skip(self.reading_cursor.block + 1)
+                        .find_map(|(block, value)| cursor_for_line(value, block, 0, column))
+                })
+        } else {
+            (0..line)
+                .rev()
+                .find_map(|line| cursor_for_line(current, self.reading_cursor.block, line, column))
+                .or_else(|| {
+                    blocks
+                        .iter()
+                        .enumerate()
+                        .take(self.reading_cursor.block)
+                        .rev()
+                        .find_map(|(block, value)| {
+                            (0..block_line_count(value))
+                                .rev()
+                                .find_map(|line| cursor_for_line(value, block, line, column))
+                        })
+                })
+        };
+        if let Some(target) = target {
+            self.reading_cursor = target;
+        }
+    }
+
+    fn move_reading_line_edge(&mut self, end: bool) {
+        let Some(block) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.markdown.blocks.get(self.reading_cursor.block))
+        else {
+            return;
+        };
+        let (line, _) = cursor_line(block, self.reading_cursor.offset);
+        if let Some(cursor) = cursor_for_line(
+            block,
+            self.reading_cursor.block,
+            line,
+            if end { usize::MAX } else { 0 },
+        ) {
+            self.reading_cursor = cursor;
+            self.reading_column = None;
+        }
+    }
+
+    fn move_reading_document_edge(&mut self, end: bool) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            return;
+        };
+        let target = if end {
+            blocks
+                .iter()
+                .enumerate()
+                .rfind(|(_, block)| block_len(block) > 0)
+                .map(|(block, value)| ReadingCursor {
+                    block,
+                    offset: block_len(value) - 1,
+                })
+        } else {
+            blocks
+                .iter()
+                .enumerate()
+                .find(|(_, block)| block_len(block) > 0)
+                .map(|(block, _)| ReadingCursor { block, offset: 0 })
+        };
+        if let Some(target) = target {
+            self.reading_cursor = target;
+            self.reading_column = None;
+        }
+    }
+
     fn enter_source_normal(
         &mut self,
         _: &EnterSourceNormal,
@@ -397,9 +501,32 @@ impl RusidianApp {
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Reading {
-            match event.keystroke.key_char.as_deref() {
-                Some("h") => self.move_reading_cursor(false),
-                Some("l") => self.move_reading_cursor(true),
+            let key = event.keystroke.key_char.as_deref();
+            if key == Some("g") {
+                if self.reading_pending_g {
+                    self.move_reading_document_edge(false);
+                    self.reading_pending_g = false;
+                    cx.notify();
+                } else {
+                    self.reading_pending_g = true;
+                }
+                return;
+            }
+            self.reading_pending_g = false;
+            match key {
+                Some("h") => {
+                    self.reading_column = None;
+                    self.move_reading_cursor(false);
+                }
+                Some("l") => {
+                    self.reading_column = None;
+                    self.move_reading_cursor(true);
+                }
+                Some("j") => self.move_reading_line(true),
+                Some("k") => self.move_reading_line(false),
+                Some("0") => self.move_reading_line_edge(false),
+                Some("$") => self.move_reading_line_edge(true),
+                Some("G") => self.move_reading_document_edge(true),
                 _ => return,
             }
             cx.notify();
@@ -932,17 +1059,81 @@ fn block_len(block: &Block) -> usize {
     if is_object(block) {
         1
     } else {
-        block.text.chars().count()
+        block
+            .text
+            .chars()
+            .filter(|character| *character != '\n')
+            .count()
     }
 }
 
 fn text_range(text: &str, offset: usize) -> Option<std::ops::Range<usize>> {
-    let start = text.char_indices().nth(offset)?.0;
+    let start = text
+        .char_indices()
+        .filter(|(_, character)| *character != '\n')
+        .nth(offset)?
+        .0;
     let end = text[start..]
         .char_indices()
         .nth(1)
         .map_or(text.len(), |(next, _)| start + next);
     Some(start..end)
+}
+
+fn block_line_count(block: &Block) -> usize {
+    if is_object(block) {
+        1
+    } else {
+        block.text.split('\n').count()
+    }
+}
+
+fn cursor_line(block: &Block, offset: usize) -> (usize, usize) {
+    if is_object(block) {
+        return (0, 0);
+    }
+    let mut seen = 0;
+    let mut line = 0;
+    let mut column = 0;
+    for character in block.text.chars() {
+        if character == '\n' {
+            line += 1;
+            column = 0;
+        } else {
+            if seen == offset {
+                return (line, column);
+            }
+            seen += 1;
+            column += 1;
+        }
+    }
+    (line, column.saturating_sub(1))
+}
+
+fn cursor_for_line(
+    block: &Block,
+    block_index: usize,
+    target_line: usize,
+    column: usize,
+) -> Option<ReadingCursor> {
+    if is_object(block) {
+        return (target_line == 0).then_some(ReadingCursor {
+            block: block_index,
+            offset: 0,
+        });
+    }
+    let mut offset = 0;
+    for (line, text) in block.text.split('\n').enumerate() {
+        let length = text.chars().count();
+        if line == target_line {
+            return (length > 0).then_some(ReadingCursor {
+                block: block_index,
+                offset: offset + column.min(length - 1),
+            });
+        }
+        offset += length;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -999,5 +1190,57 @@ mod tests {
             }
         );
         assert_eq!(text_range("中文", 1), Some(3..6));
+    }
+
+    #[test]
+    fn moves_reading_cursor_by_physical_line() {
+        let mut app = RusidianApp::open(Some(Path::new("README.md")));
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("abc\ndef\n\nxy");
+        app.reading_cursor = ReadingCursor {
+            block: 0,
+            offset: 2,
+        };
+
+        app.move_reading_line(true);
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 0,
+                offset: 5
+            }
+        );
+        app.move_reading_line(true);
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 1,
+                offset: 1
+            }
+        );
+        app.move_reading_line(false);
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 0,
+                offset: 5
+            }
+        );
+        app.move_reading_line_edge(false);
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 0,
+                offset: 3
+            }
+        );
+        app.move_reading_document_edge(true);
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 1,
+                offset: 1
+            }
+        );
+        assert_eq!(text_range("abc\ndef", 3), Some(4..5));
     }
 }
