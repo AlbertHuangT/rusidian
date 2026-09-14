@@ -77,6 +77,7 @@ struct RusidianApp {
     nvim_error: Option<SharedString>,
     nvim_warning: Option<SharedString>,
     nvim_size: (i64, i64),
+    reading_cursor: ReadingCursor,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -86,6 +87,12 @@ struct RusidianApp {
 enum View {
     Reading,
     Source,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ReadingCursor {
+    block: usize,
+    offset: usize,
 }
 
 enum TikzState {
@@ -107,6 +114,7 @@ impl RusidianApp {
                 nvim_error: None,
                 nvim_warning: None,
                 nvim_size: (120, 40),
+                reading_cursor: ReadingCursor::default(),
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -137,6 +145,7 @@ impl RusidianApp {
                     nvim_error: None,
                     nvim_warning: None,
                     nvim_size: (120, 40),
+                    reading_cursor: ReadingCursor::default(),
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -152,6 +161,7 @@ impl RusidianApp {
                 nvim_error: None,
                 nvim_warning: None,
                 nvim_size: (120, 40),
+                reading_cursor: ReadingCursor::default(),
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -303,8 +313,70 @@ impl RusidianApp {
         document.lines.splice(first..end, replacement);
         if !more {
             document.markdown = crate::markdown::parse(&document.lines.join("\n"));
+            self.clamp_reading_cursor();
         }
         true
+    }
+
+    fn clamp_reading_cursor(&mut self) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            self.reading_cursor = ReadingCursor::default();
+            return;
+        };
+        if let Some(length) = blocks.get(self.reading_cursor.block).map(block_len)
+            && length > 0
+        {
+            self.reading_cursor.offset = self.reading_cursor.offset.min(length - 1);
+            return;
+        }
+        self.reading_cursor = blocks
+            .iter()
+            .enumerate()
+            .find(|(_, block)| block_len(block) > 0)
+            .map(|(block, _)| ReadingCursor { block, offset: 0 })
+            .unwrap_or_default();
+    }
+
+    fn move_reading_cursor(&mut self, right: bool) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            return;
+        };
+        if right {
+            let length = blocks
+                .get(self.reading_cursor.block)
+                .map(block_len)
+                .unwrap_or(0);
+            if self.reading_cursor.offset + 1 < length {
+                self.reading_cursor.offset += 1;
+            } else if let Some((block, _)) = blocks
+                .iter()
+                .enumerate()
+                .skip(self.reading_cursor.block + 1)
+                .find(|(_, block)| block_len(block) > 0)
+            {
+                self.reading_cursor = ReadingCursor { block, offset: 0 };
+            }
+        } else if self.reading_cursor.offset > 0 {
+            self.reading_cursor.offset -= 1;
+        } else if let Some((block, previous)) = blocks
+            .iter()
+            .enumerate()
+            .take(self.reading_cursor.block)
+            .rfind(|(_, block)| block_len(block) > 0)
+        {
+            self.reading_cursor = ReadingCursor {
+                block,
+                offset: block_len(previous) - 1,
+            };
+        }
     }
 
     fn enter_source_normal(
@@ -324,7 +396,13 @@ impl RusidianApp {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.view != View::Source {
+        if self.view == View::Reading {
+            match event.keystroke.key_char.as_deref() {
+                Some("h") => self.move_reading_cursor(false),
+                Some("l") => self.move_reading_cursor(true),
+                _ => return,
+            }
+            cx.notify();
             return;
         }
         if event.keystroke.key == "escape" && self.grid.is_normal() {
@@ -568,6 +646,7 @@ impl Render for RusidianApp {
             .as_ref()
             .map(|document| document.name.clone())
             .unwrap_or_else(|| "Rusidian".into());
+        let reading_cursor = self.reading_cursor;
 
         let reading = if let Some(document) = &self.document {
             div()
@@ -585,7 +664,13 @@ impl Render for RusidianApp {
                         .text_base()
                         .children(document.markdown.blocks.iter().enumerate().map(
                             |(index, block)| {
-                                render_block(block, self.tikz.get(&index), &document.file)
+                                render_block(
+                                    block,
+                                    self.tikz.get(&index),
+                                    &document.file,
+                                    (reading_cursor.block == index)
+                                        .then_some(reading_cursor.offset),
+                                )
                             },
                         )),
                 )
@@ -703,9 +788,17 @@ fn source_lines(source: &str) -> Vec<String> {
     }
 }
 
-fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElement {
-    let text =
-        StyledText::new(block.text.clone()).with_highlights(block.spans.iter().map(|span| {
+fn render_block(
+    block: &Block,
+    tikz: Option<&TikzState>,
+    note: &Path,
+    cursor: Option<usize>,
+) -> AnyElement {
+    let object_cursor = cursor.is_some() && is_object(block);
+    let mut highlights = block
+        .spans
+        .iter()
+        .map(|span| {
             (
                 span.range.clone(),
                 HighlightStyle {
@@ -715,7 +808,20 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
                     ..Default::default()
                 },
             )
-        }));
+        })
+        .collect::<Vec<_>>();
+    if !object_cursor && let Some(range) = cursor.and_then(|offset| text_range(&block.text, offset))
+    {
+        highlights.push((
+            range,
+            HighlightStyle {
+                color: Some(rgb(0x111418).into()),
+                background_color: Some(rgb(0xe6e9ed).into()),
+                ..Default::default()
+            },
+        ));
+    }
+    let text = StyledText::new(block.text.clone()).with_highlights(highlights);
 
     match &block.kind {
         BlockKind::Heading(level) => div()
@@ -739,6 +845,9 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
                     .mb_4()
                     .p_4()
                     .rounded_md()
+                    .when(object_cursor, |element| {
+                        element.border_2().border_color(rgb(0x88c0d0))
+                    })
                     .bg(rgb(0x1c2229))
                     .child(format!("![{alt}]({source_label})"))
                     .into_any_element();
@@ -746,6 +855,9 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
             let path = note.parent().unwrap_or_else(|| Path::new(".")).join(path);
             div()
                 .mb_4()
+                .when(object_cursor, |element| {
+                    element.border_2().border_color(rgb(0x88c0d0))
+                })
                 .child(img(path).max_w_full().with_fallback(move || {
                     div()
                         .p_4()
@@ -762,6 +874,9 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
                 .mb_4()
                 .p_4()
                 .rounded_md()
+                .when(object_cursor, |element| {
+                    element.border_2().border_color(rgb(0x88c0d0))
+                })
                 .bg(rgb(0xffffff))
                 .child(img(image.clone()).max_w_full())
                 .into_any_element(),
@@ -769,6 +884,9 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
                 .mb_4()
                 .p_4()
                 .rounded_md()
+                .when(object_cursor, |element| {
+                    element.border_2().border_color(rgb(0x88c0d0))
+                })
                 .bg(rgb(0x3a1f24))
                 .text_color(rgb(0xffa7b2))
                 .child(error.clone())
@@ -777,6 +895,9 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
                 .mb_4()
                 .p_4()
                 .rounded_md()
+                .when(object_cursor, |element| {
+                    element.border_2().border_color(rgb(0x88c0d0))
+                })
                 .bg(rgb(0x1c2229))
                 .text_color(rgb(0x98a2ad))
                 .child("正在编译 TikZ…")
@@ -800,6 +921,28 @@ fn render_block(block: &Block, tikz: Option<&TikzState>, note: &Path) -> AnyElem
             .child(text)
             .into_any_element(),
     }
+}
+
+fn is_object(block: &Block) -> bool {
+    matches!(&block.kind, BlockKind::Image(_))
+        || matches!(&block.kind, BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz"))
+}
+
+fn block_len(block: &Block) -> usize {
+    if is_object(block) {
+        1
+    } else {
+        block.text.chars().count()
+    }
+}
+
+fn text_range(text: &str, offset: usize) -> Option<std::ops::Range<usize>> {
+    let start = text.char_indices().nth(offset)?.0;
+    let end = text[start..]
+        .char_indices()
+        .nth(1)
+        .map_or(text.len(), |(next, _)| start + next);
+    Some(start..end)
 }
 
 #[cfg(test)]
@@ -830,5 +973,31 @@ mod tests {
             app.document.unwrap().markdown.blocks[0].kind,
             BlockKind::Heading(1)
         );
+    }
+
+    #[test]
+    fn moves_reading_cursor_across_visible_content() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        app.move_reading_cursor(false);
+        assert_eq!(app.reading_cursor, ReadingCursor::default());
+        for _ in 0..12 {
+            app.move_reading_cursor(true);
+        }
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 1,
+                offset: 0
+            }
+        );
+        app.move_reading_cursor(false);
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 0,
+                offset: 11
+            }
+        );
+        assert_eq!(text_range("中文", 1), Some(3..6));
     }
 }
