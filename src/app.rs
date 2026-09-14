@@ -83,6 +83,8 @@ struct RusidianApp {
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
     reading_selection: Option<ReadingSelection>,
+    reading_search: Option<SearchPrompt>,
+    last_search: Option<SearchPrompt>,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -110,6 +112,12 @@ struct ReadingSelection {
 struct FindPending {
     forward: bool,
     till: bool,
+}
+
+#[derive(Clone)]
+struct SearchPrompt {
+    query: String,
+    forward: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +152,8 @@ impl RusidianApp {
                 reading_count: None,
                 reading_find: None,
                 reading_selection: None,
+                reading_search: None,
+                last_search: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -180,6 +190,8 @@ impl RusidianApp {
                     reading_count: None,
                     reading_find: None,
                     reading_selection: None,
+                    reading_search: None,
+                    last_search: None,
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -201,6 +213,8 @@ impl RusidianApp {
                 reading_count: None,
                 reading_find: None,
                 reading_selection: None,
+                reading_search: None,
+                last_search: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -443,6 +457,41 @@ impl RusidianApp {
         )))
     }
 
+    fn execute_search(&mut self, prompt: &SearchPrompt, reverse: bool) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            return;
+        };
+        if let Some(cursor) = search_cursor(
+            blocks,
+            self.reading_cursor,
+            &prompt.query,
+            prompt.forward != reverse,
+        ) {
+            self.reading_cursor = cursor;
+            self.reading_column = None;
+        }
+    }
+
+    fn search_word(&mut self, forward: bool) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            return;
+        };
+        let Some(query) = word_under_cursor(blocks, self.reading_cursor) else {
+            return;
+        };
+        let prompt = SearchPrompt { query, forward };
+        self.execute_search(&prompt, false);
+        self.last_search = Some(prompt);
+    }
+
     fn move_reading_line(&mut self, down: bool) {
         let Some(blocks) = self
             .document
@@ -562,8 +611,31 @@ impl RusidianApp {
                 self.reading_find = None;
                 self.reading_pending_g = false;
                 self.reading_count = None;
-                if self.reading_selection.take().is_some() {
+                self.marked_text.clear();
+                if self.reading_selection.take().is_some() || self.reading_search.take().is_some() {
                     cx.notify();
+                }
+                return;
+            }
+            if self.reading_search.is_some() {
+                match event.keystroke.key.as_str() {
+                    "enter" => {
+                        if let Some(prompt) = self.reading_search.take()
+                            && !prompt.query.is_empty()
+                        {
+                            self.execute_search(&prompt, false);
+                            self.last_search = Some(prompt);
+                        }
+                        self.marked_text.clear();
+                        cx.notify();
+                    }
+                    "backspace" => {
+                        if let Some(search) = &mut self.reading_search {
+                            search.query.pop();
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -605,6 +677,27 @@ impl RusidianApp {
                     cx.notify();
                 }
                 self.reading_count = None;
+                return;
+            }
+            if key == Some("/") || key == Some("?") {
+                self.reading_search = Some(SearchPrompt {
+                    query: String::new(),
+                    forward: key == Some("/"),
+                });
+                self.reading_count = None;
+                cx.notify();
+                return;
+            }
+            if key == Some("n") || key == Some("N") {
+                if let Some(search) = self.last_search.clone() {
+                    self.execute_search(&search, key == Some("N"));
+                    cx.notify();
+                }
+                return;
+            }
+            if key == Some("*") || key == Some("#") {
+                self.search_word(key == Some("*"));
+                cx.notify();
                 return;
             }
             if let Some(digit) = key.and_then(|key| key.parse::<usize>().ok())
@@ -884,7 +977,9 @@ impl EntityInputHandler for RusidianApp {
     ) {
         self.marked_text.clear();
         self.marked_selection = 0..0;
-        if let Some(nvim) = &self.nvim {
+        if let Some(search) = &mut self.reading_search {
+            search.query.push_str(text);
+        } else if let Some(nvim) = &self.nvim {
             nvim.input(text);
         }
         window.invalidate_character_coordinates();
@@ -937,7 +1032,8 @@ impl EntityInputHandler for RusidianApp {
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        self.view == View::Source && self.grid.accepts_text_input()
+        (self.view == View::Source && self.grid.accepts_text_input())
+            || (self.view == View::Reading && self.reading_search.is_some())
     }
 }
 
@@ -952,6 +1048,16 @@ impl Render for RusidianApp {
             .map(|document| document.name.clone())
             .unwrap_or_else(|| "Rusidian".into());
         let reading_cursor = self.reading_cursor;
+        let input_view = cx.entity();
+        let reading_focus = self.focus_handle.clone();
+        let search_prompt = self.reading_search.as_ref().map(|search| {
+            format!(
+                "{}{}{}",
+                if search.forward { "/" } else { "?" },
+                search.query,
+                self.marked_text
+            )
+        });
 
         let reading = if let Some(document) = &self.document {
             let selection = self.reading_selection.and_then(|selection| {
@@ -960,6 +1066,7 @@ impl Render for RusidianApp {
             div()
                 .flex_1()
                 .id("document")
+                .relative()
                 .overflow_y_scroll()
                 .p_8()
                 .child(
@@ -985,6 +1092,22 @@ impl Render for RusidianApp {
                             },
                         )),
                 )
+                .when_some(reading_focus, |element, focus| {
+                    element.track_focus(&focus).child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, cx| {
+                                window.handle_input(
+                                    &focus,
+                                    ElementInputHandler::new(bounds, input_view),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                })
                 .into_any_element()
         } else {
             div()
@@ -1014,6 +1137,8 @@ impl Render for RusidianApp {
         div()
             .key_context(if self.view == View::Source {
                 "Source"
+            } else if self.reading_search.is_some() {
+                "ReadingSearch"
             } else {
                 "Reading"
             })
@@ -1050,6 +1175,18 @@ impl Render for RusidianApp {
                     ),
             )
             .child(body)
+            .when_some(search_prompt, |element, prompt| {
+                element.child(
+                    div()
+                        .h(px(32.0))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .bg(rgb(0x1c2229))
+                        .font_family("SFMono-Regular")
+                        .child(prompt),
+                )
+            })
     }
 }
 
@@ -1545,6 +1682,103 @@ fn find_character(
     None
 }
 
+fn search_cursor(
+    blocks: &[Block],
+    start: ReadingCursor,
+    query: &str,
+    forward: bool,
+) -> Option<ReadingCursor> {
+    let query = query.chars().collect::<Vec<_>>();
+    if query.is_empty() {
+        return None;
+    }
+    let edge = if forward {
+        blocks
+            .iter()
+            .enumerate()
+            .find(|(_, block)| block_len(block) > 0)
+            .map(|(block, _)| ReadingCursor { block, offset: 0 })?
+    } else {
+        blocks
+            .iter()
+            .enumerate()
+            .rfind(|(_, block)| block_len(block) > 0)
+            .map(|(block, value)| ReadingCursor {
+                block,
+                offset: block_len(value) - 1,
+            })?
+    };
+    let mut candidate = step_cursor(blocks, start, forward);
+    let mut wrapped = false;
+    loop {
+        let Some(cursor) = candidate else {
+            if wrapped {
+                return None;
+            }
+            candidate = Some(edge);
+            wrapped = true;
+            continue;
+        };
+        if wrapped && cursor == start {
+            return None;
+        }
+        if matches_query(blocks, cursor, &query) {
+            return Some(cursor);
+        }
+        candidate = step_cursor(blocks, cursor, forward);
+    }
+}
+
+fn matches_query(blocks: &[Block], start: ReadingCursor, query: &[char]) -> bool {
+    let mut cursor = start;
+    for (index, expected) in query.iter().enumerate() {
+        if cursor_character(blocks, cursor) != Some(*expected) {
+            return false;
+        }
+        if index + 1 < query.len() {
+            let Some(next) = step_cursor(blocks, cursor, true) else {
+                return false;
+            };
+            if !same_line(blocks, cursor, next) {
+                return false;
+            }
+            cursor = next;
+        }
+    }
+    true
+}
+
+fn word_under_cursor(blocks: &[Block], cursor: ReadingCursor) -> Option<String> {
+    if blocks.get(cursor.block).is_some_and(is_object) {
+        return None;
+    }
+    let class = cursor_word_class(blocks, cursor)?;
+    if class == WordClass::Space {
+        return None;
+    }
+    let mut start = cursor;
+    while let Some(previous) = step_cursor(blocks, start, false) {
+        if !same_line(blocks, start, previous) || cursor_word_class(blocks, previous) != Some(class)
+        {
+            break;
+        }
+        start = previous;
+    }
+    let mut output = String::new();
+    let mut position = start;
+    loop {
+        output.push(cursor_character(blocks, position)?);
+        let Some(next) = step_cursor(blocks, position, true) else {
+            break;
+        };
+        if !same_line(blocks, position, next) || cursor_word_class(blocks, next) != Some(class) {
+            break;
+        }
+        position = next;
+    }
+    Some(output)
+}
+
 fn cursor_word_class(blocks: &[Block], cursor: ReadingCursor) -> Option<WordClass> {
     cursor_character(blocks, cursor).map(word_class)
 }
@@ -1855,5 +2089,42 @@ mod tests {
             .unwrap();
         assert!(image.text().is_none());
         assert!(local_image_path(Path::new("note.md"), "https://example.com/a.png").is_none());
+    }
+
+    #[test]
+    fn searches_rendered_text_with_wraparound() {
+        let document = crate::markdown::parse("alpha beta\nalpha");
+        let blocks = &document.blocks;
+        assert_eq!(
+            search_cursor(blocks, ReadingCursor::default(), "alpha", true),
+            Some(ReadingCursor {
+                block: 0,
+                offset: 10
+            })
+        );
+        assert_eq!(
+            search_cursor(
+                blocks,
+                ReadingCursor {
+                    block: 0,
+                    offset: 10
+                },
+                "alpha",
+                true
+            ),
+            Some(ReadingCursor::default())
+        );
+        assert!(search_cursor(blocks, ReadingCursor::default(), "betaalpha", true).is_none());
+        assert_eq!(
+            word_under_cursor(
+                blocks,
+                ReadingCursor {
+                    block: 0,
+                    offset: 7
+                }
+            )
+            .as_deref(),
+            Some("beta")
+        );
     }
 }
