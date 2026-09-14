@@ -3,9 +3,9 @@ use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
-    KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, Pixels, Point, SharedString,
-    StyledText, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas, div, img,
-    point, prelude::*, px, rgb, size,
+    KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, Pixels, Point, ScrollHandle,
+    SharedString, StyledText, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas,
+    div, img, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use std::{
@@ -85,6 +85,7 @@ struct RusidianApp {
     reading_selection: Option<ReadingSelection>,
     reading_search: Option<SearchPrompt>,
     last_search: Option<SearchPrompt>,
+    reading_scroll: ScrollHandle,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -154,6 +155,7 @@ impl RusidianApp {
                 reading_selection: None,
                 reading_search: None,
                 last_search: None,
+                reading_scroll: ScrollHandle::new(),
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -192,6 +194,7 @@ impl RusidianApp {
                     reading_selection: None,
                     reading_search: None,
                     last_search: None,
+                    reading_scroll: ScrollHandle::new(),
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -215,6 +218,7 @@ impl RusidianApp {
                 reading_selection: None,
                 reading_search: None,
                 last_search: None,
+                reading_scroll: ScrollHandle::new(),
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -492,6 +496,37 @@ impl RusidianApp {
         self.last_search = Some(prompt);
     }
 
+    fn reveal_reading_cursor(&self) {
+        self.reading_scroll
+            .scroll_to_item(self.reading_cursor.block);
+    }
+
+    fn scroll_reading(&mut self, down: bool, full_page: bool) {
+        let height = self.reading_scroll.bounds().size.height;
+        if height <= px(0.0) {
+            return;
+        }
+        let distance = height * if full_page { 1.0 } else { 0.5 };
+        let offset = self.reading_scroll.offset();
+        let maximum = self.reading_scroll.max_offset().y;
+        let y = (offset.y + if down { -distance } else { distance }).clamp(-maximum, px(0.0));
+        self.reading_scroll.set_offset(point(offset.x, y));
+
+        let visible = self
+            .reading_scroll
+            .bottom_item()
+            .saturating_sub(self.reading_scroll.top_item())
+            + 1;
+        let lines = if full_page {
+            visible
+        } else {
+            visible.div_ceil(2)
+        };
+        for _ in 0..lines {
+            self.move_reading_line(down);
+        }
+    }
+
     fn move_reading_line(&mut self, down: bool) {
         let Some(blocks) = self
             .document
@@ -655,6 +690,7 @@ impl RusidianApp {
                             self.last_search = Some(prompt);
                         }
                         self.marked_text.clear();
+                        self.reveal_reading_cursor();
                         cx.notify();
                     }
                     "backspace" => {
@@ -665,6 +701,22 @@ impl RusidianApp {
                     }
                     _ => {}
                 }
+                return;
+            }
+            if event.keystroke.modifiers.control {
+                let (down, full_page) = match event.keystroke.key.as_str() {
+                    "d" => (true, false),
+                    "u" => (false, false),
+                    "f" => (true, true),
+                    "b" => (false, true),
+                    _ => return,
+                };
+                let count = self.take_reading_count();
+                for _ in 0..count {
+                    self.scroll_reading(down, full_page);
+                }
+                self.reading_pending_g = false;
+                cx.notify();
                 return;
             }
             if let Some(find) = self.reading_find.take() {
@@ -679,6 +731,7 @@ impl RusidianApp {
                     {
                         self.reading_cursor = cursor;
                         self.reading_column = None;
+                        self.reveal_reading_cursor();
                         cx.notify();
                     }
                 }
@@ -719,12 +772,14 @@ impl RusidianApp {
             if key == Some("n") || key == Some("N") {
                 if let Some(search) = self.last_search.clone() {
                     self.execute_search(&search, key == Some("N"));
+                    self.reveal_reading_cursor();
                     cx.notify();
                 }
                 return;
             }
             if key == Some("*") || key == Some("#") {
                 self.search_word(key == Some("*"));
+                self.reveal_reading_cursor();
                 cx.notify();
                 return;
             }
@@ -765,6 +820,7 @@ impl RusidianApp {
                         self.move_reading_line(true);
                     }
                     self.reading_pending_g = false;
+                    self.reveal_reading_cursor();
                     cx.notify();
                 } else {
                     self.reading_pending_g = true;
@@ -829,6 +885,7 @@ impl RusidianApp {
                 }
                 _ => return,
             }
+            self.reveal_reading_cursor();
             cx.notify();
             return;
         }
@@ -1038,6 +1095,15 @@ impl EntityInputHandler for RusidianApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.view == View::Reading && self.reading_search.is_some() {
+            return Some(Bounds::new(
+                point(
+                    element_bounds.left() + px(16.0),
+                    element_bounds.bottom() - px(28.0),
+                ),
+                size(px(8.0), px(18.0)),
+            ));
+        }
         Some(Bounds::new(
             point(
                 element_bounds.left() + px(16.0 + self.grid.cursor.1 as f32 * 8.0),
@@ -1094,21 +1160,26 @@ impl Render for RusidianApp {
             });
             div()
                 .flex_1()
+                .flex()
+                .flex_col()
                 .id("document")
                 .relative()
                 .overflow_y_scroll()
                 .p_8()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .mx_auto()
-                        .w_full()
-                        .max_w(px(820.0))
-                        .text_base()
-                        .children(document.markdown.blocks.iter().enumerate().map(
-                            |(index, block)| {
-                                render_block(
+                .text_base()
+                .track_scroll(&self.reading_scroll)
+                .children(
+                    document
+                        .markdown
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, block)| {
+                            div()
+                                .mx_auto()
+                                .w_full()
+                                .max_w(px(820.0))
+                                .child(render_block(
                                     block,
                                     self.tikz.get(&index),
                                     &document.file,
@@ -1117,26 +1188,9 @@ impl Render for RusidianApp {
                                     selection.and_then(|bounds| {
                                         selection_for_block(bounds, index, block_len(block))
                                     }),
-                                )
-                            },
-                        )),
+                                ))
+                        }),
                 )
-                .when_some(reading_focus, |element, focus| {
-                    element.track_focus(&focus).child(
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, cx| {
-                                window.handle_input(
-                                    &focus,
-                                    ElementInputHandler::new(bounds, input_view),
-                                    cx,
-                                );
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                })
                 .into_any_element()
         } else {
             div()
@@ -1176,6 +1230,7 @@ impl Render for RusidianApp {
             .on_key_down(cx.listener(Self::key_down))
             .flex()
             .flex_col()
+            .relative()
             .size_full()
             .bg(rgb(0x111418))
             .text_color(rgb(0xe6e9ed))
@@ -1216,6 +1271,27 @@ impl Render for RusidianApp {
                         .child(prompt),
                 )
             })
+            .when_some(
+                (self.view == View::Reading)
+                    .then_some(reading_focus)
+                    .flatten(),
+                |element, focus| {
+                    element.track_focus(&focus).child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, cx| {
+                                window.handle_input(
+                                    &focus,
+                                    ElementInputHandler::new(bounds, input_view),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                },
+            )
     }
 }
 
