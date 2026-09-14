@@ -105,3 +105,7 @@
 - Rusidian 自有插件系统与主题插件的具体设计。
 - 自动检查更新是否可由用户选择开启。
 - 技术原型之后各里程碑的精确验收标准。
+
+## Implementation blockers
+
+- 混合图文富文本剪贴板需要任意剪贴板 MIME（HTML 或 RTF）写入能力；当前锁定的 GPUI macOS 实现只支持纯文本或单张图片，多条目会丢弃图片。保持“不维护 Rusidian AppKit Adapter”决定时，必须等待/推动 GPUI 增加该能力；若要由 Rusidian 直接实现，则需重新确认 GUI 架构约束。
