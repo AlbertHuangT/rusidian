@@ -129,12 +129,29 @@ impl Client {
                 }
                 let local_maps = buffer.get_keymap("n").await.unwrap_or_default();
                 let global_maps = nvim.get_keymap("n").await.unwrap_or_default();
+                let mut warnings = Vec::new();
                 if let Some(mapping) = escape_mapping(&local_maps)
                     .or_else(|| escape_mapping(&global_maps))
                 {
-                    let _ = event_sender.send(Event::Warning(format!(
+                    warnings.push(format!(
                         "Neovim Normal 的 Esc 已映射为 {mapping}；Rusidian 当前会优先用 Esc 返回阅读视图"
-                    ))).await;
+                    ));
+                }
+                if !clean
+                    && nvim
+                        .exec_lua("return package.loaded['im_select'] ~= nil", Vec::new())
+                        .await
+                        .ok()
+                        .and_then(|value| value.as_bool())
+                        != Some(true)
+                {
+                    warnings.push(
+                        "未检测到已加载的 im-select.nvim；如需在 Insert/Normal 间自动切换中英文输入源，可以安装该插件"
+                            .into(),
+                    );
+                }
+                if !warnings.is_empty() {
+                    let _ = event_sender.send(Event::Warning(warnings.join("\n"))).await;
                 }
 
                 tokio::spawn(async move {
