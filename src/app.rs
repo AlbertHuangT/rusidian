@@ -80,6 +80,7 @@ struct RusidianApp {
     reading_cursor: ReadingCursor,
     reading_column: Option<usize>,
     reading_pending_g: bool,
+    reading_count: Option<usize>,
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
@@ -95,6 +96,13 @@ enum View {
 struct ReadingCursor {
     block: usize,
     offset: usize,
+}
+
+#[derive(Clone, Copy)]
+enum WordMotion {
+    Next,
+    Previous,
+    End,
 }
 
 enum TikzState {
@@ -119,6 +127,7 @@ impl RusidianApp {
                 reading_cursor: ReadingCursor::default(),
                 reading_column: None,
                 reading_pending_g: false,
+                reading_count: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -152,6 +161,7 @@ impl RusidianApp {
                     reading_cursor: ReadingCursor::default(),
                     reading_column: None,
                     reading_pending_g: false,
+                    reading_count: None,
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
@@ -170,6 +180,7 @@ impl RusidianApp {
                 reading_cursor: ReadingCursor::default(),
                 reading_column: None,
                 reading_pending_g: false,
+                reading_count: None,
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
@@ -357,34 +368,32 @@ impl RusidianApp {
         else {
             return;
         };
-        if right {
-            let length = blocks
-                .get(self.reading_cursor.block)
-                .map(block_len)
-                .unwrap_or(0);
-            if self.reading_cursor.offset + 1 < length {
-                self.reading_cursor.offset += 1;
-            } else if let Some((block, _)) = blocks
-                .iter()
-                .enumerate()
-                .skip(self.reading_cursor.block + 1)
-                .find(|(_, block)| block_len(block) > 0)
-            {
-                self.reading_cursor = ReadingCursor { block, offset: 0 };
-            }
-        } else if self.reading_cursor.offset > 0 {
-            self.reading_cursor.offset -= 1;
-        } else if let Some((block, previous)) = blocks
-            .iter()
-            .enumerate()
-            .take(self.reading_cursor.block)
-            .rfind(|(_, block)| block_len(block) > 0)
-        {
-            self.reading_cursor = ReadingCursor {
-                block,
-                offset: block_len(previous) - 1,
-            };
+        if let Some(cursor) = step_cursor(blocks, self.reading_cursor, right) {
+            self.reading_cursor = cursor;
         }
+    }
+
+    fn move_reading_word(&mut self, motion: WordMotion) {
+        let Some(blocks) = self
+            .document
+            .as_ref()
+            .map(|document| &document.markdown.blocks)
+        else {
+            return;
+        };
+        let cursor = match motion {
+            WordMotion::Next => next_word(blocks, self.reading_cursor),
+            WordMotion::Previous => previous_word(blocks, self.reading_cursor),
+            WordMotion::End => end_word(blocks, self.reading_cursor),
+        };
+        if let Some(cursor) = cursor {
+            self.reading_cursor = cursor;
+            self.reading_column = None;
+        }
+    }
+
+    fn take_reading_count(&mut self) -> usize {
+        self.reading_count.take().unwrap_or(1)
     }
 
     fn move_reading_line(&mut self, down: bool) {
@@ -502,9 +511,19 @@ impl RusidianApp {
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Reading {
             let key = event.keystroke.key_char.as_deref();
+            if let Some(digit) = key.and_then(|key| key.parse::<usize>().ok())
+                && (digit != 0 || self.reading_count.is_some())
+            {
+                self.reading_count = Some(append_count(self.reading_count.unwrap_or(0), digit));
+                return;
+            }
             if key == Some("g") {
                 if self.reading_pending_g {
                     self.move_reading_document_edge(false);
+                    let count = self.take_reading_count();
+                    for _ in 1..count {
+                        self.move_reading_line(true);
+                    }
                     self.reading_pending_g = false;
                     cx.notify();
                 } else {
@@ -513,20 +532,60 @@ impl RusidianApp {
                 return;
             }
             self.reading_pending_g = false;
+            let had_count = self.reading_count.is_some();
+            let count = self.take_reading_count();
             match key {
                 Some("h") => {
                     self.reading_column = None;
-                    self.move_reading_cursor(false);
+                    for _ in 0..count {
+                        self.move_reading_cursor(false);
+                    }
                 }
                 Some("l") => {
                     self.reading_column = None;
-                    self.move_reading_cursor(true);
+                    for _ in 0..count {
+                        self.move_reading_cursor(true);
+                    }
                 }
-                Some("j") => self.move_reading_line(true),
-                Some("k") => self.move_reading_line(false),
+                Some("j") => {
+                    for _ in 0..count {
+                        self.move_reading_line(true);
+                    }
+                }
+                Some("k") => {
+                    for _ in 0..count {
+                        self.move_reading_line(false);
+                    }
+                }
                 Some("0") => self.move_reading_line_edge(false),
-                Some("$") => self.move_reading_line_edge(true),
+                Some("$") => {
+                    for _ in 1..count {
+                        self.move_reading_line(true);
+                    }
+                    self.move_reading_line_edge(true);
+                }
+                Some("G") if had_count => {
+                    self.move_reading_document_edge(false);
+                    for _ in 1..count {
+                        self.move_reading_line(true);
+                    }
+                }
                 Some("G") => self.move_reading_document_edge(true),
+                Some("w") => {
+                    for _ in 0..count {
+                        self.move_reading_word(WordMotion::Next);
+                    }
+                }
+                Some("b") => {
+                    for _ in 0..count {
+                        self.move_reading_word(WordMotion::Previous);
+                    }
+                }
+                Some("e") => {
+                    for _ in 0..count {
+                        self.move_reading_word(WordMotion::End);
+                    }
+                }
                 _ => return,
             }
             cx.notify();
@@ -1136,6 +1195,153 @@ fn cursor_for_line(
     None
 }
 
+fn step_cursor(blocks: &[Block], cursor: ReadingCursor, right: bool) -> Option<ReadingCursor> {
+    if right {
+        let length = blocks.get(cursor.block).map(block_len).unwrap_or(0);
+        if cursor.offset + 1 < length {
+            return Some(ReadingCursor {
+                offset: cursor.offset + 1,
+                ..cursor
+            });
+        }
+        blocks
+            .iter()
+            .enumerate()
+            .skip(cursor.block + 1)
+            .find(|(_, block)| block_len(block) > 0)
+            .map(|(block, _)| ReadingCursor { block, offset: 0 })
+    } else if cursor.offset > 0 {
+        Some(ReadingCursor {
+            offset: cursor.offset - 1,
+            ..cursor
+        })
+    } else {
+        blocks
+            .iter()
+            .enumerate()
+            .take(cursor.block)
+            .rfind(|(_, block)| block_len(block) > 0)
+            .map(|(block, value)| ReadingCursor {
+                block,
+                offset: block_len(value) - 1,
+            })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WordClass {
+    Space,
+    Keyword,
+    Punctuation,
+}
+
+fn cursor_character(blocks: &[Block], cursor: ReadingCursor) -> Option<char> {
+    let block = blocks.get(cursor.block)?;
+    if is_object(block) {
+        Some('\u{fffc}')
+    } else {
+        block
+            .text
+            .chars()
+            .filter(|character| *character != '\n')
+            .nth(cursor.offset)
+    }
+}
+
+fn word_class(character: char) -> WordClass {
+    if character.is_whitespace() {
+        WordClass::Space
+    } else if character.is_alphanumeric() || character == '_' {
+        WordClass::Keyword
+    } else {
+        WordClass::Punctuation
+    }
+}
+
+fn append_count(current: usize, digit: usize) -> usize {
+    current.saturating_mul(10).saturating_add(digit).min(9999)
+}
+
+fn cursor_word_class(blocks: &[Block], cursor: ReadingCursor) -> Option<WordClass> {
+    cursor_character(blocks, cursor).map(word_class)
+}
+
+fn same_line(blocks: &[Block], left: ReadingCursor, right: ReadingCursor) -> bool {
+    left.block == right.block
+        && blocks.get(left.block).is_some_and(|block| {
+            cursor_line(block, left.offset).0 == cursor_line(block, right.offset).0
+        })
+}
+
+fn next_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
+    let class = cursor_word_class(blocks, start)?;
+    let mut cursor = start;
+    while let Some(next) = step_cursor(blocks, cursor, true) {
+        cursor = next;
+        if !same_line(blocks, start, cursor) || cursor_word_class(blocks, cursor) != Some(class) {
+            break;
+        }
+    }
+    while cursor_word_class(blocks, cursor) == Some(WordClass::Space) {
+        let Some(next) = step_cursor(blocks, cursor, true) else {
+            break;
+        };
+        cursor = next;
+    }
+    Some(cursor)
+}
+
+fn previous_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
+    let mut cursor = step_cursor(blocks, start, false)?;
+    while cursor_word_class(blocks, cursor) == Some(WordClass::Space) {
+        cursor = step_cursor(blocks, cursor, false)?;
+    }
+    let class = cursor_word_class(blocks, cursor)?;
+    while let Some(previous) = step_cursor(blocks, cursor, false) {
+        if !same_line(blocks, cursor, previous)
+            || cursor_word_class(blocks, previous) != Some(class)
+        {
+            break;
+        }
+        cursor = previous;
+    }
+    Some(cursor)
+}
+
+fn end_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
+    let current_class = cursor_word_class(blocks, start)?;
+    let mut cursor = start;
+    if current_class != WordClass::Space
+        && step_cursor(blocks, cursor, true).is_some_and(|next| {
+            same_line(blocks, cursor, next)
+                && cursor_word_class(blocks, next) == Some(current_class)
+        })
+    {
+        while let Some(next) = step_cursor(blocks, cursor, true) {
+            if !same_line(blocks, cursor, next)
+                || cursor_word_class(blocks, next) != Some(current_class)
+            {
+                break;
+            }
+            cursor = next;
+        }
+        return Some(cursor);
+    }
+
+    cursor = step_cursor(blocks, cursor, true)?;
+    while cursor_word_class(blocks, cursor) == Some(WordClass::Space) {
+        cursor = step_cursor(blocks, cursor, true)?;
+    }
+    let class = cursor_word_class(blocks, cursor)?;
+    while let Some(next) = step_cursor(blocks, cursor, true) {
+        if !same_line(blocks, cursor, next) || cursor_word_class(blocks, next) != Some(class) {
+            break;
+        }
+        cursor = next;
+    }
+    Some(cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,5 +1448,40 @@ mod tests {
             }
         );
         assert_eq!(text_range("abc\ndef", 3), Some(4..5));
+    }
+
+    #[test]
+    fn moves_by_words_and_builds_counts() {
+        let document = crate::markdown::parse("one two,中文\nnext");
+        let blocks = &document.blocks;
+        assert_eq!(
+            next_word(blocks, ReadingCursor::default()),
+            Some(ReadingCursor {
+                block: 0,
+                offset: 4
+            })
+        );
+        assert_eq!(
+            end_word(blocks, ReadingCursor::default()),
+            Some(ReadingCursor {
+                block: 0,
+                offset: 2
+            })
+        );
+        assert_eq!(
+            previous_word(
+                blocks,
+                ReadingCursor {
+                    block: 0,
+                    offset: 10
+                }
+            ),
+            Some(ReadingCursor {
+                block: 0,
+                offset: 8
+            })
+        );
+        assert_eq!(append_count(12, 3), 123);
+        assert_eq!(append_count(9999, 9), 9999);
     }
 }
