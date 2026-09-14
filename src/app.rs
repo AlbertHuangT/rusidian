@@ -416,6 +416,33 @@ impl RusidianApp {
         self.reading_count.take().unwrap_or(1)
     }
 
+    fn selected_clipboard(&self, selection: ReadingSelection) -> Option<ClipboardItem> {
+        let document = self.document.as_ref()?;
+        let blocks = &document.markdown.blocks;
+        let bounds = selection_bounds(blocks, selection, self.reading_cursor)?;
+        if bounds.0 == bounds.1 {
+            match &blocks.get(bounds.0.block)?.kind {
+                BlockKind::Image(source) => {
+                    let path = local_image_path(&document.file, source)?;
+                    let format = image_format(&path)?;
+                    let bytes = std::fs::read(path).ok()?;
+                    return Some(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
+                }
+                BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
+                    if let Some(TikzState::Ready(image)) = self.tikz.get(&bounds.0.block) {
+                        return Some(ClipboardItem::new_image(image));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(ClipboardItem::new_string(selection_text(
+            blocks,
+            selection,
+            self.reading_cursor,
+        )))
+    }
+
     fn move_reading_line(&mut self, down: bool) {
         let Some(blocks) = self
             .document
@@ -572,16 +599,9 @@ impl RusidianApp {
             }
             if key == Some("y") {
                 if let Some(selection) = self.reading_selection.take()
-                    && let Some(blocks) = self
-                        .document
-                        .as_ref()
-                        .map(|document| &document.markdown.blocks)
+                    && let Some(item) = self.selected_clipboard(selection)
                 {
-                    cx.write_to_clipboard(ClipboardItem::new_string(selection_text(
-                        blocks,
-                        selection,
-                        self.reading_cursor,
-                    )));
+                    cx.write_to_clipboard(item);
                     cx.notify();
                 }
                 self.reading_count = None;
@@ -1079,6 +1099,29 @@ fn source_lines(source: &str) -> Vec<String> {
     }
 }
 
+fn local_image_path(note: &Path, source: &str) -> Option<PathBuf> {
+    let path = Path::new(source);
+    if path.is_absolute() || source.contains("://") || source.starts_with("data:") {
+        return None;
+    }
+    Some(note.parent().unwrap_or_else(|| Path::new(".")).join(path))
+}
+
+fn image_format(path: &Path) -> Option<ImageFormat> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "webp" => Some(ImageFormat::Webp),
+        "gif" => Some(ImageFormat::Gif),
+        "svg" => Some(ImageFormat::Svg),
+        "bmp" => Some(ImageFormat::Bmp),
+        "tif" | "tiff" => Some(ImageFormat::Tiff),
+        "ico" => Some(ImageFormat::Ico),
+        "pbm" | "ppm" | "pgm" => Some(ImageFormat::Pnm),
+        _ => None,
+    }
+}
+
 fn render_block(
     block: &Block,
     tikz: Option<&TikzState>,
@@ -1144,8 +1187,7 @@ fn render_block(
         BlockKind::Image(source) => {
             let source_label = source.clone();
             let alt = block.text.clone();
-            let path = Path::new(source);
-            if path.is_absolute() || source.contains("://") || source.starts_with("data:") {
+            let Some(path) = local_image_path(note, source) else {
                 return div()
                     .mb_4()
                     .p_4()
@@ -1156,8 +1198,7 @@ fn render_block(
                     .bg(rgb(0x1c2229))
                     .child(format!("![{alt}]({source_label})"))
                     .into_any_element();
-            }
-            let path = note.parent().unwrap_or_else(|| Path::new(".")).join(path);
+            };
             div()
                 .mb_4()
                 .when(object_cursor, |element| {
@@ -1800,5 +1841,19 @@ mod tests {
             ),
             "one two\nthree\n"
         );
+
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        app.reading_cursor = ReadingCursor {
+            block: 2,
+            offset: 0,
+        };
+        let image = app
+            .selected_clipboard(ReadingSelection {
+                anchor: app.reading_cursor,
+                linewise: false,
+            })
+            .unwrap();
+        assert!(image.text().is_none());
+        assert!(local_image_path(Path::new("note.md"), "https://example.com/a.png").is_none());
     }
 }
