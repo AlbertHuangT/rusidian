@@ -348,6 +348,7 @@ impl RusidianApp {
         let view = cx.entity();
         let focus = self.focus_handle.clone();
         let marked_text = self.marked_text.clone();
+        let (foreground, background) = self.grid.colors();
 
         div()
             .flex_1()
@@ -355,33 +356,49 @@ impl RusidianApp {
             .relative()
             .overflow_scroll()
             .p_4()
-            .bg(rgb(0x0c0f12))
+            .bg(rgb(background.unwrap_or(0x0c0f12)))
+            .text_color(rgb(foreground.unwrap_or(0xe6e9ed)))
             .font_family("SFMono-Regular")
             .text_sm()
-            .children(self.grid.lines().map(|(mut line, cursor)| {
-                let highlight = cursor.map(|range| {
-                    if marked_text.is_empty() {
+            .children(self.grid.styled_lines().map(|(mut line, styles, cursor)| {
+                let mut highlights = styles
+                    .into_iter()
+                    .map(|(range, style)| {
                         (
                             range,
                             HighlightStyle {
-                                color: Some(rgb(0x0c0f12).into()),
-                                background_color: Some(rgb(0xe6e9ed).into()),
+                                color: style.foreground.map(|color| rgb(color).into()),
+                                background_color: style.background.map(|color| rgb(color).into()),
+                                font_weight: style.bold.then_some(FontWeight::BOLD),
+                                font_style: style.italic.then_some(FontStyle::Italic),
                                 ..Default::default()
                             },
                         )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(range) = cursor {
+                    if marked_text.is_empty() {
+                        highlights.push((
+                            range,
+                            HighlightStyle {
+                                color: Some(rgb(background.unwrap_or(0x0c0f12)).into()),
+                                background_color: Some(rgb(foreground.unwrap_or(0xe6e9ed)).into()),
+                                ..Default::default()
+                            },
+                        ));
                     } else {
                         let start = range.start;
                         line.insert_str(start, &marked_text);
-                        (
+                        highlights.push((
                             start..start + marked_text.len(),
                             HighlightStyle {
                                 background_color: Some(rgb(0x284d75).into()),
                                 ..Default::default()
                             },
-                        )
+                        ));
                     }
-                });
-                let text = StyledText::new(line).with_highlights(highlight);
+                }
+                let text = StyledText::new(line).with_highlights(highlights);
                 div().whitespace_nowrap().child(text)
             }))
             .when_some(focus, |element, focus| {

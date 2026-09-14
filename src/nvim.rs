@@ -4,7 +4,7 @@ use nvim_rs::{
     Handler, Neovim, Value, compat::tokio::Compat, create::tokio as create,
     uioptions::UiAttachOptions,
 };
-use std::{ops::Range, path::PathBuf, thread};
+use std::{collections::HashMap, ops::Range, path::PathBuf, thread};
 use tokio::{process::ChildStdin, sync::mpsc};
 
 pub struct Client {
@@ -170,9 +170,26 @@ impl Client {
 pub struct Grid {
     width: usize,
     height: usize,
-    cells: Vec<Vec<String>>,
+    cells: Vec<Vec<Cell>>,
+    highlights: HashMap<u64, Highlight>,
+    foreground: Option<u32>,
+    background: Option<u32>,
     pub cursor: (usize, usize),
     mode: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Cell {
+    text: String,
+    highlight: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Highlight {
+    pub foreground: Option<u32>,
+    pub background: Option<u32>,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 impl Grid {
@@ -196,6 +213,8 @@ impl Grid {
                     "grid_cursor_goto" => self.cursor(args),
                     "grid_scroll" => self.scroll(args),
                     "mode_change" => self.set_mode(args),
+                    "default_colors_set" => self.set_default_colors(args),
+                    "hl_attr_define" => self.define_highlight(args),
                     "flush" => flush = true,
                     _ => {}
                 }
@@ -204,28 +223,54 @@ impl Grid {
         flush
     }
 
+    #[cfg(test)]
     pub fn lines(&self) -> impl Iterator<Item = (String, Option<Range<usize>>)> + '_ {
+        self.styled_lines().map(|(text, _, cursor)| (text, cursor))
+    }
+
+    pub fn styled_lines(
+        &self,
+    ) -> impl Iterator<Item = (String, Vec<(Range<usize>, Highlight)>, Option<Range<usize>>)> + '_
+    {
         self.cells.iter().enumerate().map(|(row, cells)| {
             let content_end = cells
                 .iter()
-                .rposition(|cell| cell != " ")
+                .rposition(|cell| cell.text != " ")
                 .map_or(0, |column| column + 1);
             let end = if row == self.cursor.0 {
                 content_end.max(self.cursor.1.saturating_add(1).min(cells.len()))
             } else {
                 content_end
             };
-            let text = cells[..end].concat();
+            let text = cells[..end]
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>();
+            let mut highlights = Vec::new();
+            let mut offset = 0;
+            for cell in &cells[..end] {
+                let next = offset + cell.text.len();
+                if cell.highlight != 0
+                    && let Some(highlight) = self.highlights.get(&cell.highlight)
+                {
+                    highlights.push((offset..next, *highlight));
+                }
+                offset = next;
+            }
             let cursor = (row == self.cursor.0 && self.cursor.1 < end).then(|| {
                 let start = cells[..self.cursor.1]
                     .iter()
-                    .map(String::len)
+                    .map(|cell| cell.text.len())
                     .sum::<usize>();
-                let len = cells[self.cursor.1].len().max(1);
+                let len = cells[self.cursor.1].text.len().max(1);
                 start..(start + len).min(text.len())
             });
-            (text, cursor)
+            (text, highlights, cursor)
         })
+    }
+
+    pub fn colors(&self) -> (Option<u32>, Option<u32>) {
+        (self.foreground, self.background)
     }
 
     pub fn is_normal(&self) -> bool {
@@ -261,12 +306,30 @@ impl Grid {
         };
         self.width = width as usize;
         self.height = height as usize;
-        self.cells = vec![vec![" ".into(); self.width]; self.height];
+        self.cells = vec![
+            vec![
+                Cell {
+                    text: " ".into(),
+                    highlight: 0
+                };
+                self.width
+            ];
+            self.height
+        ];
     }
 
     fn clear(&mut self, args: &[Value]) {
         if args.first().and_then(Value::as_i64) == Some(1) {
-            self.cells = vec![vec![" ".into(); self.width]; self.height];
+            self.cells = vec![
+                vec![
+                    Cell {
+                        text: " ".into(),
+                        highlight: 0
+                    };
+                    self.width
+                ];
+                self.height
+            ];
         }
     }
 
@@ -303,6 +366,7 @@ impl Grid {
             return;
         };
 
+        let mut highlight = 0;
         for cell in cells {
             let Some(cell) = cell.as_array() else {
                 continue;
@@ -310,10 +374,16 @@ impl Grid {
             let Some(text) = cell.first().and_then(Value::as_str) else {
                 continue;
             };
+            if let Some(id) = cell.get(1).and_then(Value::as_u64) {
+                highlight = id;
+            }
             let repeat = cell.get(2).and_then(Value::as_u64).unwrap_or(1) as usize;
             for _ in 0..repeat {
                 if let Some(slot) = line.get_mut(column) {
-                    *slot = text.to_owned();
+                    *slot = Cell {
+                        text: text.to_owned(),
+                        highlight,
+                    };
                 }
                 column += 1;
             }
@@ -371,10 +441,53 @@ impl Grid {
                 {
                     old[source_row as usize][source_column as usize].clone()
                 } else {
-                    " ".into()
+                    Cell {
+                        text: " ".into(),
+                        highlight: 0,
+                    }
                 };
             }
         }
+    }
+
+    fn set_default_colors(&mut self, args: &[Value]) {
+        self.foreground = args
+            .first()
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        self.background = args
+            .get(1)
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+    }
+
+    fn define_highlight(&mut self, args: &[Value]) {
+        let Some(id) = args.first().and_then(Value::as_u64) else {
+            return;
+        };
+        let Some(attributes) = args.get(1).and_then(Value::as_map) else {
+            return;
+        };
+        let value = |name: &str| {
+            attributes
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value)
+        };
+        let mut highlight = Highlight {
+            foreground: value("foreground")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32),
+            background: value("background")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32),
+            bold: value("bold").and_then(Value::as_bool).unwrap_or(false),
+            italic: value("italic").and_then(Value::as_bool).unwrap_or(false),
+        };
+        if value("reverse").and_then(Value::as_bool).unwrap_or(false) {
+            std::mem::swap(&mut highlight.foreground, &mut highlight.background);
+        }
+        self.highlights.insert(id, highlight);
     }
 }
 
@@ -388,6 +501,22 @@ mod tests {
         let mut grid = Grid::default();
         let events = vec![
             Value::Array(vec![
+                "default_colors_set".into(),
+                Value::Array(vec![0xe6e9ed.into(), 0x0c0f12.into(), 0.into()]),
+            ]),
+            Value::Array(vec![
+                "hl_attr_define".into(),
+                Value::Array(vec![
+                    1.into(),
+                    Value::Map(vec![
+                        ("foreground".into(), 0x88c0d0.into()),
+                        ("bold".into(), true.into()),
+                    ]),
+                    Value::Map(Vec::new()),
+                    Value::Array(Vec::new()),
+                ]),
+            ]),
+            Value::Array(vec![
                 "grid_resize".into(),
                 Value::Array(vec![1.into(), 5.into(), 2.into()]),
             ]),
@@ -398,7 +527,7 @@ mod tests {
                     0.into(),
                     0.into(),
                     Value::Array(vec![
-                        Value::Array(vec!["A".into(), 0.into()]),
+                        Value::Array(vec!["A".into(), 1.into()]),
                         Value::Array(vec![" ".into(), 0.into(), 2.into()]),
                         Value::Array(vec!["B".into(), 0.into()]),
                     ]),
@@ -414,6 +543,11 @@ mod tests {
 
         assert!(grid.apply_redraw(&events));
         assert_eq!(grid.lines().next().unwrap().0, "A  B");
+        assert_eq!(grid.colors(), (Some(0xe6e9ed), Some(0x0c0f12)));
+        assert_eq!(
+            grid.styled_lines().next().unwrap().1[0].1.foreground,
+            Some(0x88c0d0)
+        );
         assert!(grid.is_normal());
 
         grid.apply_redraw(&[Value::Array(vec![
