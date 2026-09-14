@@ -558,6 +558,34 @@ impl RusidianApp {
         }
     }
 
+    fn move_reading_first_nonblank(&mut self) {
+        let Some(block) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.markdown.blocks.get(self.reading_cursor.block))
+        else {
+            return;
+        };
+        let (line, _) = cursor_line(block, self.reading_cursor.offset);
+        let column = if is_object(block) {
+            0
+        } else {
+            block
+                .text
+                .split('\n')
+                .nth(line)
+                .and_then(|text| {
+                    text.chars()
+                        .position(|character| !character.is_whitespace())
+                })
+                .unwrap_or(0)
+        };
+        if let Some(cursor) = cursor_for_line(block, self.reading_cursor.block, line, column) {
+            self.reading_cursor = cursor;
+            self.reading_column = None;
+        }
+    }
+
     fn move_reading_document_edge(&mut self, end: bool) {
         let Some(blocks) = self
             .document
@@ -770,6 +798,7 @@ impl RusidianApp {
                     }
                 }
                 Some("0") => self.move_reading_line_edge(false),
+                Some("^") => self.move_reading_first_nonblank(),
                 Some("$") => {
                     for _ in 1..count {
                         self.move_reading_line(true);
@@ -1965,6 +1994,20 @@ mod tests {
             }
         );
         assert_eq!(text_range("abc\ndef", 3), Some(4..5));
+
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("```\n  abc\n```");
+        app.reading_cursor = ReadingCursor {
+            block: 0,
+            offset: 4,
+        };
+        app.move_reading_first_nonblank();
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 0,
+                offset: 2
+            }
+        );
     }
 
     #[test]
