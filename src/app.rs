@@ -439,12 +439,22 @@ impl RusidianApp {
         let blocks = &document.markdown.blocks;
         let bounds = selection_bounds(blocks, selection, self.reading_cursor)?;
         if bounds.0 == bounds.1 {
-            match &blocks.get(bounds.0.block)?.kind {
+            let block = blocks.get(bounds.0.block)?;
+            if let Some(image) = inline_image_at_offset(block, bounds.0.offset)
+                && let Some(path) = local_image_path(&document.file, &image.source)
+                && let Some(format) = image_format(&path)
+                && let Ok(bytes) = std::fs::read(path)
+            {
+                return Some(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
+            }
+            match &block.kind {
                 BlockKind::Image(source) => {
-                    let path = local_image_path(&document.file, source)?;
-                    let format = image_format(&path)?;
-                    let bytes = std::fs::read(path).ok()?;
-                    return Some(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
+                    if let Some(path) = local_image_path(&document.file, source)
+                        && let Some(format) = image_format(&path)
+                        && let Ok(bytes) = std::fs::read(path)
+                    {
+                        return Some(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
+                    }
                 }
                 BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
                     if let Some(TikzState::Ready(image)) = self.tikz.get(&bounds.0.block) {
@@ -1372,46 +1382,7 @@ fn render_block(
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
     let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
-    let mut highlights = block
-        .spans
-        .iter()
-        .map(|span| {
-            (
-                span.range.clone(),
-                HighlightStyle {
-                    font_weight: span.bold.then_some(FontWeight::BOLD),
-                    font_style: span.italic.then_some(FontStyle::Italic),
-                    background_color: span.code.then_some(rgb(0x242a32).into()),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    if !object_cursor
-        && let Some((start, end)) = selection
-        && let (Some(start), Some(end)) =
-            (text_range(&block.text, start), text_range(&block.text, end))
-    {
-        highlights.push((
-            start.start..end.end,
-            HighlightStyle {
-                background_color: Some(rgb(0x315b7d).into()),
-                ..Default::default()
-            },
-        ));
-    }
-    if !object_cursor && let Some(range) = cursor.and_then(|offset| text_range(&block.text, offset))
-    {
-        highlights.push((
-            range,
-            HighlightStyle {
-                color: Some(rgb(0x111418).into()),
-                background_color: Some(rgb(0xe6e9ed).into()),
-                ..Default::default()
-            },
-        ));
-    }
-    let text = StyledText::new(block.text.clone()).with_highlights(highlights);
+    let text = styled_fragment(block, 0..block.text.len(), cursor, selection);
 
     match &block.kind {
         BlockKind::Heading(level) => div()
@@ -1425,6 +1396,9 @@ fn render_block(
             .font_weight(FontWeight::SEMIBOLD)
             .child(text)
             .into_any_element(),
+        BlockKind::Paragraph if !block.images.is_empty() => {
+            render_inline_paragraph(block, note, cursor, selection)
+        }
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
         BlockKind::Image(source) => {
             let source_label = source.clone();
@@ -1509,6 +1483,141 @@ fn render_block(
             .child(text)
             .into_any_element(),
     }
+}
+
+fn styled_fragment(
+    block: &Block,
+    range: std::ops::Range<usize>,
+    cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
+) -> StyledText {
+    let mut highlights = block
+        .spans
+        .iter()
+        .filter_map(|span| {
+            clipped_range(&span.range, &range).map(|span_range| {
+                (
+                    span_range,
+                    HighlightStyle {
+                        font_weight: span.bold.then_some(FontWeight::BOLD),
+                        font_style: span.italic.then_some(FontStyle::Italic),
+                        background_color: span.code.then_some(rgb(0x242a32).into()),
+                        ..Default::default()
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some((start, end)) = selection
+        && let (Some(start), Some(end)) =
+            (text_range(&block.text, start), text_range(&block.text, end))
+        && let Some(selection_range) = clipped_range(&(start.start..end.end), &range)
+    {
+        highlights.push((
+            selection_range,
+            HighlightStyle {
+                background_color: Some(rgb(0x315b7d).into()),
+                ..Default::default()
+            },
+        ));
+    }
+    if let Some(cursor_range) = cursor
+        .and_then(|offset| text_range(&block.text, offset))
+        .and_then(|cursor| clipped_range(&cursor, &range))
+    {
+        highlights.push((
+            cursor_range,
+            HighlightStyle {
+                color: Some(rgb(0x111418).into()),
+                background_color: Some(rgb(0xe6e9ed).into()),
+                ..Default::default()
+            },
+        ));
+    }
+    StyledText::new(block.text[range.clone()].to_owned()).with_highlights(highlights)
+}
+
+fn clipped_range(
+    subject: &std::ops::Range<usize>,
+    container: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let start = subject.start.max(container.start);
+    let end = subject.end.min(container.end);
+    (start < end).then_some(start - container.start..end - container.start)
+}
+
+fn render_inline_paragraph(
+    block: &Block,
+    note: &Path,
+    cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
+) -> AnyElement {
+    let mut children = Vec::new();
+    let mut start = 0;
+    for image in &block.images {
+        if start < image.range.start {
+            children.push(
+                div()
+                    .child(styled_fragment(
+                        block,
+                        start..image.range.start,
+                        cursor,
+                        selection,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        let offset = block.text[..image.range.start]
+            .chars()
+            .filter(|character| *character != '\n')
+            .count();
+        let active = cursor == Some(offset)
+            || selection.is_some_and(|(from, to)| from <= offset && offset <= to);
+        let alt = image.alt.clone();
+        let source = image.source.clone();
+        let child = if let Some(path) = local_image_path(note, &image.source) {
+            img(path)
+                .h(px(24.0))
+                .max_w_full()
+                .with_fallback(move || div().child(alt.clone()).into_any_element())
+                .into_any_element()
+        } else {
+            div()
+                .px_1()
+                .bg(rgb(0x242a32))
+                .child(format!("![{alt}]({source})"))
+                .into_any_element()
+        };
+        children.push(
+            div()
+                .flex_none()
+                .when(active, |element| {
+                    element.border_2().border_color(rgb(0x88c0d0))
+                })
+                .child(child)
+                .into_any_element(),
+        );
+        start = image.range.end;
+    }
+    if start < block.text.len() {
+        children.push(
+            div()
+                .child(styled_fragment(
+                    block,
+                    start..block.text.len(),
+                    cursor,
+                    selection,
+                ))
+                .into_any_element(),
+        );
+    }
+    div()
+        .mb_4()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .children(children)
+        .into_any_element()
 }
 
 fn is_object(block: &Block) -> bool {
@@ -1697,7 +1806,9 @@ fn selection_text(blocks: &[Block], selection: ReadingSelection, cursor: Reading
                 output.push_str("[TikZ]")
             }
             _ => {
-                if let Some(character) = cursor_character(blocks, position) {
+                if let Some(image) = inline_image_at_offset(block, position.offset) {
+                    output.push_str(&image.alt);
+                } else if let Some(character) = cursor_character(blocks, position) {
                     output.push(character);
                 }
             }
@@ -1737,6 +1848,16 @@ fn cursor_character(blocks: &[Block], cursor: ReadingCursor) -> Option<char> {
             .filter(|character| *character != '\n')
             .nth(cursor.offset)
     }
+}
+
+fn inline_image_at_offset(block: &Block, offset: usize) -> Option<&crate::markdown::InlineImage> {
+    block.images.iter().find(|image| {
+        block.text[..image.range.start]
+            .chars()
+            .filter(|character| *character != '\n')
+            .count()
+            == offset
+    })
 }
 
 fn word_class(character: char) -> WordClass {
@@ -2208,6 +2329,39 @@ mod tests {
             .unwrap();
         assert!(image.text().is_none());
         assert!(local_image_path(Path::new("note.md"), "https://example.com/a.png").is_none());
+
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("a ![图](rusidian.svg) b");
+        app.reading_cursor = ReadingCursor {
+            block: 0,
+            offset: 2,
+        };
+        let inline_block = &app.document.as_ref().unwrap().markdown.blocks[0];
+        assert_eq!(inline_block.images.len(), 1);
+        assert_eq!(
+            inline_image_at_offset(inline_block, 2).unwrap().source,
+            "rusidian.svg"
+        );
+        let inline = app
+            .selected_clipboard(ReadingSelection {
+                anchor: app.reading_cursor,
+                linewise: false,
+            })
+            .unwrap();
+        assert!(inline.text().is_none());
+        assert_eq!(
+            selection_text(
+                &app.document.as_ref().unwrap().markdown.blocks,
+                ReadingSelection {
+                    anchor: ReadingCursor::default(),
+                    linewise: false,
+                },
+                ReadingCursor {
+                    block: 0,
+                    offset: 4
+                },
+            ),
+            "a 图 b"
+        );
     }
 
     #[test]

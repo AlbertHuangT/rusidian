@@ -11,6 +11,7 @@ pub struct Block {
     pub kind: BlockKind,
     pub text: String,
     pub spans: Vec<Span>,
+    pub images: Vec<InlineImage>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -29,12 +30,24 @@ pub struct Span {
     pub code: bool,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct InlineImage {
+    pub range: Range<usize>,
+    pub source: String,
+    pub alt: String,
+}
+
+struct PendingImage {
+    source: String,
+    alt: String,
+}
+
 pub fn parse(source: &str) -> MarkdownDocument {
     let mut blocks = Vec::new();
     let mut current = None;
     let mut bold = 0;
     let mut italic = 0;
-    let mut in_image = false;
+    let mut image = None;
 
     for event in Parser::new_ext(source, Options::all()) {
         match event {
@@ -50,35 +63,44 @@ pub fn parse(source: &str) -> MarkdownDocument {
                 current = Some(Block::new(BlockKind::Code(language)));
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
-                if block.kind == BlockKind::Paragraph && block.text.is_empty() {
-                    block.kind = BlockKind::Image(dest_url.into_string());
-                }
-                in_image = true;
+                current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
+                image = Some(PendingImage {
+                    source: dest_url.into_string(),
+                    alt: String::new(),
+                });
             }
             Event::Start(Tag::Strong) => bold += 1,
             Event::Start(Tag::Emphasis) => italic += 1,
             Event::End(TagEnd::Strong) => bold -= 1,
             Event::End(TagEnd::Emphasis) => italic -= 1,
-            Event::End(TagEnd::Image) => in_image = false,
+            Event::End(TagEnd::Image) => {
+                if let (Some(block), Some(image)) = (&mut current, image.take()) {
+                    block.push_image(image);
+                }
+            }
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock) => {
-                if let Some(block) = current.take() {
+                if let Some(mut block) = current.take() {
+                    block.finish();
                     blocks.push(block);
                 }
             }
             Event::Text(text) => {
-                let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
-                if !in_image && matches!(&block.kind, BlockKind::Image(_)) {
-                    block.kind = BlockKind::Paragraph;
+                if let Some(image) = &mut image {
+                    image.alt.push_str(&text);
+                } else {
+                    current
+                        .get_or_insert_with(|| Block::new(BlockKind::Paragraph))
+                        .push(&text, bold > 0, italic > 0, false);
                 }
-                block.push(&text, bold > 0, italic > 0, false);
             }
             Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                let block = current.get_or_insert_with(|| Block::new(BlockKind::Paragraph));
-                if !in_image && matches!(&block.kind, BlockKind::Image(_)) {
-                    block.kind = BlockKind::Paragraph;
+                if let Some(image) = &mut image {
+                    image.alt.push_str(&text);
+                } else {
+                    current
+                        .get_or_insert_with(|| Block::new(BlockKind::Paragraph))
+                        .push(&text, bold > 0, italic > 0, true);
                 }
-                block.push(&text, bold > 0, italic > 0, true);
             }
             Event::SoftBreak | Event::HardBreak => {
                 current
@@ -89,7 +111,8 @@ pub fn parse(source: &str) -> MarkdownDocument {
         }
     }
 
-    if let Some(block) = current {
+    if let Some(mut block) = current {
+        block.finish();
         blocks.push(block);
     }
 
@@ -102,6 +125,7 @@ impl Block {
             kind,
             text: String::new(),
             spans: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -115,6 +139,24 @@ impl Block {
                 italic,
                 code,
             });
+        }
+    }
+
+    fn push_image(&mut self, image: PendingImage) {
+        let start = self.text.len();
+        self.text.push('\u{fffc}');
+        self.images.push(InlineImage {
+            range: start..self.text.len(),
+            source: image.source,
+            alt: image.alt,
+        });
+    }
+
+    fn finish(&mut self) {
+        if self.kind == BlockKind::Paragraph && self.text == "\u{fffc}" && self.images.len() == 1 {
+            let image = self.images.pop().unwrap();
+            self.kind = BlockKind::Image(image.source);
+            self.text = image.alt;
         }
     }
 }
@@ -154,6 +196,9 @@ mod tests {
         );
         assert_eq!(images.blocks[0].text, "图");
         assert_eq!(images.blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(images.blocks[1].text, "前 \u{fffc} 后");
+        assert_eq!(images.blocks[1].images[0].source, "inline.png");
+        assert_eq!(images.blocks[1].images[0].alt, "图");
 
         let raw = parse("`code` <span>raw</span> <!-- comment -->");
         assert!(raw.blocks[0].spans.iter().all(|span| span.code));
