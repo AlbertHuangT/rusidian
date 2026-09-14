@@ -20,6 +20,7 @@ pub enum Event {
         lines: Vec<String>,
         more: bool,
     },
+    Warning(String),
     Error(String),
 }
 
@@ -126,6 +127,15 @@ impl Client {
                         .await;
                     return;
                 }
+                let local_maps = buffer.get_keymap("n").await.unwrap_or_default();
+                let global_maps = nvim.get_keymap("n").await.unwrap_or_default();
+                if let Some(mapping) = escape_mapping(&local_maps)
+                    .or_else(|| escape_mapping(&global_maps))
+                {
+                    let _ = event_sender.send(Event::Warning(format!(
+                        "Neovim Normal 的 Esc 已映射为 {mapping}；Rusidian 当前会优先用 Esc 返回阅读视图"
+                    ))).await;
+                }
 
                 tokio::spawn(async move {
                     let _ = io.await;
@@ -164,6 +174,22 @@ impl Client {
     pub fn resize(&self, width: i64, height: i64) {
         let _ = self.commands.send(Command::Resize(width, height));
     }
+}
+
+fn escape_mapping(maps: &[Vec<(Value, Value)>]) -> Option<String> {
+    maps.iter().find_map(|map| {
+        let field = |name: &str| {
+            map.iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value)
+        };
+        (field("lhs").and_then(Value::as_str) == Some("<Esc>")).then(|| {
+            field("rhs")
+                .and_then(Value::as_str)
+                .unwrap_or("Lua 回调")
+                .to_owned()
+        })
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -576,6 +602,19 @@ mod tests {
     }
 
     #[test]
+    fn detects_normal_escape_mapping() {
+        let maps = vec![vec![
+            ("lhs".into(), "<Esc>".into()),
+            ("rhs".into(), "<Cmd>nohlsearch<CR>".into()),
+        ]];
+        assert_eq!(
+            escape_mapping(&maps).as_deref(),
+            Some("<Cmd>nohlsearch<CR>")
+        );
+        assert!(escape_mapping(&[]).is_none());
+    }
+
+    #[test]
     #[ignore = "requires the external Neovim installation"]
     fn starts_neovim_and_receives_redraw() {
         let client = Client::start(PathBuf::from("examples/tikz.md"), true);
@@ -602,6 +641,7 @@ mod tests {
                                     break grid;
                                 }
                             }
+                            Event::Warning(_) => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -623,6 +663,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
+                            Event::Warning(_) => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -643,6 +684,7 @@ mod tests {
                                 mode.clone_from(&grid.mode);
                             }
                             Event::BufferLines { .. } => {}
+                            Event::Warning(_) => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -663,6 +705,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
+                            Event::Warning(_) => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }
@@ -681,6 +724,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
+                            Event::Warning(_) => {}
                             Event::Error(error) => panic!("{error}"),
                         }
                     }

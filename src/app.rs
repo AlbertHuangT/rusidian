@@ -75,6 +75,7 @@ struct RusidianApp {
     nvim: Option<NvimClient>,
     grid: NvimGrid,
     nvim_error: Option<SharedString>,
+    nvim_warning: Option<SharedString>,
     nvim_size: (i64, i64),
     focus_handle: Option<FocusHandle>,
     marked_text: String,
@@ -104,6 +105,7 @@ impl RusidianApp {
                 nvim: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
+                nvim_warning: None,
                 nvim_size: (120, 40),
                 focus_handle: None,
                 marked_text: String::new(),
@@ -133,6 +135,7 @@ impl RusidianApp {
                     nvim: None,
                     grid: NvimGrid::default(),
                     nvim_error: None,
+                    nvim_warning: None,
                     nvim_size: (120, 40),
                     focus_handle: None,
                     marked_text: String::new(),
@@ -147,6 +150,7 @@ impl RusidianApp {
                 nvim: None,
                 grid: NvimGrid::default(),
                 nvim_error: None,
+                nvim_warning: None,
                 nvim_size: (120, 40),
                 focus_handle: None,
                 marked_text: String::new(),
@@ -238,6 +242,10 @@ impl RusidianApp {
                     }
                     NvimEvent::Error(error) => {
                         this.nvim_error = Some(error.into());
+                        cx.notify();
+                    }
+                    NvimEvent::Warning(warning) => {
+                        this.nvim_warning = Some(warning.into());
                         cx.notify();
                     }
                 });
@@ -348,6 +356,7 @@ impl RusidianApp {
         let view = cx.entity();
         let focus = self.focus_handle.clone();
         let marked_text = self.marked_text.clone();
+        let warning = self.nvim_warning.clone();
         let (foreground, background) = self.grid.colors();
 
         div()
@@ -360,6 +369,17 @@ impl RusidianApp {
             .text_color(rgb(foreground.unwrap_or(0xe6e9ed)))
             .font_family("SFMono-Regular")
             .text_sm()
+            .when_some(warning, |element, warning| {
+                element.child(
+                    div()
+                        .mb_3()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(0x4a3518))
+                        .text_color(rgb(0xffd38a))
+                        .child(warning),
+                )
+            })
             .children(self.grid.styled_lines().map(|(mut line, styles, cursor)| {
                 let mut highlights = styles
                     .into_iter()
