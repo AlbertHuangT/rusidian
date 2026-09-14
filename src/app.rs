@@ -1673,8 +1673,8 @@ fn render_block(
                 .mb_4()
                 .p_4()
                 .rounded_md()
-                .bg(rgb(0xffffff))
-                .child(img(image.clone()).max_w_full())
+                .bg(rgb(0x1c2229))
+                .child(img(image.clone()).h(px(48.0)).max_w_full())
                 .into_any_element(),
             Some(TikzState::Failed(error)) => div()
                 .mb_4()
@@ -1904,7 +1904,6 @@ fn render_inline_paragraph(
             InlineAtom::Math(index, formula) => match math.get(&(block_index, index)) {
                 Some(TikzState::Ready(image)) => div()
                     .px_1()
-                    .bg(rgb(0xffffff))
                     .child(img(image.clone()).h(px(24.0)).max_w_full())
                     .into_any_element(),
                 Some(TikzState::Failed(error)) => div()

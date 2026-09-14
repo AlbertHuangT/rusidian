@@ -46,6 +46,7 @@
 - 完整 TikZ 块在闭合围栏时触发后台编译；编辑已有完整块时，在光标离开该块后触发编译。
 - Markdown 立即显示。首次编译和重新编译期间，TikZ 位置显示占位符；编译失败只在该块显示错误卡片，其他内容继续渲染。
 - Tectonic 生成 PDF。磁盘只保存具有容量上限的 PDF 缓存；显示位图主要驻留内存。
+- 数学公式同样由 Tectonic 生成 PDF；GPUI 不直接显示 PDF，因此按显示主题从 PDF 生成透明、高 DPI 内存位图。首版不增加 `dvisvgm` 或 Poppler 运行时依赖来转 SVG。
 - TeX 默认在沙箱内运行。vault 可被单独标记为可信，但外部命令、读取 vault 外文件等能力仍应逐项授权。
 
 ## Vault and local data
