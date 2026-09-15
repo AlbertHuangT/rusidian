@@ -1,5 +1,6 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
+use crate::vault::Vault;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
@@ -17,17 +18,21 @@ use std::{
 const WINDOW_WIDTH: f32 = 960.0;
 const WINDOW_HEIGHT: f32 = 640.0;
 
-actions!(rusidian, [OpenFile, Quit, EnterSourceNormal]);
+actions!(rusidian, [OpenFile, OpenFolder, Quit, EnterSourceNormal]);
 
 pub fn run(initial_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenFile, None),
+            KeyBinding::new("cmd-shift-o", OpenFolder, None),
             KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
         ]);
         cx.set_menus([
             Menu::new("Rusidian").items([MenuItem::action("退出 Rusidian", Quit)]),
-            Menu::new("文件").items([MenuItem::action("打开文件…", OpenFile)]),
+            Menu::new("文件").items([
+                MenuItem::action("打开文件…", OpenFile),
+                MenuItem::action("打开文件夹…", OpenFolder),
+            ]),
         ]);
 
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
@@ -81,6 +86,7 @@ struct Document {
 
 struct RusidianApp {
     document: Option<Document>,
+    vault: Option<Vault>,
     error: Option<SharedString>,
     tikz: HashMap<usize, TikzState>,
     math: HashMap<(usize, usize), TikzState>,
@@ -112,7 +118,10 @@ enum View {
 }
 
 enum PendingClose {
-    Open(PathBuf),
+    Open {
+        path: PathBuf,
+        vault_root: Option<PathBuf>,
+    },
     Quit,
 }
 
@@ -158,6 +167,7 @@ impl RusidianApp {
         let Some(path) = path else {
             return Self {
                 document: None,
+                vault: None,
                 error: None,
                 tikz: HashMap::new(),
                 math: HashMap::new(),
@@ -183,6 +193,22 @@ impl RusidianApp {
             };
         };
 
+        if path.is_dir() {
+            return match Vault::open(path) {
+                Ok(vault) => {
+                    let first = vault.files.first().cloned();
+                    let mut app = Self::open(first.as_deref());
+                    app.vault = Some(vault);
+                    app
+                }
+                Err(error) => {
+                    let mut app = Self::open(None);
+                    app.error = Some(format!("无法打开文件夹 {}：{error}", path.display()).into());
+                    app
+                }
+            };
+        }
+
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 let lines = source_lines(&content);
@@ -199,6 +225,7 @@ impl RusidianApp {
                         lines,
                         markdown: crate::markdown::parse(&content),
                     }),
+                    vault: None,
                     error: None,
                     tikz: HashMap::new(),
                     math: HashMap::new(),
@@ -225,6 +252,7 @@ impl RusidianApp {
             }
             Err(error) => Self {
                 document: None,
+                vault: None,
                 error: Some(format!("无法打开 {}：{error}", path.display()).into()),
                 tikz: HashMap::new(),
                 math: HashMap::new(),
@@ -451,9 +479,14 @@ impl RusidianApp {
             self.nvim = None;
         }
         match action {
-            PendingClose::Open(path) => {
+            PendingClose::Open { path, vault_root } => {
                 let focus = self.focus_handle.clone();
                 *self = Self::open(Some(&path));
+                if let Some(root) = vault_root
+                    && !path.is_dir()
+                {
+                    self.vault = Vault::open(&root).ok();
+                }
                 self.focus_handle = focus;
                 self.compile_visuals(cx);
                 self.start_nvim(cx);
@@ -464,11 +497,26 @@ impl RusidianApp {
     }
 
     fn choose_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_path(false, window, cx);
+    }
+
+    fn choose_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_path(true, window, cx);
+    }
+
+    fn choose_path(&mut self, directory: bool, window: &mut Window, cx: &mut Context<Self>) {
         let selected = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
+            files: !directory,
+            directories: directory,
             multiple: false,
-            prompt: Some("打开".into()),
+            prompt: Some(
+                if directory {
+                    "打开文件夹"
+                } else {
+                    "打开文件"
+                }
+                .into(),
+            ),
         });
 
         cx.spawn_in(window, async move |this, cx| {
@@ -480,7 +528,13 @@ impl RusidianApp {
             };
 
             this.update_in(cx, |this, _, cx| {
-                this.request_close(PendingClose::Open(path), cx);
+                this.request_close(
+                    PendingClose::Open {
+                        path,
+                        vault_root: None,
+                    },
+                    cx,
+                );
             })
             .ok();
         })
@@ -718,7 +772,13 @@ impl RusidianApp {
             self.nvim_warning = Some(format!("找不到链接文件：{}", path.display()).into());
             return;
         }
-        self.request_close(PendingClose::Open(path), cx);
+        self.request_close(
+            PendingClose::Open {
+                path,
+                vault_root: self.vault.as_ref().map(|vault| vault.root.clone()),
+            },
+            cx,
+        );
     }
 
     fn open_external_link(&self, cx: &mut Context<Self>) {
@@ -1435,6 +1495,81 @@ impl Render for RusidianApp {
         } else {
             reading
         };
+        let body = if let Some(vault) = &self.vault {
+            let current = self
+                .document
+                .as_ref()
+                .map(|document| document.file.as_path());
+            let root = vault.root.clone();
+            let name: SharedString = vault
+                .root
+                .file_name()
+                .unwrap_or(vault.root.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+                .into();
+            div()
+                .flex_1()
+                .flex()
+                .min_h_0()
+                .child(
+                    div()
+                        .w(px(240.0))
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .border_r_1()
+                        .border_color(rgb(0x2a3038))
+                        .bg(rgb(0x0c0f12))
+                        .child(
+                            div()
+                                .h(px(40.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("vault-files")
+                                .overflow_y_scroll()
+                                .children(vault.files.iter().enumerate().map(|(index, path)| {
+                                    let selected = current == Some(path.as_path());
+                                    let file = path.clone();
+                                    let vault_root = root.clone();
+                                    let label: SharedString = path
+                                        .strip_prefix(&root)
+                                        .unwrap_or(path)
+                                        .to_string_lossy()
+                                        .into_owned()
+                                        .into();
+                                    div()
+                                        .id(("vault-file", index))
+                                        .px_3()
+                                        .py_2()
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .when(selected, |element| element.bg(rgb(0x263241)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.request_close(
+                                                PendingClose::Open {
+                                                    path: file.clone(),
+                                                    vault_root: Some(vault_root.clone()),
+                                                },
+                                                cx,
+                                            );
+                                        }))
+                                        .child(label)
+                                })),
+                        ),
+                )
+                .child(body)
+                .into_any_element()
+        } else {
+            body
+        };
 
         div()
             .key_context(if self.view == View::Source {
@@ -1445,6 +1580,7 @@ impl Render for RusidianApp {
                 "Reading"
             })
             .on_action(cx.listener(Self::choose_file))
+            .on_action(cx.listener(Self::choose_folder))
             .on_action(cx.listener(Self::enter_source_normal))
             .on_key_down(cx.listener(Self::key_down))
             .flex()
@@ -2555,6 +2691,15 @@ mod tests {
 
         let missing = RusidianApp::open(Some(Path::new("missing-rusidian-test-file.md")));
         assert!(missing.error.is_some());
+
+        let vault = RusidianApp::open(Some(Path::new("examples")));
+        assert!(
+            vault
+                .vault
+                .as_ref()
+                .is_some_and(|vault| vault.files.len() >= 3)
+        );
+        assert!(vault.document.is_some());
     }
 
     #[test]
