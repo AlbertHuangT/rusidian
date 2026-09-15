@@ -39,6 +39,19 @@ impl Vault {
             settings,
         })
     }
+
+    pub fn resolve_note(&self, target: &str) -> Option<PathBuf> {
+        let target = target.trim_end_matches(".md");
+        let mut matches = self.files.iter().filter(|file| {
+            let relative = file.strip_prefix(&self.root).unwrap_or(file);
+            let without_extension = relative.with_extension("");
+            without_extension == Path::new(target)
+                || (!target.contains('/')
+                    && file.file_stem().and_then(|stem| stem.to_str()) == Some(target))
+        });
+        let first = matches.next()?.clone();
+        matches.next().is_none().then_some(first)
+    }
 }
 
 fn visit(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -75,6 +88,8 @@ mod tests {
         let hidden = root.join(".obsidian");
         fs::create_dir_all(&hidden).unwrap();
         fs::write(root.join("a.md"), "# A").unwrap();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/B Note.md"), "# B").unwrap();
         fs::write(root.join("ignored.txt"), "text").unwrap();
         fs::write(hidden.join("state.md"), "state").unwrap();
         fs::write(
@@ -84,10 +99,21 @@ mod tests {
         .unwrap();
 
         let vault = Vault::open(&root).unwrap();
-        assert_eq!(vault.files, [root.join("a.md")]);
+        assert_eq!(
+            vault.files,
+            [root.join("a.md"), root.join("nested/B Note.md")]
+        );
         assert!(vault.is_obsidian);
         assert!(vault.settings.strict_line_breaks);
         assert_eq!(vault.settings.always_update_links, Some(true));
+        assert_eq!(
+            vault.resolve_note("B Note"),
+            Some(root.join("nested/B Note.md"))
+        );
+        assert_eq!(
+            vault.resolve_note("nested/B Note"),
+            Some(root.join("nested/B Note.md"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

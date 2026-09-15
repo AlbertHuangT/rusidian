@@ -776,18 +776,30 @@ impl RusidianApp {
             return;
         }
         let destination = destination.split('#').next().unwrap_or_default();
+        if destination.is_empty() {
+            return;
+        }
         let Some(document) = &self.document else {
             return;
         };
-        let path = document
+        let direct = document
             .file
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(destination);
-        if !path.is_file() {
-            self.nvim_warning = Some(format!("找不到链接文件：{}", path.display()).into());
+        let path = if direct.is_file() {
+            Some(direct)
+        } else if direct.extension().is_none() && direct.with_extension("md").is_file() {
+            Some(direct.with_extension("md"))
+        } else {
+            self.vault
+                .as_ref()
+                .and_then(|vault| vault.resolve_note(destination))
+        };
+        let Some(path) = path else {
+            self.nvim_warning = Some(format!("找不到或无法唯一确定链接：{destination}").into());
             return;
-        }
+        };
         self.request_close(
             PendingClose::Open {
                 path,

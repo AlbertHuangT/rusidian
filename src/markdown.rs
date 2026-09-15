@@ -523,5 +523,9 @@ mod tests {
         assert_eq!(parse("a\nb").blocks[0].text, "a\nb");
         assert_eq!(parse_with_options("a\nb", true).blocks[0].text, "a b");
         assert_eq!(parse_with_options("a  \nb", true).blocks[0].text, "a\nb");
+
+        let wiki = parse("[[目标笔记|显示名称]]");
+        assert_eq!(wiki.blocks[0].text, "显示名称");
+        assert_eq!(wiki.blocks[0].links[0].destination, "目标笔记");
     }
 }
