@@ -198,7 +198,7 @@ impl RusidianApp {
                 Ok(vault) => {
                     let first = vault.files.first().cloned();
                     let mut app = Self::open(first.as_deref());
-                    app.vault = Some(vault);
+                    app.attach_vault(vault);
                     app
                 }
                 Err(error) => {
@@ -277,6 +277,16 @@ impl RusidianApp {
                 marked_selection: 0..0,
             },
         }
+    }
+
+    fn attach_vault(&mut self, vault: Vault) {
+        if let Some(document) = &mut self.document {
+            document.markdown = crate::markdown::parse_with_options(
+                &document.lines.join("\n"),
+                vault.settings.strict_line_breaks,
+            );
+        }
+        self.vault = Some(vault);
     }
 
     fn compile_tikz(&mut self, cx: &mut Context<Self>) {
@@ -484,8 +494,9 @@ impl RusidianApp {
                 *self = Self::open(Some(&path));
                 if let Some(root) = vault_root
                     && !path.is_dir()
+                    && let Ok(vault) = Vault::open(&root)
                 {
-                    self.vault = Vault::open(&root).ok();
+                    self.attach_vault(vault);
                 }
                 self.focus_handle = focus;
                 self.compile_visuals(cx);
@@ -548,6 +559,10 @@ impl RusidianApp {
         replacement: Vec<String>,
         more: bool,
     ) -> bool {
+        let strict_line_breaks = self
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.settings.strict_line_breaks);
         let Some(document) = &mut self.document else {
             return false;
         };
@@ -557,7 +572,8 @@ impl RusidianApp {
         }
         document.lines.splice(first..end, replacement);
         if !more {
-            document.markdown = crate::markdown::parse(&document.lines.join("\n"));
+            document.markdown =
+                crate::markdown::parse_with_options(&document.lines.join("\n"), strict_line_breaks);
             self.clamp_reading_cursor();
         }
         true
@@ -1501,13 +1517,21 @@ impl Render for RusidianApp {
                 .as_ref()
                 .map(|document| document.file.as_path());
             let root = vault.root.clone();
-            let name: SharedString = vault
+            let root_name = vault
                 .root
                 .file_name()
                 .unwrap_or(vault.root.as_os_str())
                 .to_string_lossy()
-                .into_owned()
-                .into();
+                .into_owned();
+            let name: SharedString = format!(
+                "{root_name}{}",
+                if vault.is_obsidian {
+                    " · Obsidian"
+                } else {
+                    ""
+                }
+            )
+            .into();
             div()
                 .flex_1()
                 .flex()

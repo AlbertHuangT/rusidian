@@ -82,6 +82,10 @@ struct ItemState {
 }
 
 pub fn parse(source: &str) -> MarkdownDocument {
+    parse_with_options(source, false)
+}
+
+pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDocument {
     let mut blocks = Vec::new();
     let mut current = None;
     let mut bold = 0;
@@ -285,7 +289,19 @@ pub fn parse(source: &str) -> MarkdownDocument {
                 block.push(&text, false, false, false, false, None);
                 blocks.push(block);
             }
-            Event::SoftBreak | Event::HardBreak => {
+            Event::SoftBreak => {
+                current
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .push(
+                        if strict_line_breaks { " " } else { "\n" },
+                        bold > 0,
+                        italic > 0,
+                        false,
+                        strike > 0,
+                        link.as_deref(),
+                    );
+            }
+            Event::HardBreak => {
                 current
                     .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
                     .push(
@@ -504,5 +520,8 @@ mod tests {
                 .iter()
                 .any(|block| matches!(&block.kind, BlockKind::Footnote(label) if label == "1"))
         );
+        assert_eq!(parse("a\nb").blocks[0].text, "a\nb");
+        assert_eq!(parse_with_options("a\nb", true).blocks[0].text, "a b");
+        assert_eq!(parse_with_options("a  \nb", true).blocks[0].text, "a\nb");
     }
 }

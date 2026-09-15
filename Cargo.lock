@@ -4437,6 +4437,8 @@ dependencies = [
  "gpui_platform",
  "nvim-rs",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
