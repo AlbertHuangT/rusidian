@@ -455,9 +455,6 @@ impl RusidianApp {
 
     fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = true;
-        if matches!(self.update_status, UpdateStatus::Idle) {
-            self.check_for_updates(false, cx);
-        }
         cx.notify();
     }
 
@@ -530,11 +527,7 @@ impl RusidianApp {
         match update::set_auto_update(enabled) {
             Ok(()) => {
                 self.auto_update = enabled;
-                if enabled {
-                    self.check_for_updates(true, cx);
-                } else {
-                    cx.notify();
-                }
+                cx.notify();
             }
             Err(error) => {
                 self.update_status = UpdateStatus::Failed(error.into());
@@ -1451,7 +1444,7 @@ impl RusidianApp {
                         highlights.push((
                             start..start + marked_text.len(),
                             HighlightStyle {
-                                background_color: Some(rgb(0x284d75).into()),
+                                background_color: Some(rgb(0x7a3b20).into()),
                                 ..Default::default()
                             },
                         ));
@@ -1490,53 +1483,58 @@ impl RusidianApp {
             UpdateStatus::Failed(error) => error.clone(),
         };
         let packaged = update::is_packaged_app();
-
-        let check_button = div()
-            .id("check-updates")
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(if busy { 0x30363d } else { 0x315b7d }))
-            .text_color(rgb(0xffffff))
-            .when(!busy, |element| {
-                element
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.check_for_updates(false, cx);
-                    }))
-            })
-            .child(if busy { "处理中…" } else { "检查更新" });
-
-        let auto_label = if self.auto_update {
-            "已开启：之后自动更新并安装"
+        let failed = matches!(self.update_status, UpdateStatus::Failed(_));
+        let status_color = if failed { 0xffa7a7 } else { 0xc7cbd1 };
+        let check_label = if busy {
+            "处理中…"
+        } else if failed {
+            "重试"
+        } else if matches!(self.update_status, UpdateStatus::UpToDate) {
+            "重新检查"
         } else {
-            "之后自动更新并安装"
+            "检查更新"
         };
-        let auto_button = div()
-            .id("toggle-auto-update")
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .cursor_pointer()
-            .bg(rgb(if self.auto_update { 0x2f6f55 } else { 0x263241 }))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx)))
-            .child(auto_label);
-
+        let check_button = (!matches!(
+            self.update_status,
+            UpdateStatus::Available(_) | UpdateStatus::Installed(_)
+        ))
+        .then(|| {
+            div()
+                .id("check-updates")
+                .px_4()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(if busy { 0x34383e } else { 0xf06a24 }))
+                .text_color(rgb(if busy { 0x8b929a } else { 0x1a0d07 }))
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(!busy, |element| {
+                    element
+                        .cursor_pointer()
+                        .hover(|element| element.bg(rgb(0xff7a32)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.check_for_updates(false, cx);
+                        }))
+                })
+                .child(check_label)
+        });
         let install_button = self.available_update.as_ref().map(|update| {
             let label: SharedString = if packaged {
-                format!("下载并安装 {}", update.version).into()
+                format!("安装 {}", update.version).into()
             } else {
-                "自动安装仅适用于 Rusidian.app".into()
+                "请在 Rusidian.app 中安装".into()
             };
             div()
                 .id("install-update")
                 .px_4()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(if packaged { 0x315b7d } else { 0x30363d }))
+                .bg(rgb(if packaged { 0xf06a24 } else { 0x34383e }))
+                .text_color(rgb(if packaged { 0x1a0d07 } else { 0x8b929a }))
+                .font_weight(FontWeight::SEMIBOLD)
                 .when(packaged, |element| {
                     element
                         .cursor_pointer()
+                        .hover(|element| element.bg(rgb(0xff7a32)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.install_available_update(cx);
                         }))
@@ -1551,12 +1549,31 @@ impl RusidianApp {
                 .py_2()
                 .rounded_md()
                 .cursor_pointer()
-                .bg(rgb(0x2f6f55))
+                .bg(rgb(0xf06a24))
+                .text_color(rgb(0x1a0d07))
+                .font_weight(FontWeight::SEMIBOLD)
+                .hover(|element| element.bg(rgb(0xff7a32)))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.request_close(PendingClose::Restart, cx);
                 }))
-                .child("重启以完成更新")
+                .child("重启应用")
         });
+        let auto_toggle = div()
+            .w(px(44.0))
+            .h(px(24.0))
+            .p_1()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .when(self.auto_update, |element| element.justify_end())
+            .bg(rgb(if self.auto_update { 0xf06a24 } else { 0x3a4047 }))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded_full()
+                    .bg(rgb(0xf4f1e8)),
+            );
 
         div()
             .absolute()
@@ -1564,62 +1581,165 @@ impl RusidianApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(0x090b0d))
+            .bg(rgb(0x080a0c).opacity(0.94))
             .child(
                 div()
-                    .w(px(560.0))
-                    .p_6()
+                    .w(px(620.0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x3a424d))
-                    .bg(rgb(0x171b20))
+                    .border_color(rgb(0x343a41))
+                    .bg(rgb(0x15191e))
                     .flex()
                     .flex_col()
-                    .gap_4()
                     .child(
                         div()
+                            .h(px(76.0))
+                            .px_6()
                             .flex()
                             .justify_between()
                             .items_center()
                             .child(
                                 div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("设置"),
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .w(px(10.0))
+                                            .h(px(32.0))
+                                            .rounded_md()
+                                            .bg(rgb(0xf06a24)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_xl()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("设置"),
+                                            )
+                                            .child(
+                                                div().text_sm().text_color(rgb(0x8f969f)).child(
+                                                    format!(
+                                                        "Rusidian {}",
+                                                        env!("CARGO_PKG_VERSION")
+                                                    ),
+                                                ),
+                                            ),
+                                    ),
                             )
                             .child(
                                 div()
                                     .id("close-settings")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
                                     .cursor_pointer()
                                     .text_color(rgb(0x98a2ad))
+                                    .hover(|element| element.bg(rgb(0x252a30)))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.settings_open = false;
                                         cx.notify();
                                     }))
-                                    .child("完成"),
+                                    .child("完成  Esc"),
                             ),
                     )
-                    .child(div().text_sm().text_color(rgb(0x98a2ad)).child(format!(
-                        "Rusidian {} · Apple Silicon",
-                        env!("CARGO_PKG_VERSION")
-                    )))
-                    .child(div().h(px(1.0)).bg(rgb(0x3a424d)))
-                    .child(div().child(status))
                     .child(
                         div()
+                            .border_t_1()
+                            .border_color(rgb(0x30363d))
+                            .p_6()
                             .flex()
+                            .flex_col()
                             .gap_3()
-                            .child(check_button)
-                            .children(install_button)
-                            .children(restart_button),
-                    )
-                    .child(div().h(px(1.0)).bg(rgb(0x3a424d)))
-                    .child(auto_button)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x98a2ad))
-                            .child("更新包经过内置公钥验证；自动安装默认关闭。"),
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xf28c45))
+                                    .child("软件更新"),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x343a41))
+                                    .bg(rgb(0x1b2026))
+                                    .child(
+                                        div()
+                                            .p_4()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .child("当前版本"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(rgb(status_color))
+                                                            .child(status),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .children(check_button)
+                                                    .children(install_button)
+                                                    .children(restart_button),
+                                            ),
+                                    )
+                                    .child(div().h(px(1.0)).bg(rgb(0x30363d)))
+                                    .child(
+                                        div()
+                                            .id("toggle-auto-update")
+                                            .p_4()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .cursor_pointer()
+                                            .hover(|element| element.bg(rgb(0x20262d)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_auto_update(cx)
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .child("自动更新"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(rgb(0x8f969f))
+                                                            .child(
+                                                                "启动时检查，验证签名后自动安装",
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(auto_toggle),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x717983))
+                                    .child("更新仅访问 GitHub Release；笔记内容不会离开本机。"),
+                            ),
                     ),
             )
             .into_any_element()
@@ -1916,7 +2036,9 @@ impl Render for RusidianApp {
                                         .py_2()
                                         .text_sm()
                                         .cursor_pointer()
-                                        .when(selected, |element| element.bg(rgb(0x263241)))
+                                        .when(selected, |element| {
+                                            element.bg(rgb(0x452519)).text_color(rgb(0xffb07a))
+                                        })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.request_close(
                                                 PendingClose::Open {
@@ -2145,7 +2267,7 @@ fn render_block(
                         .p_4()
                         .rounded_md()
                         .when(object_cursor, |element| {
-                            element.border_2().border_color(rgb(0x88c0d0))
+                            element.border_2().border_color(rgb(0xf28c45))
                         })
                         .bg(rgb(0x1c2229))
                         .child(format!("![{alt}]({source_label})"))
@@ -2155,7 +2277,7 @@ fn render_block(
             div()
                 .mb_4()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0x88c0d0))
+                    element.border_2().border_color(rgb(0xf28c45))
                 })
                 .child(img(path).max_w_full().with_fallback(move || {
                     div()
@@ -2174,7 +2296,7 @@ fn render_block(
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0x88c0d0))
+                    element.border_2().border_color(rgb(0xf28c45))
                 })
                 .bg(rgb(0xffffff))
                 .child(img(image.clone()).max_w_full())
@@ -2184,7 +2306,7 @@ fn render_block(
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0x88c0d0))
+                    element.border_2().border_color(rgb(0xf28c45))
                 })
                 .bg(rgb(0x3a1f24))
                 .text_color(rgb(0xffa7b2))
@@ -2195,7 +2317,7 @@ fn render_block(
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0x88c0d0))
+                    element.border_2().border_color(rgb(0xf28c45))
                 })
                 .bg(rgb(0x1c2229))
                 .text_color(rgb(0x98a2ad))
@@ -2291,7 +2413,7 @@ fn render_block(
             .child(
                 div()
                     .mr_2()
-                    .text_color(rgb(0x88c0d0))
+                    .text_color(rgb(0xf28c45))
                     .child(format!("[^{label}]")),
             )
             .child(text)
@@ -2377,7 +2499,7 @@ fn fragment_highlights(
             (
                 range,
                 HighlightStyle {
-                    color: Some(rgb(0x88c0d0).into()),
+                    color: Some(rgb(0xf28c45).into()),
                     underline: Some(UnderlineStyle {
                         thickness: px(1.0),
                         color: None,
@@ -2396,7 +2518,7 @@ fn fragment_highlights(
         highlights.push((
             selection_range,
             HighlightStyle {
-                background_color: Some(rgb(0x315b7d).into()),
+                background_color: Some(rgb(0x8a3b1c).into()),
                 ..Default::default()
             },
         ));
@@ -2579,7 +2701,7 @@ fn render_inline_paragraph(
             div()
                 .flex_none()
                 .h(px(row_height))
-                .when(active, |element| element.bg(rgb(0x34465a)))
+                .when(active, |element| element.bg(rgb(0x3c2a22)))
                 .child(child)
                 .into_any_element(),
         );

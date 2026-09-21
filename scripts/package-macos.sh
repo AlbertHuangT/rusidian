@@ -8,7 +8,7 @@ iconset=target/packager/Rusidian.iconset
 mkdir -p "$iconset" dist
 
 while read -r dimension filename; do
-  sips -s format png -z "$dimension" "$dimension" assets/app-icon.svg \
+  sips -s format png -z "$dimension" "$dimension" assets/app-icon.png \
     --out "$iconset/$filename" >/dev/null
 done <<'EOF'
 16 icon_16x16.png
