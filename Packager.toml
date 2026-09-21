@@ -1,0 +1,22 @@
+name = "rusidian"
+product-name = "Rusidian"
+version = "0.0.1"
+identifier = "com.alberthuang.rusidian"
+category = "Productivity"
+description = "Local-first native Markdown with real Neovim"
+homepage = "https://github.com/AlbertHuangT/rusidian"
+formats = ["app", "dmg"]
+before-packaging-command = "cargo build --locked --release"
+binaries-dir = "target/release"
+out-dir = "dist"
+binaries = [{ path = "rusidian", main = true }]
+icons = ["target/packager/Rusidian.icns"]
+resources = ["README.md", "PRODUCT.md", "CONTEXT.md", "docs/licenses"]
+
+[[file-associations]]
+extensions = ["md", "markdown"]
+name = "Markdown document"
+role = "editor"
+
+[macos]
+signing-identity = "-"

@@ -21,7 +21,7 @@
 
 ---
 
-Rusidian 是一个**本地优先的原生 Markdown 桌面应用**。它将你本机的 Neovim 与独立的阅读视图连接起来：源码交给熟悉的编辑器，排版、图片和 TikZ 交给 Rust 与 GPUI。
+Rusidian 是一个**本地优先的原生 Markdown 桌面应用**。它将你本机的 Neovim 与独立的阅读视图连接起来：源码交给熟悉的编辑器，排版、图片和数学公式交给 Rust 与 GPUI，TikZ 交给 Tectonic。
 
 > **正在构建，欢迎试用原型。** 当前以 Apple Silicon macOS 为验证平台，尚不是可替代日常笔记软件的稳定版本。已确认的产品取舍以 [PRODUCT.md](PRODUCT.md) 为准。
 
@@ -45,7 +45,17 @@ GPUI 负责窗口、文字和图像绘制，不使用 Electron 或 WebView。阅
 
 ## 快速开始
 
-需要 **Apple Silicon Mac、Xcode Command Line Tools、Rust 和 Neovim**。TikZ 与公式额外需要 Tectonic；首次编译可能联网下载 TeX 资源，离线使用前需准备好所需资源。
+需要 **Apple Silicon Mac 和 Neovim**。只有 TikZ 额外需要 Tectonic；普通公式由 GPUI 原生绘制，不启动 TeX 进程。TikZ 首次编译可能联网下载 TeX 资源，离线使用前需准备好所需资源。
+
+Homebrew 一行安装滚动 nightly（会自动添加本仓库为 tap）：
+
+```sh
+brew tap AlbertHuangT/rusidian https://github.com/AlbertHuangT/rusidian && brew install --cask rusidian
+```
+
+也可以从 [GitHub Releases](https://github.com/AlbertHuangT/rusidian/releases) 下载 Apple Silicon DMG，把 `Rusidian.app` 拖入“应用程序”。当前构建使用 ad-hoc 签名、尚未 Apple 公证；首次启动可能需要在访达中右键应用并选择“打开”。更新包另有内置公钥签名验证。
+
+从源码运行需要 **Xcode Command Line Tools 和 Rust**：
 
 ```sh
 # 已有 Homebrew 和 rustup 的环境
@@ -78,8 +88,13 @@ cargo run --locked -- /absolute/path/to/note.md
 | 选择并复制 | `v` / `V`，然后 `y` |
 | 打开光标处的内部 / 外部链接 | `gf` / `gx` |
 | 保存文件 | 在 Neovim 中执行 `:w` |
+| 打开设置 / 更新 | `⌘ ,` |
 
 切回阅读视图不会保存文件。换文件或从应用菜单退出时，Neovim 会拒绝丢弃未保存修改；先用 `:w` 保存，或自行用 `:q!` 放弃修改。当前检测到 Normal 模式的 `Esc` 映射冲突时只提示，应用仍优先使用该键切换视图。
+
+检测到 Neovim swap 冲突时，Rusidian 会停止打开源码视图并保留阅读内容，不会自动删除 swap 或覆盖文件；请先用 Neovim 的恢复模式检查内容。
+
+在设置中可以手动“检查更新”；应用优先使用正式 Release，没有正式版本时回退 nightly。自动安装默认关闭；点击“之后自动更新并安装”后，应用启动时会检查、验证并安装新版本，完成后由用户重启。Homebrew 安装同样提供设置页。
 
 TikZ 块写完整环境，外层文档由 Rusidian 补齐：
 
@@ -98,12 +113,12 @@ TikZ 块写完整环境，外层文档由 Rusidian 补齐：
 
 | 已有实现，可参与验证 | 尚未完成验收或仍在规划 |
 | :--- | :--- |
-| 单窗口文件打开、Neovim 嵌入、内存 buffer 预览 | 用户真实配置的完整兼容、Neovim 内切换 buffer 的预览同步、阅读光标精确映射回源码 |
-| 常见 Markdown / GFM 渲染、阅读导航与选择 | 完整 Obsidian 语义、屏幕折行导航、混合图文富文本复制 |
-| TikZ、实验性行内 / 块级公式、PDF 缓存 | 编译触发时机、TeX 权限隔离与资源配置的完整闭环 |
+| 单窗口文件打开、Vault 文件树、Neovim 嵌入、内存 buffer 预览 | 多文件标签、多窗口、用户真实配置的完整兼容、Neovim 内切换 buffer 的预览同步 |
+| 常见 Markdown / GFM、wikilink、阅读导航与选择 | 完整 Obsidian 语义、屏幕折行导航、混合图文富文本复制 |
+| TikZ、GPUI 原生行内 / 块级公式、PDF 缓存 | TikZ 编译触发时机、TeX 权限隔离与资源配置的完整闭环 |
 | 原生 GPUI 窗口、中文预编辑接口 | 中文输入与字体的完整验收、系统主题跟随、性能指标 |
 
-后续优先级是 vault、文件树、多文件标签和多窗口，再扩展全文搜索、wikilink、反向链接与 properties。**Linux 在后续计划中；Windows 不在支持目标内。**
+后续优先级是多文件标签和多窗口，再扩展全文搜索、反向链接、tags 与 properties。**Linux 在后续计划中；Windows 不在支持目标内。**
 
 HTML 按代码显示，Mermaid 保留源码；不执行 Obsidian 插件，也不承诺兼容其主题。应用体积、内存与启动速度目前仍是待测目标，不是已达成的性能宣传。
 
@@ -116,11 +131,14 @@ cargo test --locked
 # 需要本机 Neovim、Tectonic，以及 macOS 自带的 sips
 cargo test --locked -- --ignored --test-threads=1
 cargo build --locked --release
+# 生成 dist/Rusidian.app 与 Apple Silicon DMG
+cargo install cargo-packager --version 0.11.8 --locked
+scripts/package-macos.sh
 ```
 
-[GitHub Actions](https://github.com/AlbertHuangT/rusidian/actions/workflows/ci.yml) 在 macOS ARM64 上执行上述检查，并保留 7 天的压缩构建产物和 SHA-256 校验文件。版本标签 `v<版本号>` 与 Cargo 版本匹配且检查通过后，会创建 **draft prerelease**，供维护者检查后发布。
+[GitHub Actions](https://github.com/AlbertHuangT/rusidian/actions/workflows/ci.yml) 在 macOS ARM64 上执行上述检查并构建 `.app`、DMG、更新签名与 SHA-256 校验文件。`main` 每次通过后更新滚动 `nightly` Release；版本标签 `v<版本号>` 与 Cargo、打包配置匹配后发布正式 Release。
 
-产物是需要外部 Neovim / Tectonic 的原型可执行文件，尚无签名、公证、`.app` 安装包或 Homebrew 发布。GPUI 固定到经过本地构建验证的 Zed Git 提交，不跟随浮动主分支。
+产物是需要外部 Neovim、按需使用外部 Tectonic 的原型 `.app`。更新归档使用独立密钥签名；Apple Developer ID 签名和公证尚未配置。GPUI 固定到经过本地构建验证的 Zed Git 提交，不跟随浮动主分支。
 
 ## 参与
 

@@ -97,7 +97,11 @@ impl Client {
                 if clean {
                     command.arg("--clean");
                 }
-                command.arg("--").arg(path);
+                command.args([
+                    "--cmd",
+                    "lua local g=vim.api.nvim_create_augroup('RusidianStartupSwap',{clear=true}); vim.api.nvim_create_autocmd('SwapExists',{group=g,callback=function() vim.g.rusidian_swapname=vim.v.swapname; vim.v.swapchoice='q' end})",
+                    "--",
+                ]).arg(&path);
                 let (nvim, io, _child) = match create::new_child_cmd(&mut command, handler).await {
                     Ok(session) => session,
                     Err(error) => {
@@ -116,15 +120,55 @@ impl Client {
                         .await;
                     return;
                 }
-                let buffer = match nvim.get_current_buf().await {
-                    Ok(buffer) => buffer,
-                    Err(error) => {
-                        let _ = event_sender
-                            .send(Event::Error(format!("无法读取 Neovim buffer：{error}")))
-                            .await;
-                        return;
+                let swap = nvim
+                    .get_var("rusidian_swapname")
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let _ = nvim
+                    .exec_lua(
+                        "pcall(vim.api.nvim_del_augroup_by_name, 'RusidianStartupSwap')",
+                        Vec::new(),
+                    )
+                    .await;
+                if let Some(swap) = swap {
+                    let _ = event_sender
+                        .send(Event::Error(format!(
+                            "Neovim 检测到 swap 文件，已停止打开以保护未恢复内容：{swap}。请先用 Neovim 的恢复模式检查该文件：{}",
+                            path.display()
+                        )))
+                        .await;
+                    return;
+                }
+                let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+                let mut buffer = None;
+                if let Ok(buffers) = nvim.list_bufs().await {
+                    for candidate in buffers {
+                        let Ok(name) = candidate.get_name().await else {
+                            continue;
+                        };
+                        let name = PathBuf::from(name);
+                        if name.canonicalize().unwrap_or(name) == target {
+                            buffer = Some(candidate);
+                            break;
+                        }
                     }
+                }
+                let Some(buffer) = buffer else {
+                    let _ = event_sender
+                        .send(Event::Error(format!(
+                            "Neovim 未打开请求的文件：{}",
+                            path.display()
+                        )))
+                        .await;
+                    return;
                 };
+                if let Err(error) = nvim.set_current_buf(&buffer).await {
+                    let _ = event_sender
+                        .send(Event::Error(format!("无法选择 Neovim buffer：{error}")))
+                        .await;
+                    return;
+                }
                 if let Err(error) = buffer.attach(true, Vec::new()).await {
                     let _ = event_sender
                         .send(Event::Error(format!("无法监听 Neovim buffer：{error}")))
@@ -576,7 +620,7 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{fs, time::Duration};
 
     #[test]
     fn applies_linegrid_redraw() {
@@ -840,5 +884,89 @@ mod tests {
             .await
             .expect("Neovim exit was not reported");
         });
+    }
+
+    #[test]
+    #[ignore = "requires the external Neovim installation"]
+    fn refuses_swap_conflicts_without_overwriting_the_file() {
+        let path = std::env::temp_dir().join(format!(
+            "rusidian-swap-test-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "original\n").unwrap();
+        let owner = Client::start(path.clone(), true);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match owner.events.recv().await.unwrap() {
+                        Event::BufferLines { lines, .. }
+                            if lines.iter().any(|line| line == "original") =>
+                        {
+                            break;
+                        }
+                        Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                        Event::Exited => panic!("owner Neovim exited unexpectedly"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("owner Neovim did not open the file");
+        });
+        owner.input("A unsaved<Esc>");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match owner.events.recv().await.unwrap() {
+                        Event::BufferLines { lines, .. }
+                            if lines.iter().any(|line| line.contains("unsaved")) =>
+                        {
+                            break;
+                        }
+                        Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                        Event::Exited => panic!("owner Neovim exited unexpectedly"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("owner Neovim did not modify the buffer");
+        });
+        owner.input(":preserve<CR>");
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(100)).await });
+
+        let contender = Client::start(path.clone(), true);
+        let error = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Event::Error(error) = contender.events.recv().await.unwrap() {
+                            break error;
+                        }
+                    }
+                })
+                .await
+            })
+            .expect("second Neovim did not report the swap conflict");
+        assert!(error.contains("swap 文件"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
+
+        owner.input(":qall!<CR>");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(owner.events.recv().await.unwrap(), Event::Exited) {}
+            })
+            .await
+            .expect("owner Neovim did not exit");
+        });
+        fs::remove_file(path).unwrap();
     }
 }

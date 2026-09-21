@@ -6,7 +6,11 @@ scratchpad/
 docs/*
 !docs/adr/
 !docs/adr/**
+!docs/math-rendering-research.md
+!docs/licenses/
+!docs/licenses/**
 
 # Added by cargo
 
 /target
+/dist

@@ -1,6 +1,9 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
+use crate::math::{FONT_SIZE, Formula};
 use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
+use crate::update;
 use crate::vault::Vault;
+use cargo_packager_updater::Update;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
@@ -10,7 +13,7 @@ use gpui::{
 };
 use gpui_platform::application;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,17 +21,25 @@ use std::{
 const WINDOW_WIDTH: f32 = 960.0;
 const WINDOW_HEIGHT: f32 = 640.0;
 
-actions!(rusidian, [OpenFile, OpenFolder, Quit, EnterSourceNormal]);
+actions!(
+    rusidian,
+    [OpenFile, OpenFolder, OpenSettings, Quit, EnterSourceNormal]
+);
 
 pub fn run(initial_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-shift-o", OpenFolder, None),
+            KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
         ]);
         cx.set_menus([
-            Menu::new("Rusidian").items([MenuItem::action("退出 Rusidian", Quit)]),
+            Menu::new("Rusidian").items([
+                MenuItem::action("设置…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("退出 Rusidian", Quit),
+            ]),
             Menu::new("文件").items([
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
@@ -48,6 +59,9 @@ pub fn run(initial_path: Option<PathBuf>) {
                     app.focus_handle = Some(cx.focus_handle());
                     app.compile_visuals(cx);
                     app.start_nvim(cx);
+                    if app.auto_update && update::is_packaged_app() {
+                        app.check_for_updates(true, cx);
+                    }
                     app
                 });
                 let focus = app.read(cx).focus_handle.clone();
@@ -89,7 +103,7 @@ struct RusidianApp {
     vault: Option<Vault>,
     error: Option<SharedString>,
     tikz: HashMap<usize, TikzState>,
-    math: HashMap<(usize, usize), TikzState>,
+    math: HashMap<(String, bool), MathState>,
     view: View,
     nvim: Option<NvimClient>,
     pending_close: Option<PendingClose>,
@@ -109,6 +123,10 @@ struct RusidianApp {
     focus_handle: Option<FocusHandle>,
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
+    settings_open: bool,
+    auto_update: bool,
+    update_status: UpdateStatus,
+    available_update: Option<Update>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -117,12 +135,23 @@ enum View {
     Source,
 }
 
+enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(SharedString),
+    Installing(SharedString),
+    Installed(SharedString),
+    Failed(SharedString),
+}
+
 enum PendingClose {
     Open {
         path: PathBuf,
         vault_root: Option<PathBuf>,
     },
     Quit,
+    Restart,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -154,6 +183,12 @@ enum WordMotion {
     Next,
     Previous,
     End,
+}
+
+enum MathState {
+    Loading,
+    Ready(Arc<Formula>),
+    Failed(SharedString),
 }
 
 enum TikzState {
@@ -190,6 +225,10 @@ impl RusidianApp {
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
+                settings_open: false,
+                auto_update: update::auto_update_enabled(),
+                update_status: UpdateStatus::Idle,
+                available_update: None,
             };
         };
 
@@ -248,6 +287,10 @@ impl RusidianApp {
                     focus_handle: None,
                     marked_text: String::new(),
                     marked_selection: 0..0,
+                    settings_open: false,
+                    auto_update: update::auto_update_enabled(),
+                    update_status: UpdateStatus::Idle,
+                    available_update: None,
                 }
             }
             Err(error) => Self {
@@ -275,6 +318,10 @@ impl RusidianApp {
                 focus_handle: None,
                 marked_text: String::new(),
                 marked_selection: 0..0,
+                settings_open: false,
+                auto_update: update::auto_update_enabled(),
+                update_status: UpdateStatus::Idle,
+                available_update: None,
             },
         }
     }
@@ -340,54 +387,59 @@ impl RusidianApp {
         }
     }
 
-    fn compile_math(&mut self, cx: &mut Context<Self>) {
+    fn pending_math(&mut self) -> Vec<(String, bool)> {
         let Some(document) = &self.document else {
-            return;
+            self.math.clear();
+            return Vec::new();
         };
-        let mut jobs = Vec::new();
-        for (block_index, block) in document.markdown.blocks.iter().enumerate() {
-            if block.kind == BlockKind::Math {
-                jobs.push(((block_index, usize::MAX), block.text.clone(), true));
-            }
-            jobs.extend(
-                block.maths.iter().enumerate().map(|(math_index, math)| {
-                    ((block_index, math_index), math.source.clone(), false)
-                }),
-            );
-        }
+        let keys: HashSet<_> = document
+            .markdown
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                (block.kind == BlockKind::Math)
+                    .then(|| (block.text.clone(), true))
+                    .into_iter()
+                    .chain(
+                        block
+                            .maths
+                            .iter()
+                            .map(|formula| (formula.source.clone(), false)),
+                    )
+            })
+            .collect();
+        // Only the current document owns layouts. Unchanged/duplicate formulas share one result.
+        self.math.retain(|key, _| keys.contains(key));
+        keys.into_iter()
+            .filter(|key| {
+                if self.math.contains_key(key) {
+                    return false;
+                }
+                self.math.insert(key.clone(), MathState::Loading);
+                true
+            })
+            .collect()
+    }
 
-        for (key, source, display) in jobs {
-            self.math.insert(key, TikzState::Loading);
-            let expected = source.clone();
+    fn compile_math(&mut self, cx: &mut Context<Self>) {
+        for key in self.pending_math() {
             let executor = cx.background_executor().clone();
             cx.spawn(async move |this, cx| {
+                let input = key.clone();
                 let result = executor
-                    .spawn(async move { crate::tikz::compile_math(&source, display) })
+                    .spawn(async move { Formula::parse(&input.0, input.1) })
                     .await;
                 this.update(cx, |this, cx| {
-                    let is_current = this.document.as_ref().is_some_and(|document| {
-                        let Some(block) = document.markdown.blocks.get(key.0) else {
-                            return false;
-                        };
-                        if key.1 == usize::MAX {
-                            block.kind == BlockKind::Math && block.text == expected
-                        } else {
-                            block
-                                .maths
-                                .get(key.1)
-                                .is_some_and(|math| math.source == expected)
-                        }
-                    });
-                    if !is_current {
+                    if !this.math.contains_key(&key) {
                         return;
                     }
-                    let state = match result {
-                        Ok(bytes) => {
-                            TikzState::Ready(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
-                        }
-                        Err(error) => TikzState::Failed(error.into()),
-                    };
-                    this.math.insert(key, state);
+                    this.math.insert(
+                        key,
+                        match result {
+                            Ok(formula) => MathState::Ready(Arc::new(formula)),
+                            Err(error) => MathState::Failed(error.into()),
+                        },
+                    );
                     cx.notify();
                 })
                 .ok();
@@ -399,6 +451,96 @@ impl RusidianApp {
     fn compile_visuals(&mut self, cx: &mut Context<Self>) {
         self.compile_tikz(cx);
         self.compile_math(cx);
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        if matches!(self.update_status, UpdateStatus::Idle) {
+            self.check_for_updates(false, cx);
+        }
+        cx.notify();
+    }
+
+    fn check_for_updates(&mut self, install_automatically: bool, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Installing(_)
+        ) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        self.available_update = None;
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor.spawn(async { crate::update::check() }).await;
+            this.update(cx, |this, cx| match result {
+                Ok(Some(update)) => {
+                    let version: SharedString = update.version.clone().into();
+                    this.available_update = Some(update);
+                    this.update_status = UpdateStatus::Available(version);
+                    if install_automatically {
+                        this.install_available_update(cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+                Ok(None) => {
+                    this.update_status = UpdateStatus::UpToDate;
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.update_status = UpdateStatus::Failed(error.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn install_available_update(&mut self, cx: &mut Context<Self>) {
+        let Some(update) = self.available_update.take() else {
+            return;
+        };
+        let version: SharedString = update.version.clone().into();
+        self.update_status = UpdateStatus::Installing(version.clone());
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move { crate::update::install(update) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.update_status = match result {
+                    Ok(()) => UpdateStatus::Installed(version),
+                    Err(error) => UpdateStatus::Failed(error.into()),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.auto_update;
+        match update::set_auto_update(enabled) {
+            Ok(()) => {
+                self.auto_update = enabled;
+                if enabled {
+                    self.check_for_updates(true, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.update_status = UpdateStatus::Failed(error.into());
+                cx.notify();
+            }
+        }
     }
 
     fn start_nvim(&mut self, cx: &mut Context<Self>) {
@@ -433,7 +575,6 @@ impl RusidianApp {
                         } => {
                             if this.update_buffer(first, last, lines, more) && !more {
                                 this.tikz.clear();
-                                this.math.clear();
                                 if this.view == View::Reading {
                                     this.compile_visuals(cx);
                                 }
@@ -473,6 +614,17 @@ impl RusidianApp {
                     break;
                 }
             }
+            this.update(cx, |this, cx| {
+                if this
+                    .nvim
+                    .as_ref()
+                    .is_some_and(|client| client.events.same_channel(&events))
+                {
+                    this.nvim = None;
+                    cx.notify();
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -504,6 +656,7 @@ impl RusidianApp {
                 cx.notify();
             }
             PendingClose::Quit => cx.quit(),
+            PendingClose::Restart => cx.restart(),
         }
     }
 
@@ -651,10 +804,15 @@ impl RusidianApp {
             {
                 return Some(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
             }
-            if let Some((index, _)) = inline_math_at_offset(block, bounds.0.offset)
-                && let Some(TikzState::Ready(image)) = self.math.get(&(bounds.0.block, index))
+            if let Some((_, formula)) = inline_math_at_offset(block, bounds.0.offset)
+                && let Some(MathState::Ready(formula)) =
+                    self.math.get(&(formula.source.clone(), false))
+                && let Ok(bytes) = formula.clipboard_png()
             {
-                return Some(ClipboardItem::new_image(image));
+                return Some(ClipboardItem::new_image(&Image::from_bytes(
+                    ImageFormat::Png,
+                    bytes,
+                )));
             }
             match &block.kind {
                 BlockKind::Image(source) => {
@@ -671,10 +829,14 @@ impl RusidianApp {
                     }
                 }
                 BlockKind::Math => {
-                    if let Some(TikzState::Ready(image)) =
-                        self.math.get(&(bounds.0.block, usize::MAX))
+                    if let Some(MathState::Ready(formula)) =
+                        self.math.get(&(block.text.clone(), true))
+                        && let Ok(bytes) = formula.clipboard_png()
                     {
-                        return Some(ClipboardItem::new_image(image));
+                        return Some(ClipboardItem::new_image(&Image::from_bytes(
+                            ImageFormat::Png,
+                            bytes,
+                        )));
                     }
                 }
                 _ => {}
@@ -963,6 +1125,13 @@ impl RusidianApp {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            if event.keystroke.key == "escape" {
+                self.settings_open = false;
+                cx.notify();
+            }
+            return;
+        }
         if self.view == View::Reading {
             let key = event.keystroke.key_char.as_deref();
             if event.keystroke.key == "escape" {
@@ -1194,7 +1363,7 @@ impl RusidianApp {
             cx.notify();
             return;
         }
-        if event.keystroke.key == "escape" && self.grid.is_normal() {
+        if event.keystroke.key == "escape" && (self.grid.is_normal() || self.nvim_error.is_some()) {
             self.view = View::Reading;
             self.compile_visuals(cx);
             cx.notify();
@@ -1216,6 +1385,9 @@ impl RusidianApp {
                 .flex_1()
                 .p_8()
                 .text_color(rgb(0xffa7b2))
+                .when_some(self.focus_handle.clone(), |element, focus| {
+                    element.track_focus(&focus)
+                })
                 .child(error.clone())
                 .into_any_element();
         }
@@ -1300,6 +1472,156 @@ impl RusidianApp {
                     .size_full(),
                 )
             })
+            .into_any_element()
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let busy = matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Installing(_)
+        );
+        let status: SharedString = match &self.update_status {
+            UpdateStatus::Idle => "尚未检查更新".into(),
+            UpdateStatus::Checking => "正在检查更新…".into(),
+            UpdateStatus::UpToDate => "已是最新版本".into(),
+            UpdateStatus::Available(version) => format!("发现新版本 {version}").into(),
+            UpdateStatus::Installing(version) => format!("正在下载并安装 {version}…").into(),
+            UpdateStatus::Installed(version) => format!("{version} 已安装，重启后生效").into(),
+            UpdateStatus::Failed(error) => error.clone(),
+        };
+        let packaged = update::is_packaged_app();
+
+        let check_button = div()
+            .id("check-updates")
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(if busy { 0x30363d } else { 0x315b7d }))
+            .text_color(rgb(0xffffff))
+            .when(!busy, |element| {
+                element
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_for_updates(false, cx);
+                    }))
+            })
+            .child(if busy { "处理中…" } else { "检查更新" });
+
+        let auto_label = if self.auto_update {
+            "已开启：之后自动更新并安装"
+        } else {
+            "之后自动更新并安装"
+        };
+        let auto_button = div()
+            .id("toggle-auto-update")
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(rgb(if self.auto_update { 0x2f6f55 } else { 0x263241 }))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx)))
+            .child(auto_label);
+
+        let install_button = self.available_update.as_ref().map(|update| {
+            let label: SharedString = if packaged {
+                format!("下载并安装 {}", update.version).into()
+            } else {
+                "自动安装仅适用于 Rusidian.app".into()
+            };
+            div()
+                .id("install-update")
+                .px_4()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(if packaged { 0x315b7d } else { 0x30363d }))
+                .when(packaged, |element| {
+                    element
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.install_available_update(cx);
+                        }))
+                })
+                .child(label)
+        });
+
+        let restart_button = matches!(self.update_status, UpdateStatus::Installed(_)).then(|| {
+            div()
+                .id("restart-after-update")
+                .px_4()
+                .py_2()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(0x2f6f55))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.request_close(PendingClose::Restart, cx);
+                }))
+                .child("重启以完成更新")
+        });
+
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x090b0d))
+            .child(
+                div()
+                    .w(px(560.0))
+                    .p_6()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x3a424d))
+                    .bg(rgb(0x171b20))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("设置"),
+                            )
+                            .child(
+                                div()
+                                    .id("close-settings")
+                                    .cursor_pointer()
+                                    .text_color(rgb(0x98a2ad))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("完成"),
+                            ),
+                    )
+                    .child(div().text_sm().text_color(rgb(0x98a2ad)).child(format!(
+                        "Rusidian {} · Apple Silicon",
+                        env!("CARGO_PKG_VERSION")
+                    )))
+                    .child(div().h(px(1.0)).bg(rgb(0x3a424d)))
+                    .child(div().child(status))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(check_button)
+                            .children(install_button)
+                            .children(restart_button),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(0x3a424d)))
+                    .child(auto_button)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x98a2ad))
+                            .child("更新包经过内置公钥验证；自动安装默认关闭。"),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -1458,7 +1780,13 @@ impl Render for RusidianApp {
                 self.marked_text
             )
         });
+        let settings = self.settings_open.then(|| self.render_settings(cx));
 
+        let text_baseline = f32::from(cx.text_system().baseline_offset(
+            cx.text_system().resolve_font(&gpui::font(".SystemUIFont")),
+            px(FONT_SIZE),
+            px(24.0),
+        ));
         let reading = if let Some(document) = &self.document {
             let selection = self.reading_selection.and_then(|selection| {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
@@ -1481,6 +1809,7 @@ impl Render for RusidianApp {
                         .enumerate()
                         .map(|(index, block)| {
                             div()
+                                .id(("block", index))
                                 .mx_auto()
                                 .w_full()
                                 .max_w(px(820.0))
@@ -1488,7 +1817,7 @@ impl Render for RusidianApp {
                                     block,
                                     self.tikz.get(&index),
                                     &self.math,
-                                    index,
+                                    text_baseline,
                                     &document.file,
                                     (reading_cursor.block == index)
                                         .then_some(reading_cursor.offset),
@@ -1617,6 +1946,7 @@ impl Render for RusidianApp {
             })
             .on_action(cx.listener(Self::choose_file))
             .on_action(cx.listener(Self::choose_folder))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::enter_source_normal))
             .on_key_down(cx.listener(Self::key_down))
             .flex()
@@ -1683,6 +2013,7 @@ impl Render for RusidianApp {
                     )
                 },
             )
+            .when_some(settings, |element, settings| element.child(settings))
     }
 }
 
@@ -1775,8 +2106,8 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
 fn render_block(
     block: &Block,
     tikz: Option<&TikzState>,
-    math: &HashMap<(usize, usize), TikzState>,
-    block_index: usize,
+    math: &HashMap<(String, bool), MathState>,
+    text_baseline: f32,
     note: &Path,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
@@ -1797,10 +2128,10 @@ fn render_block(
             .child(text)
             .into_any_element(),
         BlockKind::Paragraph if !block.images.is_empty() => {
-            render_inline_paragraph(block, math, block_index, note, cursor, selection)
+            render_inline_paragraph(block, math, text_baseline, note, cursor, selection)
         }
         BlockKind::Paragraph if !block.maths.is_empty() => {
-            render_inline_paragraph(block, math, block_index, note, cursor, selection)
+            render_inline_paragraph(block, math, text_baseline, note, cursor, selection)
         }
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
         BlockKind::Image(source) => {
@@ -1926,21 +2257,23 @@ fn render_block(
                     .child(styled_fragment(block, range.clone(), cursor, selection))
             }))
             .into_any_element(),
-        BlockKind::Math => match math.get(&(block_index, usize::MAX)) {
-            Some(TikzState::Ready(image)) => div()
+        BlockKind::Math => match math.get(&(block.text.clone(), true)) {
+            Some(MathState::Ready(formula)) => div()
                 .mb_4()
                 .p_4()
                 .rounded_md()
                 .bg(rgb(0x1c2229))
-                .child(img(image.clone()).h(px(48.0)).max_w_full())
+                .id("display-math")
+                .overflow_x_scroll()
+                .child(formula.element(FONT_SIZE))
                 .into_any_element(),
-            Some(TikzState::Failed(error)) => div()
+            Some(MathState::Failed(error)) => div()
                 .mb_4()
                 .p_4()
                 .rounded_md()
                 .bg(rgb(0x3a1f24))
                 .text_color(rgb(0xffa7b2))
-                .child(error.clone())
+                .child(format!("$${}$$：{}", block.text, error))
                 .into_any_element(),
             _ => div()
                 .mb_4()
@@ -1948,7 +2281,7 @@ fn render_block(
                 .rounded_md()
                 .bg(rgb(0x1c2229))
                 .text_color(rgb(0x98a2ad))
-                .child("正在编译公式…")
+                .child("正在排版公式…")
                 .into_any_element(),
         },
         BlockKind::Footnote(label) => div()
@@ -2095,17 +2428,80 @@ fn clipped_range(
 
 enum InlineAtom<'a> {
     Image(&'a crate::markdown::InlineImage),
-    Math(usize, &'a crate::markdown::InlineMath),
+    Math(&'a crate::markdown::InlineMath),
+}
+
+fn inline_extents(
+    block: &Block,
+    math: &HashMap<(String, bool), MathState>,
+    baseline: f32,
+) -> (f32, f32) {
+    // ponytail: all wrapped rows share the tallest formula's extents; per-row metrics if this wastes space.
+    let mut ascent = if block.images.is_empty() {
+        baseline
+    } else {
+        baseline.max(24.0)
+    };
+    let mut descent = 24.0 - baseline;
+    for formula in &block.maths {
+        if let Some(MathState::Ready(formula)) = math.get(&(formula.source.clone(), false)) {
+            ascent = ascent.max(formula.ascent(FONT_SIZE) + 1.0);
+            descent = descent.max(formula.descent(FONT_SIZE) + 1.0);
+        }
+    }
+    (ascent, descent)
+}
+
+fn push_inline_text(
+    children: &mut Vec<AnyElement>,
+    block: &Block,
+    range: std::ops::Range<usize>,
+    cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
+    top: f32,
+    height: f32,
+) {
+    let text = &block.text[range.clone()];
+    let mut start = 0;
+    for (end, opportunity) in unicode_linebreak::linebreaks(text) {
+        let content_end = if text[..end].ends_with('\n') {
+            end - 1
+        } else {
+            end
+        };
+        if start < content_end {
+            children.push(
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .pt(px(top))
+                    .h(px(height))
+                    .child(styled_fragment(
+                        block,
+                        range.start + start..range.start + content_end,
+                        cursor,
+                        selection,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if opportunity == unicode_linebreak::BreakOpportunity::Mandatory && content_end < end {
+            children.push(div().w_full().h(px(0.0)).into_any_element());
+        }
+        start = end;
+    }
 }
 
 fn render_inline_paragraph(
     block: &Block,
-    math: &HashMap<(usize, usize), TikzState>,
-    block_index: usize,
+    math: &HashMap<(String, bool), MathState>,
+    text_baseline: f32,
     note: &Path,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
+    let (ascent, descent) = inline_extents(block, math, text_baseline);
+    let row_height = ascent + descent;
     let mut children = Vec::new();
     let mut start = 0;
     let mut atoms = block
@@ -2116,23 +2512,21 @@ fn render_inline_paragraph(
             block
                 .maths
                 .iter()
-                .enumerate()
-                .map(|(index, math)| (math.range.clone(), InlineAtom::Math(index, math))),
+                .map(|math| (math.range.clone(), InlineAtom::Math(math))),
         )
         .collect::<Vec<_>>();
     atoms.sort_by_key(|(range, _)| range.start);
 
     for (range, atom) in atoms {
         if start < range.start {
-            children.push(
-                div()
-                    .child(styled_fragment(
-                        block,
-                        start..range.start,
-                        cursor,
-                        selection,
-                    ))
-                    .into_any_element(),
+            push_inline_text(
+                &mut children,
+                block,
+                start..range.start,
+                cursor,
+                selection,
+                ascent - text_baseline,
+                row_height,
             );
         }
         let offset = block.text[..range.start]
@@ -2146,10 +2540,14 @@ fn render_inline_paragraph(
                 let alt = image.alt.clone();
                 let source = image.source.clone();
                 if let Some(path) = local_image_path(note, &image.source) {
-                    img(path)
-                        .h(px(24.0))
-                        .max_w_full()
-                        .with_fallback(move || div().child(alt.clone()).into_any_element())
+                    div()
+                        .pt(px(ascent - 24.0))
+                        .child(
+                            img(path)
+                                .h(px(24.0))
+                                .max_w_full()
+                                .with_fallback(move || div().child(alt.clone()).into_any_element()),
+                        )
                         .into_any_element()
                 } else {
                     div()
@@ -2159,16 +2557,16 @@ fn render_inline_paragraph(
                         .into_any_element()
                 }
             }
-            InlineAtom::Math(index, formula) => match math.get(&(block_index, index)) {
-                Some(TikzState::Ready(image)) => div()
-                    .px_1()
-                    .child(img(image.clone()).h(px(24.0)).max_w_full())
+            InlineAtom::Math(formula) => match math.get(&(formula.source.clone(), false)) {
+                Some(MathState::Ready(formula)) => div()
+                    .pt(px(ascent - formula.ascent(FONT_SIZE) - 1.0))
+                    .child(formula.element(FONT_SIZE))
                     .into_any_element(),
-                Some(TikzState::Failed(error)) => div()
+                Some(MathState::Failed(error)) => div()
                     .px_1()
                     .bg(rgb(0x3a1f24))
                     .text_color(rgb(0xffa7b2))
-                    .child(error.clone())
+                    .child(format!("${}$：{}", formula.source, error))
                     .into_any_element(),
                 _ => div()
                     .px_1()
@@ -2180,31 +2578,30 @@ fn render_inline_paragraph(
         children.push(
             div()
                 .flex_none()
-                .when(active, |element| {
-                    element.border_2().border_color(rgb(0x88c0d0))
-                })
+                .h(px(row_height))
+                .when(active, |element| element.bg(rgb(0x34465a)))
                 .child(child)
                 .into_any_element(),
         );
         start = range.end;
     }
     if start < block.text.len() {
-        children.push(
-            div()
-                .child(styled_fragment(
-                    block,
-                    start..block.text.len(),
-                    cursor,
-                    selection,
-                ))
-                .into_any_element(),
+        push_inline_text(
+            &mut children,
+            block,
+            start..block.text.len(),
+            cursor,
+            selection,
+            ascent - text_baseline,
+            row_height,
         );
     }
     div()
         .mb_4()
         .flex()
         .flex_wrap()
-        .items_center()
+        .items_start()
+        .line_height(px(24.0))
         .children(children)
         .into_any_element()
 }
@@ -2697,6 +3094,31 @@ fn end_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reuses_math_after_edits_and_aligns_to_the_text_baseline() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/math.md")));
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("中文 $x_i$ 重复 $x_i$。");
+        assert_eq!(app.pending_math(), vec![("x_i".into(), false)]);
+        let formula = Arc::new(Formula::parse("x_i", false).unwrap());
+        app.math
+            .insert(("x_i".into(), false), MathState::Ready(formula.clone()));
+        assert!(app.pending_math().is_empty());
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("修改正文 $x_i$。");
+        assert!(app.pending_math().is_empty());
+        let MathState::Ready(cached) = app.math.get(&("x_i".into(), false)).unwrap() else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(cached, &formula));
+        let block = &app.document.as_ref().unwrap().markdown.blocks[0];
+        let (ascent, descent) = inline_extents(block, &app.math, 18.0);
+        assert!(ascent >= 18.0 && descent >= 6.0);
+        let formula_top = ascent - formula.ascent(FONT_SIZE) - 1.0;
+        assert!((formula_top + 1.0 + formula.ascent(FONT_SIZE) - ascent).abs() < 0.001);
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("$$x_i$$");
+        assert_eq!(app.pending_math(), vec![("x_i".into(), true)]);
+        assert!(!app.math.contains_key(&("x_i".into(), false)));
+    }
 
     #[test]
     fn composition_keeps_highlights_on_character_boundaries() {

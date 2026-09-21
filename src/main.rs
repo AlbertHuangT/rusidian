@@ -1,7 +1,9 @@
 mod app;
 mod markdown;
+mod math;
 mod nvim;
 mod tikz;
+mod update;
 mod vault;
 
 fn main() {

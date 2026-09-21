@@ -35,6 +35,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check package version
+        run: |
+          version=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Packager.toml)" = "$version"
       - name: Check release version
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -50,31 +54,66 @@ jobs:
         run: brew install neovim tectonic
       - name: Neovim and Tectonic integration tests
         run: cargo test --locked -- --ignored --test-threads=1
-      - name: Build prototype
-        run: cargo build --locked --release
-      - name: Package prototype
+      - name: Install macOS packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+      - name: Package macOS app
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: scripts/package-macos.sh
+      - name: Verify macOS app
         run: |
-          mkdir -p dist/rusidian-macos-arm64
-          cp target/release/rusidian README.md PRODUCT.md CONTEXT.md PLAN.html dist/rusidian-macos-arm64/
-          cp -R examples assets docs dist/rusidian-macos-arm64/
-          file dist/rusidian-macos-arm64/rusidian | grep -q arm64
-          otool -L dist/rusidian-macos-arm64/rusidian
-          tar -czf dist/rusidian-macos-arm64.tar.gz -C dist rusidian-macos-arm64
-          cd dist
-          shasum -a 256 rusidian-macos-arm64.tar.gz > SHA256SUMS
-      - name: Upload prototype
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          test -x dist/Rusidian.app/Contents/MacOS/rusidian
+          file dist/Rusidian.app/Contents/MacOS/rusidian | grep -q arm64
+          plutil -extract CFBundleIdentifier raw dist/Rusidian.app/Contents/Info.plist | grep -qx com.alberthuang.rusidian
+          codesign --verify --deep --strict --verbose=2 dist/Rusidian.app
+          hdiutil verify dist/Rusidian_*.dmg
+          otool -L dist/Rusidian.app/Contents/MacOS/rusidian
+      - name: Prepare release assets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if ! test -f dist/Rusidian.app.tar.gz; then
+            COPYFILE_DISABLE=1 tar -czf dist/Rusidian.app.tar.gz -C dist Rusidian.app
+          fi
+          version=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          cp "dist/Rusidian_${version}_aarch64.dmg" dist/Rusidian.dmg
+          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -exec shasum -a 256 {} \; | sed 's#  \./#  #') > dist/SHA256SUMS
+          if [[ "$EVENT_NAME" == push ]]; then
+            test -s dist/Rusidian.app.tar.gz.sig
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              release_tag="$RELEASE_TAG"
+            else
+              release_tag=nightly
+            fi
+            signature=$(cat dist/Rusidian.app.tar.gz.sig)
+            jq -n \
+              --arg version "$version" \
+              --arg signature "$signature" \
+              --arg url "https://github.com/$REPOSITORY/releases/download/$release_tag/Rusidian.app.tar.gz" \
+              '{version: $version, platforms: {"macos-aarch64": {signature: $signature, url: $url, format: "app"}}}' \
+              > dist/latest.json
+          fi
+      - name: Upload macOS package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rusidian-macos-arm64-${{ github.sha }}
           path: |
-            dist/rusidian-macos-arm64.tar.gz
+            dist/Rusidian.app.tar.gz
+            dist/Rusidian.app.tar.gz.sig
+            dist/Rusidian_*.dmg
+            dist/Rusidian.dmg
+            dist/Rusidian_*.dmg.sig
+            dist/latest.json
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
 
   release:
-    name: Draft prerelease
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
     needs: macos
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -85,16 +124,27 @@ jobs:
         with:
           name: rusidian-macos-arm64-${{ github.sha }}
           path: dist
-      - name: Create draft prerelease
+      - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo 'Release already exists; leaving existing assets unchanged.'
-            exit 0
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            release_tag="$GITHUB_REF_NAME"
+            if ! gh release view "$release_tag" >/dev/null 2>&1; then
+              gh release create "$release_tag" --verify-tag \
+                --title "Rusidian $release_tag" \
+                --generate-notes
+            fi
+          else
+            release_tag=nightly
+            if gh release view "$release_tag" >/dev/null 2>&1; then
+              gh release edit "$release_tag" --title "Rusidian nightly" \
+                --notes "Automated Apple Silicon build from $GITHUB_SHA."
+            else
+              gh release create "$release_tag" --target "$GITHUB_SHA" --prerelease \
+                --title "Rusidian nightly" \
+                --notes "Automated Apple Silicon build from $GITHUB_SHA."
+            fi
           fi
-          gh release create "$RELEASE_TAG" dist/rusidian-macos-arm64.tar.gz dist/SHA256SUMS \
-            --verify-tag --draft --prerelease --title "Rusidian $RELEASE_TAG — technical prototype" \
-            --notes 'Unsigned macOS ARM64 prototype. Requires Neovim; TikZ and math require Tectonic. This is not a signed or notarized application bundle. See README for setup and current limitations.'
+          gh release upload "$release_tag" dist/* --clobber
