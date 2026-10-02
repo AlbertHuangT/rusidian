@@ -1450,13 +1450,15 @@ impl RusidianApp {
             let relative = root
                 .and_then(|root| path.strip_prefix(root).ok())
                 .unwrap_or(path);
+            // Like Obsidian, only notes drop their extension.
+            let name = if crate::vault::is_markdown(path) {
+                relative.file_stem()
+            } else {
+                relative.file_name()
+            };
             SwitcherItem {
                 path: path.clone(),
-                name: relative
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
+                name: name.unwrap_or_default().to_string_lossy().into_owned(),
                 folder: relative
                     .parent()
                     .map(|folder| folder.to_string_lossy().into_owned())
