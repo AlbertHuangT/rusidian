@@ -10,8 +10,9 @@ use gpui::{
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
-    SharedString, Size, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, Window,
-    WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb, size,
+    SharedString, Size, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, WeakEntity,
+    Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb,
+    size,
 };
 use gpui_platform::application;
 use std::{
@@ -872,6 +873,41 @@ impl RusidianApp {
         next.update_status = std::mem::replace(&mut self.update_status, UpdateStatus::Idle);
         next.available_update = self.available_update.take();
         *self = next;
+    }
+
+    /// A click in the reading view: move the cursor there and follow a link under it.
+    fn click_reading(&mut self, block: usize, offset: usize, cx: &mut Context<Self>) {
+        if self.view != View::Reading || self.settings_open {
+            return;
+        }
+        let Some(length) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.markdown.blocks.get(block))
+            .map(block_len)
+            .filter(|length| *length > 0)
+        else {
+            return;
+        };
+        self.reading_cursor = ReadingCursor {
+            block,
+            offset: offset.min(length - 1),
+        };
+        self.reading_column = None;
+        self.reading_selection = None;
+        self.reading_search = None;
+        self.reading_pending_g = false;
+        self.reading_count = None;
+        self.reading_find = None;
+        self.notice = None;
+        if let Some(destination) = self.current_link() {
+            if is_external_link(&destination) {
+                cx.open_url(&destination);
+            } else {
+                self.open_internal_link(cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Show the buffer Neovim switched to. Its lines arrive next as a full buffer update.
@@ -2867,6 +2903,7 @@ impl Render for RusidianApp {
                 px(24.0),
             ),
         );
+        let view = cx.entity().downgrade();
         let reading = if let Some(document) = &self.document {
             let context = RenderContext {
                 theme: &theme,
@@ -2876,6 +2913,8 @@ impl Render for RusidianApp {
                     note: &document.file,
                     vault: self.vault.as_ref(),
                 },
+                view: &view,
+                block_index: 0,
             };
             let selection = self.reading_selection.and_then(|selection| {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
@@ -2914,7 +2953,10 @@ impl Render for RusidianApp {
                                 .max_w(px(820.0))
                                 .when(table_end, |element| element.mb_4())
                                 .child(render_block(
-                                    context,
+                                    RenderContext {
+                                        block_index: index,
+                                        ..context
+                                    },
                                     block,
                                     self.tikz.get(&block.text),
                                     (reading_cursor.block == index)
@@ -3234,6 +3276,22 @@ struct RenderContext<'a> {
     math: &'a HashMap<(String, bool), MathState>,
     text_baseline: f32,
     links: Links<'a>,
+    /// Receives clicks that place the reading cursor.
+    view: &'a WeakEntity<RusidianApp>,
+    /// The block being rendered.
+    block_index: usize,
+}
+
+impl RenderContext<'_> {
+    /// A mouse-down handler that puts the reading cursor at a visible-character offset.
+    fn click_at(&self, offset: usize) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+        let view = self.view.clone();
+        let block = self.block_index;
+        move |_, _, cx| {
+            view.update(cx, |this, cx| this.click_reading(block, offset, cx))
+                .ok();
+        }
+    }
 }
 
 fn render_block(
@@ -3246,7 +3304,7 @@ fn render_block(
     let theme = context.theme;
     let links = context.links;
     let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
-    let text = styled_fragment(theme, block, 0..block.text.len(), cursor, selection);
+    let text = styled_fragment(context, block, 0..block.text.len(), cursor, selection);
 
     let content = match &block.kind {
         BlockKind::Heading(level) => div()
@@ -3401,7 +3459,7 @@ fn render_block(
                         |element| element.text_right(),
                     )
                     .child(styled_fragment(
-                        theme,
+                        context,
                         block,
                         range.clone(),
                         cursor,
@@ -3455,6 +3513,14 @@ fn render_block(
             .into_any_element(),
         BlockKind::Definition => div().mb_3().ml_6().child(text).into_any_element(),
     };
+    let content = if is_object(block) {
+        div()
+            .on_mouse_down(MouseButton::Left, context.click_at(0))
+            .child(content)
+            .into_any_element()
+    } else {
+        content
+    };
     decorate_block(theme, block, content)
 }
 
@@ -3487,15 +3553,57 @@ fn decorate_block(theme: &Theme, block: &Block, content: AnyElement) -> AnyEleme
     }
 }
 
+/// Styled text for `range` of a block; clicking it places the reading cursor on the character.
 fn styled_fragment(
-    theme: &Theme,
+    context: RenderContext,
     block: &Block,
     range: std::ops::Range<usize>,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
-) -> StyledText {
-    let highlights = fragment_highlights(theme, block, &range, cursor, selection);
-    StyledText::new(block.text[range].to_owned()).with_highlights(highlights)
+) -> AnyElement {
+    let highlights = fragment_highlights(context.theme, block, &range, cursor, selection);
+    let fragment: SharedString = block.text[range.clone()].to_owned().into();
+    let text = StyledText::new(fragment.clone()).with_highlights(highlights);
+    let layout = text.layout().clone();
+    let before = visible_offset(&block.text, range.start);
+    let view = context.view.clone();
+    let index = context.block_index;
+    div()
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+            let byte = layout
+                .index_for_position(event.position)
+                .unwrap_or_else(|nearest| nearest)
+                .min(fragment.len());
+            let mut byte = (0..=byte)
+                .rev()
+                .find(|byte| fragment.is_char_boundary(*byte))
+                .unwrap_or(0);
+            // The nearest boundary may follow the clicked character; select the one under
+            // the pointer instead.
+            if let Some(at) = layout.position_for_index(byte)
+                && byte > 0
+                && event.position.x < at.x
+                && event.position.y >= at.y
+            {
+                byte = fragment[..byte]
+                    .char_indices()
+                    .next_back()
+                    .map_or(0, |(index, _)| index);
+            }
+            let offset = before + visible_offset(&fragment, byte);
+            view.update(cx, |this, cx| this.click_reading(index, offset, cx))
+                .ok();
+        })
+        .child(text)
+        .into_any_element()
+}
+
+/// Visible characters (newlines excluded) before byte `byte` of `text`.
+fn visible_offset(text: &str, byte: usize) -> usize {
+    text[..byte]
+        .chars()
+        .filter(|character| *character != '\n')
+        .count()
 }
 
 fn fragment_highlights(
@@ -3640,7 +3748,7 @@ fn inline_extents(
 
 /// Push wrappable text pieces of `range`; `(top, height)` aligns them on the shared baseline.
 fn push_inline_text(
-    theme: &Theme,
+    context: RenderContext,
     children: &mut Vec<AnyElement>,
     block: &Block,
     range: std::ops::Range<usize>,
@@ -3664,7 +3772,7 @@ fn push_inline_text(
                     .pt(px(top))
                     .h(px(height))
                     .child(styled_fragment(
-                        theme,
+                        context,
                         block,
                         range.start + start..range.start + content_end,
                         cursor,
@@ -3691,6 +3799,7 @@ fn render_inline_paragraph(
         math,
         text_baseline,
         links,
+        ..
     } = context;
     let (ascent, descent) = inline_extents(block, math, text_baseline);
     let row_height = ascent + descent;
@@ -3712,7 +3821,7 @@ fn render_inline_paragraph(
     for (range, atom) in atoms {
         if start < range.start {
             push_inline_text(
-                theme,
+                context,
                 &mut children,
                 block,
                 start..range.start,
@@ -3771,6 +3880,7 @@ fn render_inline_paragraph(
             div()
                 .flex_none()
                 .h(px(row_height))
+                .on_mouse_down(MouseButton::Left, context.click_at(offset))
                 .when(active, |element| element.bg(rgb(theme.atom_active)))
                 .child(child)
                 .into_any_element(),
@@ -3779,7 +3889,7 @@ fn render_inline_paragraph(
     }
     if start < block.text.len() {
         push_inline_text(
-            theme,
+            context,
             &mut children,
             block,
             start..block.text.len(),
