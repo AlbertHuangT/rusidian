@@ -12,6 +12,18 @@ use std::{
 pub struct Settings {
     pub auto_update: bool,
     pub appearance: Appearance,
+    /// Recently opened files and folders, newest first.
+    pub recent: Vec<PathBuf>,
+}
+
+const RECENT_LIMIT: usize = 10;
+
+impl Settings {
+    pub fn remember(&mut self, path: PathBuf) {
+        self.recent.retain(|recent| *recent != path);
+        self.recent.insert(0, path);
+        self.recent.truncate(RECENT_LIMIT);
+    }
 }
 
 pub fn load() -> Settings {
@@ -68,12 +80,21 @@ mod tests {
             Settings {
                 auto_update: true,
                 appearance: Appearance::System,
+                recent: Vec::new(),
             }
         );
         update_at(&path, |settings| settings.appearance = Appearance::Dark).unwrap();
         let settings = load_from(&path);
         assert!(settings.auto_update);
         assert_eq!(settings.appearance, Appearance::Dark);
+        let mut remembered = Settings::default();
+        for index in 0..12 {
+            remembered.remember(PathBuf::from(format!("/notes/{index}.md")));
+        }
+        remembered.remember(PathBuf::from("/notes/5.md"));
+        assert_eq!(remembered.recent.len(), RECENT_LIMIT);
+        assert_eq!(remembered.recent[0], PathBuf::from("/notes/5.md"));
+        assert_eq!(remembered.recent[1], PathBuf::from("/notes/11.md"));
         fs::write(&path, "not json").unwrap();
         assert_eq!(load_from(&path), Settings::default());
         fs::remove_dir_all(directory).unwrap();

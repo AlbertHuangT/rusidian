@@ -108,6 +108,9 @@ pub fn run(initial_path: Option<PathBuf>) {
             |window, cx| {
                 let app = cx.new(|cx| {
                     let mut app = RusidianApp::open_with_vault(initial_path.as_deref());
+                    if let Some(path) = &initial_path {
+                        app.remember_recent(path);
+                    }
                     app.focus_handle = Some(cx.focus_handle());
                     app.compile_visuals(cx);
                     app.start_nvim(cx);
@@ -227,6 +230,7 @@ struct RusidianApp {
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
     appearance: Appearance,
+    recent: Vec<PathBuf>,
     /// Resolved at the start of every render from `appearance` and the window's appearance.
     theme: Theme,
     /// A transient message for the status bar, such as a failed link or a completed copy.
@@ -344,6 +348,7 @@ impl RusidianApp {
             marked_selection: 0..0,
             settings_open: false,
             appearance: crate::settings::load().appearance,
+            recent: crate::settings::load().recent,
             theme: Theme::DARK,
             notice: None,
             notice_generation: 0,
@@ -618,6 +623,17 @@ impl RusidianApp {
         .detach();
     }
 
+    /// Add an opened file or folder to the welcome screen's recent list.
+    fn remember_recent(&mut self, path: &Path) {
+        if self.document.is_none() && self.vault.is_none() {
+            return;
+        }
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(settings) = crate::settings::update(|settings| settings.remember(path)) {
+            self.recent = settings.recent;
+        }
+    }
+
     fn set_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
         self.appearance = appearance;
         if let Err(error) = crate::settings::update(|settings| settings.appearance = appearance) {
@@ -778,6 +794,7 @@ impl RusidianApp {
                 fragment,
             } => {
                 self.replace_document(&path, vault_root);
+                self.remember_recent(&path);
                 if let Some(fragment) = fragment
                     && !self.reveal_fragment(&fragment)
                 {
@@ -828,6 +845,7 @@ impl RusidianApp {
         next.cell_size = self.cell_size;
         next.settings_open = self.settings_open;
         next.appearance = self.appearance;
+        next.recent = std::mem::take(&mut self.recent);
         next.theme = self.theme;
         next.auto_update = self.auto_update;
         next.update_status = std::mem::replace(&mut self.update_status, UpdateStatus::Idle);
@@ -1966,6 +1984,134 @@ impl RusidianApp {
             .into_any_element()
     }
 
+    fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let shortcut = |key: &str| {
+            if cfg!(target_os = "macos") {
+                format!("⌘{key}")
+            } else {
+                format!("Ctrl+{key}")
+            }
+        };
+        let button = |id: &'static str, label: &'static str, hint: String, directory: bool| {
+            div()
+                .id(id)
+                .w(px(220.0))
+                .px_4()
+                .py_2()
+                .flex()
+                .justify_between()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(theme.block))
+                .hover(|element| element.bg(rgb(theme.hover)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_path(directory, window, cx);
+                }))
+                .child(label)
+                .child(div().text_color(rgb(theme.muted)).child(hint))
+        };
+        let recent = self
+            .recent
+            .iter()
+            .filter(|path| path.exists())
+            .take(8)
+            .enumerate()
+            .map(|(index, path)| {
+                let target = path.clone();
+                let folder = path.is_dir();
+                div()
+                    .id(("recent", index))
+                    .w(px(440.0))
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .gap_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|element| element.bg(rgb(theme.hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request_close(
+                            PendingClose::Open {
+                                path: target.clone(),
+                                vault_root: None,
+                                fragment: None,
+                            },
+                            cx,
+                        );
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(theme.accent))
+                            .child(display_name(path) + if folder { "/" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(rgb(theme.faint))
+                            .child(
+                                path.parent()
+                                    .map(|parent| parent.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            ),
+                    )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_3()
+            .child(div().text_2xl().child("本地 Markdown，真实 Neovim"))
+            .when_some(self.error.clone(), |element, error| {
+                element.child(
+                    div()
+                        .max_w(px(560.0))
+                        .text_sm()
+                        .text_color(rgb(theme.error_text))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .mt_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .text_sm()
+                    .child(button("open-file", "打开文件…", shortcut("O"), false))
+                    .child(button(
+                        "open-folder",
+                        "打开文件夹…",
+                        shortcut(if cfg!(target_os = "macos") {
+                            "⇧O"
+                        } else {
+                            "Shift+O"
+                        }),
+                        true,
+                    )),
+            )
+            .when(!recent.is_empty(), |element| {
+                element
+                    .child(
+                        div()
+                            .mt_6()
+                            .w(px(440.0))
+                            .px_3()
+                            .text_xs()
+                            .text_color(rgb(theme.muted))
+                            .child("最近打开"),
+                    )
+                    .child(div().flex().flex_col().text_sm().children(recent))
+            })
+            .into_any_element()
+    }
+
     fn render_status_bar(&self, search_prompt: Option<String>) -> AnyElement {
         let theme = self.theme;
         let mode: SharedString = match self.view {
@@ -2648,14 +2794,7 @@ impl Render for RusidianApp {
                 .items_center()
                 .justify_center()
                 .gap_3()
-                .child(div().text_2xl().child("本地 Markdown，真实 Neovim"))
-                .child(
-                    div().text_sm().text_color(rgb(theme.muted)).child(
-                        self.error
-                            .clone()
-                            .unwrap_or_else(|| "运行 rusidian path/to/note.md".into()),
-                    ),
-                )
+                .child(self.render_welcome(cx))
                 .into_any_element()
         };
 
