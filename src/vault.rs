@@ -107,9 +107,74 @@ pub enum TreeRow {
 
 #[derive(Default)]
 struct TreeFolder {
-    /// Keyed by lowercase name so folders sort case-insensitively, like Obsidian.
-    folders: BTreeMap<String, (String, TreeFolder)>,
-    notes: BTreeMap<String, (String, PathBuf)>,
+    /// Keyed so folders and notes sort like Obsidian's file list.
+    folders: BTreeMap<NaturalKey, (String, TreeFolder)>,
+    notes: BTreeMap<NaturalKey, (String, PathBuf)>,
+}
+
+/// A name ordered like Obsidian's file list: ignoring case, with numbers by value, so
+/// `Note 2` comes before `Note 10`.
+#[derive(PartialEq, Eq)]
+struct NaturalKey(String);
+
+impl NaturalKey {
+    fn new(name: &str) -> Self {
+        Self(name.to_lowercase())
+    }
+}
+
+impl Ord for NaturalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        natural_cmp(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for NaturalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let digits = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut number = String::new();
+                    while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+                        number.push(digit);
+                    }
+                    number
+                };
+                let (first, second) = (digits(&mut a), digits(&mut b));
+                let (x, y) = (
+                    first.trim_start_matches('0'),
+                    second.trim_start_matches('0'),
+                );
+                // By value, then fewer leading zeros first.
+                let order = x
+                    .len()
+                    .cmp(&y.len())
+                    .then_with(|| x.cmp(y))
+                    .then_with(|| first.len().cmp(&second.len()));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
 }
 
 impl Vault {
@@ -131,7 +196,7 @@ impl Vault {
             for parent in parents {
                 folder = &mut folder
                     .folders
-                    .entry(parent.to_lowercase())
+                    .entry(NaturalKey::new(parent))
                     .or_insert_with(|| (parent.clone(), TreeFolder::default()))
                     .1;
             }
@@ -140,7 +205,7 @@ impl Vault {
                 .map_or_else(|| name.clone(), |stem| stem.to_string_lossy().into_owned());
             folder
                 .notes
-                .insert(name.to_lowercase(), (stem, file.clone()));
+                .insert(NaturalKey::new(name), (stem, file.clone()));
         }
         let mut rows = Vec::new();
         flatten(&tree, &self.root, 0, expanded, &mut rows);
@@ -522,6 +587,32 @@ mod tests {
         assert_eq!(new_note_path(&note, Some(&vault), "../outside"), None);
         assert_eq!(new_note_path(&note, Some(&vault), "https://x.org"), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sorts_names_naturally() {
+        let mut names = [
+            "note-25",
+            "Note-3",
+            "note-250",
+            "note-2499",
+            "Alpha",
+            "note-03",
+            "beta",
+        ];
+        names.sort_by(|a, b| NaturalKey::new(a).cmp(&NaturalKey::new(b)));
+        assert_eq!(
+            names,
+            [
+                "Alpha",
+                "beta",
+                "Note-3",
+                "note-03",
+                "note-25",
+                "note-250",
+                "note-2499"
+            ]
+        );
     }
 
     #[test]
