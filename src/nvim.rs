@@ -348,9 +348,9 @@ impl Client {
                             if let Err(error) = nvim.command("qall").await
                                 && !error.is_channel_closed()
                             {
-                                let _ = event_sender.send(Event::CloseRefused(format!(
-                                    "Neovim 拒绝关闭：{error}。请用 :w 保存，或自行用 :q! 放弃修改。"
-                                ))).await;
+                                let _ = event_sender
+                                    .send(Event::CloseRefused(close_refusal(&error.to_string())))
+                                    .await;
                             }
                         }
                         Command::Input(keys) => {
@@ -507,6 +507,19 @@ async fn send_input(nvim: &Neovim<Compat<ChildStdin>>, mut keys: &str) -> Result
     })
     .await
     .map_err(|_| "Neovim 输入超时，部分文字可能未送达".to_owned())?
+}
+
+/// Explain why Neovim kept running; unsaved changes (E37/E162) are the usual reason.
+fn close_refusal(error: &str) -> String {
+    if error.contains("E37") || error.contains("E162") {
+        "当前笔记有未保存的修改。请用 :w 保存，或用 :e! 放弃修改，然后再切换笔记或退出。".to_owned()
+    } else {
+        let detail = error
+            .split_once("Vim(")
+            .and_then(|(_, rest)| rest.split_once("):"))
+            .map_or(error, |(_, message)| message.trim_end_matches(['\'', ')']));
+        format!("Neovim 未能关闭：{detail}")
+    }
 }
 
 fn escape_mapping(maps: &[Vec<(Value, Value)>]) -> Option<String> {
@@ -1224,6 +1237,20 @@ mod tests {
             Value::Array(vec![]),
         ])]);
         assert!(grid.visible_cursor().is_none());
+    }
+
+    #[test]
+    fn explains_why_neovim_refused_to_close() {
+        assert!(
+            close_refusal(
+                "Error processing request: 0 - 'Vim(qall):E37: No write since last change'"
+            )
+            .contains("未保存的修改")
+        );
+        assert_eq!(
+            close_refusal("Error processing request: 0 - 'Vim(qall):E999: Other'"),
+            "Neovim 未能关闭：E999: Other"
+        );
     }
 
     #[test]
