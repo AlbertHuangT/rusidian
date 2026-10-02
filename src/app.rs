@@ -51,7 +51,8 @@ actions!(
         ToggleSidebar,
         QuickSwitcher,
         SearchVault,
-        EnterSourceNormal
+        EnterSourceNormal,
+        CopySelection
     ]
 );
 
@@ -95,6 +96,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&format!("{modifier}-p"), QuickSwitcher, context),
         KeyBinding::new(&format!("{modifier}-shift-f"), SearchVault, context),
         KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
+        // The source view leaves copying to Neovim.
+        KeyBinding::new(&format!("{modifier}-c"), CopySelection, Some("Reading")),
     ]
 }
 
@@ -137,6 +140,7 @@ pub fn run(initial_path: Option<PathBuf>) {
                 MenuItem::action("关闭标签", CloseTab),
                 MenuItem::action("关闭窗口", CloseWindow),
             ]),
+            Menu::new("编辑").items([MenuItem::action("复制", CopySelection)]),
             Menu::new("显示").items([
                 MenuItem::action("显示/隐藏文件列表", ToggleSidebar),
                 MenuItem::separator(),
@@ -497,6 +501,7 @@ struct RusidianApp {
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
     reading_selection: Option<ReadingSelection>,
+    mouse_press: Option<MousePress>,
     reading_search: Option<SearchPrompt>,
     last_search: Option<SearchPrompt>,
     reading_scroll: ScrollHandle,
@@ -602,6 +607,16 @@ struct ReadingCursor {
 struct ReadingSelection {
     anchor: ReadingCursor,
     linewise: bool,
+}
+
+/// The left button went down on the reading view: a click, or the start of a drag that
+/// selects text.
+#[derive(Clone, Copy)]
+struct MousePress {
+    at: ReadingCursor,
+    /// Pressed on the text itself, where a link or tag is followed once released in place.
+    on_text: bool,
+    dragged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -940,6 +955,7 @@ impl RusidianApp {
             reading_count: None,
             reading_find: None,
             reading_selection: None,
+            mouse_press: None,
             reading_search: None,
             last_search: None,
             reading_scroll: ScrollHandle::new(),
@@ -2415,9 +2431,70 @@ impl RusidianApp {
         *self = next;
     }
 
-    /// A click in the reading view: move the cursor there and follow a link under it.
+    /// A press on the reading view's text: move the cursor there. A link or tag under it is
+    /// followed when the button comes up without a drag.
     fn click_reading(&mut self, block: usize, offset: usize, cx: &mut Context<Self>) {
         if !self.place_reading_cursor(block, offset) {
+            return;
+        }
+        self.mouse_press = Some(MousePress {
+            at: self.reading_cursor,
+            on_text: true,
+            dragged: false,
+        });
+        cx.notify();
+    }
+
+    /// A press beside the text (between blocks, in margins, on list markers): the cursor goes
+    /// to the nearest position, without following a link there.
+    fn click_nearest(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(cursor) = self.reading_position_at(position.x, position.y, true)
+            && self.place_reading_cursor(cursor.block, cursor.offset)
+        {
+            self.mouse_press = Some(MousePress {
+                at: self.reading_cursor,
+                on_text: false,
+                dragged: false,
+            });
+            cx.notify();
+        }
+    }
+
+    /// Dragging with the button down selects from where it was pressed, like `v`.
+    fn drag_reading(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.mouse_press = None;
+            return;
+        }
+        let Some(press) = self.mouse_press else {
+            return;
+        };
+        let Some(cursor) = self.reading_position_at(event.position.x, event.position.y, true)
+        else {
+            return;
+        };
+        if cursor == self.reading_cursor && (press.dragged || cursor == press.at) {
+            return;
+        }
+        self.mouse_press = Some(MousePress {
+            dragged: true,
+            ..press
+        });
+        self.reading_selection = Some(ReadingSelection {
+            anchor: press.at,
+            linewise: false,
+        });
+        self.reading_cursor = cursor;
+        self.reading_column = None;
+        cx.notify();
+    }
+
+    /// The button came up: a click on a tag searches it, one on a link follows it.
+    fn release_reading(&mut self, cx: &mut Context<Self>) {
+        let Some(press) = self.mouse_press.take() else {
+            return;
+        };
+        if press.dragged || !press.on_text || self.reading_cursor != press.at {
             return;
         }
         if let Some(tag) = self.current_tag() {
@@ -2434,13 +2511,17 @@ impl RusidianApp {
         cx.notify();
     }
 
-    /// A click beside the text (between blocks, in margins, on list markers): the cursor goes
-    /// to the nearest position, without following a link there.
-    fn click_nearest(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if let Some(cursor) = self.reading_position_at(position.x, position.y, true)
-            && self.place_reading_cursor(cursor.block, cursor.offset)
+    /// Copy the selection to the system clipboard: `y`, or the platform's copy shortcut.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(selection) = self.reading_selection.take()
+            && let Some(item) = self.selected_clipboard(selection)
         {
-            cx.notify();
+            let message = match item.text() {
+                Some(text) => format!("已复制 {} 个字符", text.chars().count()),
+                None => "已复制图片".to_owned(),
+            };
+            cx.write_to_clipboard(item);
+            self.show_notice(message, false, cx);
         }
     }
 
@@ -3776,16 +3857,7 @@ impl RusidianApp {
                 return;
             }
             if key == Some("y") {
-                if let Some(selection) = self.reading_selection.take()
-                    && let Some(item) = self.selected_clipboard(selection)
-                {
-                    let message = match item.text() {
-                        Some(text) => format!("已复制 {} 个字符", text.chars().count()),
-                        None => "已复制图片".to_owned(),
-                    };
-                    cx.write_to_clipboard(item);
-                    self.show_notice(message, false, cx);
-                }
+                self.copy_selection(cx);
                 self.reading_count = None;
                 return;
             }
@@ -5926,6 +5998,13 @@ impl Render for RusidianApp {
                         this.click_nearest(event.position, cx);
                     }),
                 )
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.drag_reading(event, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.release_reading(cx)),
+                )
                 .children(children)
                 .child({
                     // Prepainted after every block: from here on this frame's text layouts can be
@@ -6142,6 +6221,9 @@ impl Render for RusidianApp {
                 cx.notify();
             }))
             .on_action(cx.listener(Self::enter_source_normal))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
+                this.copy_selection(cx);
+            }))
             .on_key_down(cx.listener(Self::key_down))
             .flex()
             .flex_col()
