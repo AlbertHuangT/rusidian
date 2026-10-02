@@ -56,6 +56,13 @@ enum Command {
     /// Zero-based line and byte column.
     SetCursor(usize, usize),
     QueryCursor,
+    Mouse {
+        button: &'static str,
+        action: &'static str,
+        modifier: String,
+        row: usize,
+        column: usize,
+    },
     FollowCurrentBuffer,
     Close,
 }
@@ -342,6 +349,18 @@ impl Client {
                                     .await;
                             }
                         }
+                        Command::Mouse {
+                            button,
+                            action,
+                            modifier,
+                            row,
+                            column,
+                        } => {
+                            // Grid 0 targets the default grid when multigrid is off.
+                            let _ = nvim
+                                .input_mouse(button, action, &modifier, 0, row as i64, column as i64)
+                                .await;
+                        }
                         Command::FollowCurrentBuffer => {
                             let Ok(current) = nvim.get_current_buf().await else {
                                 continue;
@@ -395,6 +414,23 @@ impl Client {
 
     pub fn query_cursor(&self) {
         let _ = self.commands.send(Command::QueryCursor);
+    }
+
+    /// Forward a mouse event at a grid cell; see `nvim_input_mouse` for buttons and actions.
+    pub fn mouse(
+        &self,
+        button: &'static str,
+        action: &'static str,
+        modifier: String,
+        (row, column): (usize, usize),
+    ) {
+        let _ = self.commands.send(Command::Mouse {
+            button,
+            action,
+            modifier,
+            row,
+            column,
+        });
     }
 
     pub fn close(&self) -> bool {
@@ -583,6 +619,10 @@ impl Grid {
 
     pub fn height(&self) -> usize {
         self.height
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
     }
 
     /// Runs for one row. ASCII cells with the same highlight are merged; every other cell gets

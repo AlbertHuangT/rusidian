@@ -8,7 +8,8 @@ use cargo_packager_updater::Update;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
-    KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, Pixels, Point, ScrollHandle,
+    KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
     SharedString, Size, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, Window,
     WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb, size,
 };
@@ -213,6 +214,11 @@ struct RusidianApp {
     /// Grid size last requested from Neovim; shared with the layout pass that measures it.
     nvim_size: Rc<Cell<(i64, i64)>>,
     cell_size: Size<Pixels>,
+    /// Top-left of the grid area from the last layout, for mapping mouse positions to cells.
+    grid_origin: Rc<Cell<Point<Pixels>>>,
+    mouse_button: Option<&'static str>,
+    /// Scroll distance not yet sent to Neovim as a wheel step.
+    scroll_remainder: Pixels,
     reading_cursor: ReadingCursor,
     /// The reading cursor as last placed from Neovim's cursor; unchanged means Enter keeps
     /// Neovim's exact position instead of moving it to the mapped character.
@@ -333,6 +339,9 @@ impl RusidianApp {
             nvim_warning: None,
             nvim_size: Rc::new(Cell::new((120, 40))),
             cell_size: size(px(SOURCE_FONT_SIZE * 0.6), px(SOURCE_LINE_HEIGHT)),
+            grid_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
+            mouse_button: None,
+            scroll_remainder: px(0.0),
             reading_cursor: ReadingCursor::default(),
             synced_cursor: None,
             reading_column: None,
@@ -843,6 +852,7 @@ impl RusidianApp {
         next.focus_handle = self.focus_handle.take();
         next.nvim_size = self.nvim_size.clone();
         next.cell_size = self.cell_size;
+        next.grid_origin = self.grid_origin.clone();
         next.settings_open = self.settings_open;
         next.appearance = self.appearance;
         next.recent = std::mem::take(&mut self.recent);
@@ -1909,6 +1919,7 @@ impl RusidianApp {
 
         let resizer = self.nvim.as_ref().map(NvimClient::resizer);
         let requested = self.nvim_size.clone();
+        let origin = self.grid_origin.clone();
         let warning = self.nvim_warning.clone().map(|warning| {
             div()
                 .flex_none()
@@ -1956,11 +1967,58 @@ impl RusidianApp {
                     .font_family(family)
                     .text_size(font_size)
                     .line_height(line_height)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.grid_mouse("left", "press", event.position, &event.modifiers, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.grid_mouse("right", "press", event.position, &event.modifiers, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if let Some(button) = this.mouse_button
+                            && event.pressed_button.is_some()
+                        {
+                            this.grid_mouse(button, "drag", event.position, &event.modifiers, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.grid_mouse(
+                                "left",
+                                "release",
+                                event.position,
+                                &event.modifiers,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.grid_mouse(
+                                "right",
+                                "release",
+                                event.position,
+                                &event.modifiers,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.grid_scroll(event, cx);
+                    }))
                     .children(layers)
                     .when_some(focus, |element, focus| {
                         element.track_focus(&focus).child(
                             canvas(
                                 move |bounds, _, _| {
+                                    origin.set(bounds.origin);
                                     let columns = ((bounds.size.width - padding * 2.0) / cell_width)
                                         .floor()
                                         .max(20.0)
@@ -2220,6 +2278,69 @@ impl RusidianApp {
             .child(message)
             .child(div().flex_none().child(hint))
             .into_any_element()
+    }
+
+    /// The grid cell under a window position, clamped to the grid.
+    fn grid_cell(&self, position: Point<Pixels>) -> (usize, usize) {
+        let local = position - self.grid_origin.get();
+        let padding = px(GRID_PADDING);
+        let column = ((local.x - padding) / self.cell_size.width)
+            .floor()
+            .max(0.0) as usize;
+        let row = ((local.y - padding) / self.cell_size.height)
+            .floor()
+            .max(0.0) as usize;
+        (
+            row.min(self.grid.height().saturating_sub(1)),
+            column.min(self.grid.width().saturating_sub(1)),
+        )
+    }
+
+    fn grid_mouse(
+        &mut self,
+        button: &'static str,
+        action: &'static str,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            "press" => self.mouse_button = Some(button),
+            "release" => self.mouse_button = None,
+            _ => {}
+        }
+        if let Some(nvim) = &self.nvim {
+            nvim.mouse(
+                button,
+                action,
+                mouse_modifiers(modifiers),
+                self.grid_cell(position),
+            );
+        }
+        cx.stop_propagation();
+    }
+
+    /// Send whole wheel steps; trackpads report small pixel deltas that accumulate.
+    fn grid_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let Some(nvim) = &self.nvim else {
+            return;
+        };
+        // Neovim scrolls three lines per wheel step by default ('mousescroll').
+        let step = self.cell_size.height * 3.0;
+        self.scroll_remainder += event.delta.pixel_delta(self.cell_size.height).y;
+        let cell = self.grid_cell(event.position);
+        let modifier = mouse_modifiers(&event.modifiers);
+        while self.scroll_remainder.abs() >= step {
+            let up = self.scroll_remainder > px(0.0);
+            nvim.mouse(
+                "wheel",
+                if up { "up" } else { "down" },
+                modifier.clone(),
+                cell,
+            );
+            self.scroll_remainder -= if up { step } else { -step };
+        }
+        cx.stop_propagation();
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3729,6 +3850,24 @@ fn reading_position(blocks: &[Block], offset: usize) -> Option<ReadingCursor> {
         })
 }
 
+/// Modifier letters for `nvim_input_mouse`.
+fn mouse_modifiers(modifiers: &Modifiers) -> String {
+    let mut letters = String::new();
+    if modifiers.control {
+        letters.push('C');
+    }
+    if modifiers.shift {
+        letters.push('S');
+    }
+    if modifiers.alt {
+        letters.push('A');
+    }
+    if modifiers.platform {
+        letters.push('D');
+    }
+    letters
+}
+
 fn is_external_link(destination: &str) -> bool {
     destination.contains("://") || destination.starts_with("mailto:")
 }
@@ -4275,7 +4414,6 @@ fn end_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::Modifiers;
 
     #[test]
     fn reuses_math_after_edits_and_aligns_to_the_text_baseline() {
