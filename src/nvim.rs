@@ -56,6 +56,8 @@ pub enum Event {
     },
     /// Neovim's listed file buffers in buffer order, with their modified flags.
     Buffers(Vec<(PathBuf, bool)>),
+    /// No input-source switcher (im-select.nvim) is loaded; a recommendation, not a problem.
+    ImeHint,
     Exited,
 }
 
@@ -363,6 +365,9 @@ impl Client {
                         "Neovim Normal 的 Esc 已映射为 {mapping}；Rusidian 当前会优先用 Esc 返回阅读视图"
                     ));
                 }
+                if !warnings.is_empty() {
+                    let _ = event_sender.send(Event::Warning(warnings.join("\n"))).await;
+                }
                 if !clean
                     && nvim
                         .exec_lua("return package.loaded['im_select'] ~= nil", Vec::new())
@@ -371,13 +376,7 @@ impl Client {
                         .and_then(|value| value.as_bool())
                         != Some(true)
                 {
-                    warnings.push(
-                        "未检测到已加载的 im-select.nvim；如需在 Insert/Normal 间自动切换中英文输入源，可以安装该插件"
-                            .into(),
-                    );
-                }
-                if !warnings.is_empty() {
-                    let _ = event_sender.send(Event::Warning(warnings.join("\n"))).await;
+                    let _ = event_sender.send(Event::ImeHint).await;
                 }
 
                 let exit_sender = event_sender.clone();
@@ -1442,7 +1441,8 @@ mod tests {
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
                             | Event::Notice { .. }
-                            | Event::Buffers(_) => {}
+                            | Event::Buffers(_)
+                            | Event::ImeHint => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1471,7 +1471,8 @@ mod tests {
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
                             | Event::Notice { .. }
-                            | Event::Buffers(_) => {}
+                            | Event::Buffers(_)
+                            | Event::ImeHint => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1499,7 +1500,8 @@ mod tests {
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
                             | Event::Notice { .. }
-                            | Event::Buffers(_) => {}
+                            | Event::Buffers(_)
+                            | Event::ImeHint => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1527,7 +1529,8 @@ mod tests {
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
                             | Event::Notice { .. }
-                            | Event::Buffers(_) => {}
+                            | Event::Buffers(_)
+                            | Event::ImeHint => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1553,7 +1556,8 @@ mod tests {
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
                             | Event::Notice { .. }
-                            | Event::Buffers(_) => {}
+                            | Event::Buffers(_)
+                            | Event::ImeHint => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }

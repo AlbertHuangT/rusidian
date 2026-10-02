@@ -10,10 +10,6 @@ const ENDPOINTS: [&str; 2] = [
 ];
 const PUBLIC_KEY: &str = include_str!("../assets/update.pubkey");
 
-pub fn auto_update_enabled() -> bool {
-    crate::settings::load().auto_update
-}
-
 pub fn set_auto_update(enabled: bool) -> Result<(), String> {
     crate::settings::update(|settings| settings.auto_update = enabled).map(|_| ())
 }

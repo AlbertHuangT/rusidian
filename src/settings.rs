@@ -16,6 +16,8 @@ pub struct Settings {
     pub recent: Vec<PathBuf>,
     /// Vaults whose remote images load without asking each time.
     pub remote_image_vaults: Vec<PathBuf>,
+    /// The user asked not to be reminded about im-select.nvim again.
+    pub hide_ime_hint: bool,
 }
 
 const RECENT_LIMIT: usize = 10;
@@ -84,6 +86,7 @@ mod tests {
                 appearance: Appearance::System,
                 recent: Vec::new(),
                 remote_image_vaults: Vec::new(),
+                hide_ime_hint: false,
             }
         );
         update_at(&path, |settings| settings.appearance = Appearance::Dark).unwrap();

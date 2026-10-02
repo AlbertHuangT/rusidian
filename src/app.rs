@@ -258,6 +258,8 @@ struct RusidianApp {
     grid: NvimGrid,
     nvim_error: Option<SharedString>,
     nvim_warning: Option<SharedString>,
+    /// Recommend im-select.nvim for switching input sources between Insert and Normal.
+    ime_hint: bool,
     /// Grid size last requested from Neovim; shared with the layout pass that measures it.
     nvim_size: Rc<Cell<(i64, i64)>>,
     cell_size: Size<Pixels>,
@@ -394,6 +396,7 @@ enum TikzState {
 
 impl RusidianApp {
     fn empty() -> Self {
+        let settings = crate::settings::load();
         Self {
             document: None,
             vault: None,
@@ -407,6 +410,7 @@ impl RusidianApp {
             grid: NvimGrid::default(),
             nvim_error: None,
             nvim_warning: None,
+            ime_hint: false,
             nvim_size: Rc::new(Cell::new((120, 40))),
             cell_size: size(px(SOURCE_FONT_SIZE * 0.6), px(SOURCE_LINE_HEIGHT)),
             grid_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
@@ -429,8 +433,8 @@ impl RusidianApp {
             marked_text: String::new(),
             marked_selection: 0..0,
             settings_open: false,
-            appearance: crate::settings::load().appearance,
-            recent: crate::settings::load().recent,
+            appearance: settings.appearance,
+            recent: settings.recent,
             sidebar_visible: true,
             expanded_folders: HashSet::new(),
             revealed_in_tree: None,
@@ -443,8 +447,8 @@ impl RusidianApp {
             place_initial_cursor: false,
             open_buffers: Vec::new(),
             remote_images: HashMap::new(),
-            remote_image_vaults: crate::settings::load().remote_image_vaults,
-            auto_update: update::auto_update_enabled(),
+            remote_image_vaults: settings.remote_image_vaults,
+            auto_update: settings.auto_update,
             update_status: UpdateStatus::Idle,
             available_update: None,
         }
@@ -956,6 +960,10 @@ impl RusidianApp {
                         }
                         NvimEvent::Error(error) => {
                             this.nvim_error = Some(error.into());
+                            cx.notify();
+                        }
+                        NvimEvent::ImeHint => {
+                            this.ime_hint = !crate::settings::load().hide_ime_hint;
                             cx.notify();
                         }
                         NvimEvent::Warning(warning) => {
@@ -2629,6 +2637,48 @@ impl RusidianApp {
                         .child("×"),
                 )
         });
+        let ime_hint = self.ime_hint.then(|| {
+            let action = |id: &'static str, label: &'static str, forever: bool| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|element| element.bg(rgb(theme.hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.ime_hint = false;
+                        if forever
+                            && let Err(error) =
+                                crate::settings::update(|settings| settings.hide_ime_hint = true)
+                        {
+                            this.show_notice(error, true, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .child(label)
+            };
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .m_3()
+                .mb_0()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(theme.block))
+                .text_color(rgb(theme.muted))
+                .text_sm()
+                .child(
+                    div().flex_1().child(
+                        "提示：可以用 im-select.nvim 在 Insert/Normal 间自动切换中英文输入源。",
+                    ),
+                )
+                .child(action("hide-ime-hint", "不再提示", true))
+                .child(action("close-ime-hint", "×", false))
+        });
 
         div()
             .flex_1()
@@ -2637,6 +2687,7 @@ impl RusidianApp {
             .flex_col()
             .bg(rgb(background))
             .children(warning)
+            .children(ime_hint)
             .child(
                 div()
                     .flex_1()
