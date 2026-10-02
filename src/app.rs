@@ -2702,8 +2702,11 @@ impl RusidianApp {
         } else {
             anchor_y - delta
         };
+        // Look up the new position before scrolling: text layouts and block positions must
+        // both be those of the last frame, which the probe is measured in.
+        let target = self.reading_position_at(anchor_x, probe, down);
         self.reading_scroll.set_offset(point(offset.x, y));
-        if let Some(cursor) = self.reading_position_at(anchor_x, probe, down)
+        if let Some(cursor) = target
             && cursor != self.reading_cursor
         {
             self.reading_cursor = cursor;
