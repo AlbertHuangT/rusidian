@@ -10,13 +10,13 @@ use gpui::{
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
-    SharedString, Size, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, WeakEntity,
-    Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb,
-    size,
+    SharedString, Size, StrikethroughStyle, StyledText, TextLayout, UTF16Selection, UnderlineStyle,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*,
+    px, rgb, size,
 };
 use gpui_platform::application;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
@@ -239,6 +239,10 @@ struct RusidianApp {
     /// Neovim's exact position instead of moving it to the mapped character.
     synced_cursor: Option<ReadingCursor>,
     reading_column: Option<usize>,
+    /// The horizontal position gj/gk keep while moving between screen lines.
+    reading_desired_x: Option<Pixels>,
+    /// Text layouts from the last rendered reading view, for gj/gk.
+    fragment_layouts: RefCell<Vec<FragmentLayout>>,
     reading_pending_g: bool,
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
@@ -366,6 +370,8 @@ impl RusidianApp {
             reading_cursor: ReadingCursor::default(),
             synced_cursor: None,
             reading_column: None,
+            reading_desired_x: None,
+            fragment_layouts: RefCell::new(Vec::new()),
             reading_pending_g: false,
             reading_count: None,
             reading_find: None,
@@ -1470,6 +1476,120 @@ impl RusidianApp {
         }
     }
 
+    /// gj/gk: move to the next or previous screen line of the current block, keeping the
+    /// horizontal position. Returns false when the block has no such line.
+    fn move_reading_screen_line(&mut self, down: bool) -> bool {
+        let Some(block) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.markdown.blocks.get(self.reading_cursor.block))
+        else {
+            return false;
+        };
+        if is_object(block) {
+            return false;
+        }
+        let Some(byte) =
+            text_range(&block.text, self.reading_cursor.offset).map(|range| range.start)
+        else {
+            return false;
+        };
+        let layouts = self.fragment_layouts.borrow();
+        let fragments = layouts
+            .iter()
+            .filter(|fragment| fragment.block == self.reading_cursor.block)
+            .collect::<Vec<_>>();
+        let Some(current) = fragments
+            .iter()
+            .find(|fragment| fragment.range.contains(&byte))
+        else {
+            return false;
+        };
+        let Some(position) = current
+            .layout
+            .position_for_index(byte - current.range.start)
+        else {
+            return false;
+        };
+        let line_height = current.layout.line_height();
+        let x = *self.reading_desired_x.get_or_insert(position.x);
+        // Each candidate is (fragment, the y to probe, the top of that screen line).
+        let mut candidates = Vec::new();
+        for fragment in &fragments {
+            let bounds = fragment.layout.bounds();
+            let height = fragment.layout.line_height();
+            if std::ptr::eq(*fragment, *current) {
+                let next = if down {
+                    position.y + line_height
+                } else {
+                    position.y - line_height
+                };
+                if next >= bounds.top() && next + height <= bounds.bottom() + px(0.5) {
+                    candidates.push((*fragment, next + height / 2.0, next));
+                }
+            } else if down && bounds.top() >= position.y + line_height - px(1.0) {
+                candidates.push((*fragment, bounds.top() + height / 2.0, bounds.top()));
+            } else if !down && bounds.bottom() <= position.y + px(1.0) {
+                let top = bounds.bottom() - height;
+                candidates.push((*fragment, top + height / 2.0, top));
+            }
+        }
+        let Some(row) = candidates
+            .iter()
+            .map(|(_, _, top)| *top)
+            .reduce(|a, b| if down { a.min(b) } else { a.max(b) })
+        else {
+            return false;
+        };
+        let distance = |bounds: Bounds<Pixels>| {
+            if x < bounds.left() {
+                bounds.left() - x
+            } else if x > bounds.right() {
+                x - bounds.right()
+            } else {
+                px(0.0)
+            }
+        };
+        let Some((fragment, probe_y, _)) = candidates
+            .iter()
+            .filter(|(_, _, top)| (*top - row).abs() < px(2.0))
+            .min_by(|a, b| {
+                f32::from(distance(a.0.layout.bounds()))
+                    .total_cmp(&f32::from(distance(b.0.layout.bounds())))
+            })
+        else {
+            return false;
+        };
+        let bounds = fragment.layout.bounds();
+        let probe = point(x.clamp(bounds.left(), bounds.right()), *probe_y);
+        let index = fragment
+            .layout
+            .index_for_position(probe)
+            .unwrap_or_else(|nearest| nearest);
+        let text = &block.text[fragment.range.clone()];
+        let mut local = (0..=index.min(text.len()))
+            .rev()
+            .find(|byte| text.is_char_boundary(*byte))
+            .unwrap_or(0);
+        // Past the last character of a line: stay on the line's last character.
+        if local > 0
+            && (local == text.len() || text[local..].starts_with('\n'))
+            && let Some(at) = fragment.layout.position_for_index(local)
+            && at.x <= probe.x
+        {
+            local = text[..local]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(index, _)| index);
+        }
+        let length = block_len(block);
+        let offset = visible_offset(&block.text, fragment.range.start + local).min(length - 1);
+        drop(layouts);
+        self.reading_cursor.offset = offset;
+        self.reading_column = None;
+        true
+    }
+
     fn move_reading_line_edge(&mut self, end: bool) {
         let Some(block) = self
             .document
@@ -1594,6 +1714,12 @@ impl RusidianApp {
                 cx.notify();
             }
             let key = event.keystroke.key_char.as_deref();
+            if !(self.reading_pending_g && matches!(key, Some("j" | "k")))
+                && !key.is_some_and(|key| key.parse::<usize>().is_ok())
+                && key != Some("g")
+            {
+                self.reading_desired_x = None;
+            }
             if event.keystroke.key == "escape" {
                 self.reading_find = None;
                 self.reading_pending_g = false;
@@ -1728,6 +1854,17 @@ impl RusidianApp {
                         }
                         self.reveal_reading_cursor();
                         cx.notify();
+                    }
+                    Some("j") | Some("k") => {
+                        let down = key == Some("j");
+                        for _ in 0..self.take_reading_count() {
+                            if !self.move_reading_screen_line(down) {
+                                self.move_reading_line(down);
+                            }
+                        }
+                        self.reveal_reading_cursor();
+                        cx.notify();
+                        return;
                     }
                     Some("f") => {
                         self.open_internal_link(cx);
@@ -2935,6 +3072,7 @@ impl Render for RusidianApp {
             ),
         );
         let view = cx.entity().downgrade();
+        self.fragment_layouts.borrow_mut().clear();
         let reading = if let Some(document) = &self.document {
             let context = RenderContext {
                 theme: &theme,
@@ -2945,6 +3083,7 @@ impl Render for RusidianApp {
                     vault: self.vault.as_ref(),
                 },
                 view: &view,
+                layouts: &self.fragment_layouts,
                 block_index: 0,
             };
             let selection = self.reading_selection.and_then(|selection| {
@@ -3350,6 +3489,13 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
     }
 }
 
+/// Where a block's text fragment was laid out in the last frame.
+struct FragmentLayout {
+    block: usize,
+    range: std::ops::Range<usize>,
+    layout: TextLayout,
+}
+
 /// Inputs shared by every block in one render of the reading view.
 #[derive(Clone, Copy)]
 struct RenderContext<'a> {
@@ -3359,6 +3505,8 @@ struct RenderContext<'a> {
     links: Links<'a>,
     /// Receives clicks that place the reading cursor.
     view: &'a WeakEntity<RusidianApp>,
+    /// Collects every text fragment's layout for screen-line motions.
+    layouts: &'a RefCell<Vec<FragmentLayout>>,
     /// The block being rendered.
     block_index: usize,
 }
@@ -3646,6 +3794,11 @@ fn styled_fragment(
     let fragment: SharedString = block.text[range.clone()].to_owned().into();
     let text = StyledText::new(fragment.clone()).with_highlights(highlights);
     let layout = text.layout().clone();
+    context.layouts.borrow_mut().push(FragmentLayout {
+        block: context.block_index,
+        range: range.clone(),
+        layout: layout.clone(),
+    });
     let before = visible_offset(&block.text, range.start);
     let view = context.view.clone();
     let index = context.block_index;
