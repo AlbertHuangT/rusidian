@@ -640,6 +640,8 @@ struct Switcher {
     text: bool,
     /// Lines containing the query, once the background search for it finished.
     hits: Vec<TextHit>,
+    /// For the query `#`: every tag and how many notes use it.
+    tags: Vec<(String, usize)>,
     /// Counts searches, so a slower earlier one cannot replace newer results.
     generation: u64,
 }
@@ -724,6 +726,56 @@ fn search_notes(files: &[PathBuf], root: Option<&Path>, query: &str, limit: usiz
         }
     }
     hits
+}
+
+/// The text search's query that lists every tag instead of searching.
+const ALL_TAGS: &str = "#";
+
+/// Every tag in `files`, with how many notes use it, most used first: tags in the text (not
+/// in code or comments) and in the front matter's `tags`. Tags differing only in case are one.
+fn vault_tags(files: &[PathBuf]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+    for path in files.iter().filter(|path| crate::vault::is_markdown(path)) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        for block in crate::markdown::parse_with_options(&text, false).blocks {
+            let tags: Vec<String> = if block.kind == BlockKind::Metadata {
+                parse_properties(&block.text)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(Property::is_tags)
+                    .flat_map(|property| property.values)
+                    .map(|value| value.trim().trim_start_matches('#').to_owned())
+                    .collect()
+            } else {
+                block
+                    .spans
+                    .iter()
+                    .filter(|span| span.tag)
+                    .map(|span| {
+                        block.text[span.range.clone()]
+                            .trim_start_matches('#')
+                            .to_owned()
+                    })
+                    .collect()
+            };
+            for tag in tags.into_iter().filter(|tag| !tag.is_empty()) {
+                let key = tag.to_lowercase();
+                if seen.insert(key.clone()) {
+                    counts.entry(key).or_insert((tag, 0)).1 += 1;
+                }
+            }
+        }
+    }
+    let mut tags: Vec<(String, usize)> = counts.into_values().collect();
+    tags.sort_by(|(a, first), (b, second)| {
+        second
+            .cmp(first)
+            .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
+    tags
 }
 
 /// Lines of `files` (other notes of the vault at `root`) that link to `note`: wikilinks and
@@ -1493,6 +1545,9 @@ impl RusidianApp {
     /// Rows the switcher lists now.
     fn switcher_rows(&self) -> usize {
         match &self.switcher {
+            Some(switcher) if switcher.text && switcher.query.trim() == ALL_TAGS => {
+                switcher.tags.len()
+            }
             Some(switcher) if switcher.text => switcher.hits.len(),
             Some(_) => self.switcher_items().len(),
             None => 0,
@@ -1516,6 +1571,22 @@ impl RusidianApp {
         let files = self.switcher_files();
         let root = self.vault.as_ref().map(|vault| vault.root.clone());
         let executor = cx.background_executor().clone();
+        if query.trim() == ALL_TAGS {
+            cx.spawn(async move |this, cx| {
+                let tags = executor.spawn(async move { vault_tags(&files) }).await;
+                this.update(cx, |this, cx| {
+                    if let Some(switcher) = &mut this.switcher
+                        && switcher.generation == generation
+                    {
+                        switcher.tags = tags;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         cx.spawn(async move |this, cx| {
             executor.timer(std::time::Duration::from_millis(120)).await;
             let current = |this: &RusidianApp| {
@@ -1685,6 +1756,18 @@ impl RusidianApp {
         let selected = index
             .or_else(|| self.switcher.as_ref().map(|switcher| switcher.selected))
             .unwrap_or(0);
+        // A tag from the list of all tags: search for it.
+        if let Some(switcher) = &mut self.switcher
+            && switcher.text
+            && switcher.query.trim() == ALL_TAGS
+        {
+            if let Some((tag, _)) = switcher.tags.get(selected) {
+                switcher.query = format!("#{tag}");
+                self.search_text(cx);
+                cx.notify();
+            }
+            return;
+        }
         let target = match &self.switcher {
             Some(switcher) if switcher.text => switcher
                 .hits
@@ -4907,7 +4990,14 @@ impl RusidianApp {
             .when(!typed.is_empty(), |element| element.child(typed))
             .child(div().ml_px().w(px(2.0)).h(px(18.0)).bg(rgb(theme.accent)));
         // Each row: a title (note name), its folder, and for text hits the matching line.
-        let entries: Vec<(String, String, Option<String>)> = if switcher.text {
+        let all_tags = switcher.text && query.trim() == ALL_TAGS;
+        let entries: Vec<(String, String, Option<String>)> = if all_tags {
+            switcher
+                .tags
+                .iter()
+                .map(|(tag, notes)| (format!("#{tag}"), format!("{notes} 篇笔记"), None))
+                .collect()
+        } else if switcher.text {
             switcher
                 .hits
                 .iter()
@@ -5006,6 +5096,8 @@ impl RusidianApp {
             None
         } else if query.trim().is_empty() {
             (!switcher.text).then_some("没有可打开的笔记")
+        } else if all_tags {
+            Some("没有找到标签")
         } else if switcher.text {
             Some("没有找到这段文字")
         } else {
@@ -5066,8 +5158,10 @@ impl RusidianApp {
                             .border_color(rgb(theme.border))
                             .text_xs()
                             .text_color(rgb(theme.faint))
-                            .child(if switcher.text {
-                                "↑↓ 选择 · Enter 打开到该行 · Esc 关闭"
+                            .child(if all_tags {
+                                "↑↓ 选择 · Enter 搜索该标签 · Esc 关闭"
+                            } else if switcher.text {
+                                "↑↓ 选择 · Enter 打开到该行 · 只输入 # 列出所有标签 · Esc 关闭"
                             } else {
                                 "↑↓ 选择 · Enter 打开 · Esc 关闭"
                             }),
@@ -5345,7 +5439,7 @@ impl RusidianApp {
                     (format!("{command}P"), "按名称快速打开笔记".to_owned()),
                     (
                         format!("{command}{shift}F"),
-                        "在所有笔记中搜索文字".to_owned(),
+                        "在所有笔记中搜索文字（只输入 # 列出所有标签）".to_owned(),
                     ),
                     (
                         format!("{command}O / {command}{shift}O"),
@@ -8707,6 +8801,40 @@ mod tests {
         assert_eq!(fold_ranges(&blocks, &folded(&[id(1)])), vec![1..4]);
         assert_eq!(fold_ranges(&blocks, &folded(&[id(1), id(2)])), vec![1..4]);
         assert_eq!(fold_ranges(&blocks, &folded(&[id(2), id(4)])), [2..3, 4..5]);
+    }
+
+    #[test]
+    fn lists_the_vault_tags_by_use() {
+        let root = std::env::temp_dir().join(format!("rusidian-tags-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let note = |name: &str, text: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let files = [
+            note(
+                "a.md",
+                "---\ntags: [Project, idea]\n---\nBody #project #rust/gpui\n",
+            ),
+            note(
+                "b.md",
+                "---\ntags:\n  - idea\n---\n`#code` %%#hidden%% #Rust/GPUI\n",
+            ),
+            note("c.md", "```\n#fenced\n```\nNo tags here, issue #12.\n"),
+            note("d.txt", "#plain"),
+        ];
+        // A note counts once per tag, whatever the case; code, comments and other files do
+        // not count.
+        assert_eq!(
+            vault_tags(&files),
+            [
+                ("idea".to_owned(), 2),
+                ("rust/gpui".to_owned(), 2),
+                ("Project".to_owned(), 1),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
