@@ -203,6 +203,9 @@ struct RusidianApp {
     nvim_size: Rc<Cell<(i64, i64)>>,
     cell_size: Size<Pixels>,
     reading_cursor: ReadingCursor,
+    /// The reading cursor as last placed from Neovim's cursor; unchanged means Enter keeps
+    /// Neovim's exact position instead of moving it to the mapped character.
+    synced_cursor: Option<ReadingCursor>,
     reading_column: Option<usize>,
     reading_pending_g: bool,
     reading_count: Option<usize>,
@@ -316,6 +319,7 @@ impl RusidianApp {
             nvim_size: Rc::new(Cell::new((120, 40))),
             cell_size: size(px(SOURCE_FONT_SIZE * 0.6), px(SOURCE_LINE_HEIGHT)),
             reading_cursor: ReadingCursor::default(),
+            synced_cursor: None,
             reading_column: None,
             reading_pending_g: false,
             reading_count: None,
@@ -665,6 +669,21 @@ impl RusidianApp {
                             this.nvim_warning = Some(warning.into());
                             this.view = View::Source;
                             cx.notify();
+                        }
+                        NvimEvent::Cursor { line, column } => {
+                            if this.view == View::Reading
+                                && let Some(document) = &this.document
+                                && let Some(cursor) = reading_position(
+                                    &document.markdown.blocks,
+                                    source_offset(&document.lines, line, column),
+                                )
+                            {
+                                this.reading_cursor = cursor;
+                                this.reading_column = None;
+                                this.synced_cursor = Some(cursor);
+                                this.reveal_reading_cursor();
+                                cx.notify();
+                            }
                         }
                         NvimEvent::Exited => {
                             this.nvim = None;
@@ -1331,6 +1350,12 @@ impl RusidianApp {
         }
         if let Some(nvim) = &self.nvim {
             nvim.input("<Esc>");
+            if self.synced_cursor != Some(self.reading_cursor)
+                && let Some(document) = &self.document
+                && let Some((line, column)) = source_position(document, self.reading_cursor)
+            {
+                nvim.set_cursor(line, column);
+            }
         }
         cx.notify();
     }
@@ -1602,6 +1627,9 @@ impl RusidianApp {
             && (self.grid.is_normal() || self.nvim_error.is_some() || self.nvim.is_none())
         {
             self.view = View::Reading;
+            if let Some(nvim) = &self.nvim {
+                nvim.query_cursor();
+            }
             self.compile_visuals(cx);
             cx.notify();
         } else if self.grid.accepts_text_input()
@@ -3267,6 +3295,69 @@ fn render_inline_paragraph(
         .into_any_element()
 }
 
+/// Zero-based line and byte column in the source for a reading-view position.
+fn source_position(document: &Document, cursor: ReadingCursor) -> Option<(usize, usize)> {
+    let block = document.markdown.blocks.get(cursor.block)?;
+    let byte = if is_object(block) {
+        0
+    } else {
+        text_range(&block.text, cursor.offset)?.start
+    };
+    let offset = block.source_offset(byte)?;
+    let mut remaining = offset;
+    for (index, line) in document.lines.iter().enumerate() {
+        if remaining <= line.len() {
+            return Some((index, remaining));
+        }
+        remaining -= line.len() + 1;
+    }
+    let last = document.lines.len().saturating_sub(1);
+    Some((last, document.lines.get(last).map_or(0, String::len)))
+}
+
+/// Byte offset in `lines.join("\n")` for a zero-based line and byte column.
+fn source_offset(lines: &[String], line: usize, column: usize) -> usize {
+    let line = line.min(lines.len().saturating_sub(1));
+    lines[..line]
+        .iter()
+        .map(|text| text.len() + 1)
+        .sum::<usize>()
+        + column.min(lines.get(line).map_or(0, String::len))
+}
+
+/// The reading position showing source byte `offset`, or the next visible character after it.
+fn reading_position(blocks: &[Block], offset: usize) -> Option<ReadingCursor> {
+    for (index, block) in blocks.iter().enumerate() {
+        let length = block_len(block);
+        if length == 0 {
+            continue;
+        }
+        if let Some(byte) = block.text_offset(offset) {
+            let offset = if is_object(block) {
+                0
+            } else {
+                block.text[..byte]
+                    .chars()
+                    .filter(|character| *character != '\n')
+                    .count()
+                    .min(length - 1)
+            };
+            return Some(ReadingCursor {
+                block: index,
+                offset,
+            });
+        }
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .rfind(|(_, block)| block_len(block) > 0)
+        .map(|(block, value)| ReadingCursor {
+            block,
+            offset: block_len(value) - 1,
+        })
+}
+
 fn is_external_link(destination: &str) -> bool {
     destination.contains("://") || destination.starts_with("mailto:")
 }
@@ -3928,6 +4019,56 @@ mod tests {
         );
         let vault = RusidianApp::open(Some(Path::new("examples")));
         assert!(vault.window_title().ends_with(" — examples"));
+    }
+
+    #[test]
+    fn maps_reading_positions_to_source_and_back() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        let source = "# Title\n\nSome **bold** and `code`.\n\n$$x^2$$\n\n- item\n";
+        let document = app.document.as_mut().unwrap();
+        document.lines = source_lines(source);
+        document.parse(false);
+        let document = app.document.as_ref().unwrap();
+        let blocks = &document.markdown.blocks;
+        // "b" of "bold" is the sixth visible character of the paragraph.
+        let bold = ReadingCursor {
+            block: 1,
+            offset: 5,
+        };
+        assert_eq!(source_position(document, bold), Some((2, 7)));
+        assert_eq!(
+            reading_position(blocks, source_offset(&document.lines, 2, 7)),
+            Some(bold)
+        );
+        // Hidden markup maps forward to the next visible character.
+        assert_eq!(
+            reading_position(blocks, source_offset(&document.lines, 2, 5)),
+            Some(bold)
+        );
+        assert_eq!(
+            reading_position(blocks, source_offset(&document.lines, 0, 0)),
+            Some(ReadingCursor::default())
+        );
+        let math = ReadingCursor {
+            block: 2,
+            offset: 0,
+        };
+        assert_eq!(
+            reading_position(blocks, source_offset(&document.lines, 4, 3)),
+            Some(math)
+        );
+        assert_eq!(source_position(document, math), Some((4, 2)));
+        assert_eq!(
+            reading_position(blocks, source_offset(&document.lines, 6, 4)),
+            Some(ReadingCursor {
+                block: 3,
+                offset: 2
+            })
+        );
+        assert_eq!(
+            source_offset(&document.lines, 99, 99),
+            source.trim_end().len()
+        );
     }
 
     #[test]

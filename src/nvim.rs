@@ -33,12 +33,20 @@ pub enum Event {
     Warning(String),
     Error(String),
     CloseRefused(String),
+    /// The cursor of the current window: zero-based line and byte column.
+    Cursor {
+        line: usize,
+        column: usize,
+    },
     Exited,
 }
 
 enum Command {
     Input(String),
     Resize(i64, i64),
+    /// Zero-based line and byte column.
+    SetCursor(usize, usize),
+    QueryCursor,
     Close,
 }
 
@@ -236,6 +244,27 @@ impl Client {
                                     .await;
                             }
                         }
+                        Command::SetCursor(line, column) => {
+                            // The buffer may have changed since the position was computed; a
+                            // rejected position just leaves the cursor where it was.
+                            if let Ok(window) = nvim.get_current_win().await {
+                                let line = line as i64 + 1;
+                                let lines = buffer.line_count().await.unwrap_or(line);
+                                let _ = window.set_cursor((line.min(lines), column as i64)).await;
+                            }
+                        }
+                        Command::QueryCursor => {
+                            if let Ok(window) = nvim.get_current_win().await
+                                && let Ok((line, column)) = window.get_cursor().await
+                            {
+                                let _ = event_sender
+                                    .send(Event::Cursor {
+                                        line: (line - 1).max(0) as usize,
+                                        column: column.max(0) as usize,
+                                    })
+                                    .await;
+                            }
+                        }
                         Command::Resize(width, height) => {
                             if let Err(error) = nvim.ui_try_resize(width, height).await {
                                 let _ = event_sender
@@ -259,6 +288,14 @@ impl Client {
 
     pub fn input_text(&self, text: &str) {
         self.input(text.replace('<', "<lt>"));
+    }
+
+    pub fn set_cursor(&self, line: usize, column: usize) {
+        let _ = self.commands.send(Command::SetCursor(line, column));
+    }
+
+    pub fn query_cursor(&self) {
+        let _ = self.commands.send(Command::QueryCursor);
     }
 
     pub fn close(&self) -> bool {
@@ -1045,7 +1082,7 @@ mod tests {
                                     break grid;
                                 }
                             }
-                            Event::Warning(_) => {}
+                            Event::Warning(_) | Event::Cursor { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1068,7 +1105,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) => {}
+                            Event::Warning(_) | Event::Cursor { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1090,7 +1127,7 @@ mod tests {
                                 mode.clone_from(&grid.mode);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) => {}
+                            Event::Warning(_) | Event::Cursor { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1112,7 +1149,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) => {}
+                            Event::Warning(_) | Event::Cursor { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1132,7 +1169,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) => {}
+                            Event::Warning(_) | Event::Cursor { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }

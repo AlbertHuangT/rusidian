@@ -20,6 +20,17 @@ pub struct Block {
     pub quote_depth: usize,
     pub cells: Vec<Range<usize>>,
     pub table_alignments: Vec<Alignment>,
+    /// Where each piece of `text` came from in the Markdown source, in text order.
+    pub source_map: Vec<SourceSpan>,
+}
+
+/// A run of rendered text and the source bytes it was produced from.
+#[derive(Debug, PartialEq)]
+pub struct SourceSpan {
+    pub text: Range<usize>,
+    pub source: Range<usize>,
+    /// The source repeats the text byte for byte, so offsets inside map one to one.
+    pub exact: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -101,7 +112,8 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     let mut table_alignments = Vec::new();
     let mut footnote: Option<String> = None;
 
-    for event in Parser::new_ext(source, Options::all()) {
+    for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+        let before = current.as_ref().map(|block: &Block| block.text.len());
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph if current.is_none() => {
@@ -288,6 +300,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 push_current(&mut blocks, &mut current);
                 let mut block = new_block(BlockKind::Math, quote_depth, &mut items);
                 block.push(&text, false, false, false, false, None);
+                block.map_source(0..block.text.len(), source, range.clone());
                 blocks.push(block);
             }
             Event::SoftBreak => {
@@ -326,6 +339,12 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     .push(&format!("[^{label}]"), false, false, false, false, None);
             }
         }
+        if let Some(block) = &mut current {
+            let start = before.unwrap_or(0);
+            if block.text.len() > start {
+                block.map_source(start..block.text.len(), source, range);
+            }
+        }
     }
 
     push_current(&mut blocks, &mut current);
@@ -346,6 +365,7 @@ fn new_block(kind: BlockKind, quote_depth: usize, items: &mut [ItemState]) -> Bl
         quote_depth,
         cells: Vec::new(),
         table_alignments: Vec::new(),
+        source_map: Vec::new(),
     };
     if let Some(item) = items.last_mut()
         && !item.used
@@ -432,12 +452,92 @@ impl Block {
                 span.range.end = span.range.end.min(end);
             }
             self.spans.retain(|span| !span.range.is_empty());
+            for span in &mut self.source_map {
+                if span.text.end > end {
+                    if span.exact {
+                        span.source.end -= span.text.end - end;
+                    }
+                    span.text.end = end;
+                }
+            }
+            self.source_map.retain(|span| !span.text.is_empty());
         }
         if self.kind == BlockKind::Paragraph && self.text == "\u{fffc}" && self.images.len() == 1 {
             let image = self.images.pop().unwrap();
             self.kind = BlockKind::Image(image.source);
             self.text = image.alt;
+            let source = self
+                .source_map
+                .first()
+                .map_or(0..0, |span| span.source.clone());
+            self.source_map = vec![SourceSpan {
+                text: 0..self.text.len(),
+                source,
+                exact: false,
+            }];
         }
+    }
+}
+
+impl Block {
+    fn map_source(&mut self, text: Range<usize>, source: &str, range: Range<usize>) {
+        let shown = &self.text[text.clone()];
+        let raw = source.get(range.clone()).unwrap_or_default();
+        let (source, exact) = if raw == shown {
+            (range, true)
+        } else if let Some(at) = raw.find(shown).filter(|_| !shown.is_empty()) {
+            (range.start + at..range.start + at + shown.len(), true)
+        } else {
+            (range, false)
+        };
+        self.source_map.push(SourceSpan {
+            text,
+            source,
+            exact,
+        });
+    }
+
+    /// The source byte for the text byte `byte`; hidden markup and objects map to their start.
+    pub fn source_offset(&self, byte: usize) -> Option<usize> {
+        if let Some(span) = self
+            .source_map
+            .iter()
+            .find(|span| span.text.contains(&byte))
+        {
+            return Some(if span.exact {
+                span.source.start + (byte - span.text.start)
+            } else {
+                span.source.start
+            });
+        }
+        self.source_map
+            .iter()
+            .find(|span| span.text.start >= byte)
+            .or(self.source_map.last())
+            .map(|span| span.source.start)
+    }
+
+    /// The text byte shown for source byte `offset`, or the next visible text after it when the
+    /// offset is on hidden markup. `None` if the block ends before `offset`.
+    pub fn text_offset(&self, offset: usize) -> Option<usize> {
+        if let Some(span) = self
+            .source_map
+            .iter()
+            .find(|span| span.source.contains(&offset))
+        {
+            if !span.exact {
+                return Some(span.text.start);
+            }
+            let mut byte = (span.text.start + offset - span.source.start).min(span.text.end);
+            while !self.text.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            return Some(byte);
+        }
+        self.source_map
+            .iter()
+            .find(|span| span.source.start > offset)
+            .map(|span| span.text.start)
     }
 }
 
@@ -541,6 +641,24 @@ mod tests {
         assert_eq!(parse("a\nb").blocks[0].text, "a\nb");
         assert_eq!(parse_with_options("a\nb", true).blocks[0].text, "a b");
         assert_eq!(parse_with_options("a  \nb", true).blocks[0].text, "a\nb");
+
+        let mapped = parse("# Title\n\nSome **bold** and `code` text.\n");
+        let paragraph = &mapped.blocks[1];
+        let source = "# Title\n\nSome **bold** and `code` text.\n";
+        let bold = paragraph.text.find("bold").unwrap();
+        assert_eq!(paragraph.source_offset(bold), source.find("bold"));
+        let code = paragraph.text.find("code").unwrap();
+        assert_eq!(
+            paragraph.source_offset(code + 1),
+            Some(source.find("code").unwrap() + 1)
+        );
+        // The `**` before "bold" is hidden; it maps forward to the bold text.
+        assert_eq!(
+            paragraph.text_offset(source.find("**").unwrap()),
+            Some(bold)
+        );
+        assert_eq!(mapped.blocks[0].text_offset(0), Some(0));
+        assert_eq!(mapped.blocks[0].source_offset(0), Some(2));
 
         let wiki = parse("[[目标笔记|显示名称]]");
         assert_eq!(wiki.blocks[0].text, "显示名称");
