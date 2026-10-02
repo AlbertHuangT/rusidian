@@ -3,7 +3,7 @@ use crate::math::{FONT_SIZE, Formula};
 use crate::nvim::{Client as NvimClient, CursorShape, Event as NvimEvent, Grid as NvimGrid};
 use crate::theme::{Appearance, Theme};
 use crate::update;
-use crate::vault::Vault;
+use crate::vault::{TreeRow, Vault};
 use cargo_packager_updater::Update;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
@@ -41,6 +41,7 @@ actions!(
         OpenSettings,
         Quit,
         CloseWindow,
+        ToggleSidebar,
         EnterSourceNormal
     ]
 );
@@ -59,6 +60,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
         KeyBinding::new(&format!("{modifier}-q"), Quit, context),
         KeyBinding::new(&format!("{modifier}-w"), CloseWindow, context),
+        KeyBinding::new(&format!("{modifier}-\\"), ToggleSidebar, context),
         KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
     ]
 }
@@ -98,6 +100,7 @@ pub fn run(initial_path: Option<PathBuf>) {
                 MenuItem::separator(),
                 MenuItem::action("关闭窗口", CloseWindow),
             ]),
+            Menu::new("显示").items([MenuItem::action("显示/隐藏文件列表", ToggleSidebar)]),
         ]);
 
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
@@ -249,6 +252,10 @@ struct RusidianApp {
     settings_open: bool,
     appearance: Appearance,
     recent: Vec<PathBuf>,
+    sidebar_visible: bool,
+    expanded_folders: HashSet<PathBuf>,
+    /// The note whose folders were last expanded in the tree.
+    revealed_in_tree: Option<PathBuf>,
     /// Resolved at the start of every render from `appearance` and the window's appearance.
     theme: Theme,
     /// A transient message for the status bar, such as a failed link or a completed copy.
@@ -370,6 +377,9 @@ impl RusidianApp {
             settings_open: false,
             appearance: crate::settings::load().appearance,
             recent: crate::settings::load().recent,
+            sidebar_visible: true,
+            expanded_folders: HashSet::new(),
+            revealed_in_tree: None,
             theme: Theme::DARK,
             notice: None,
             notice_generation: 0,
@@ -402,6 +412,7 @@ impl RusidianApp {
 
         match std::fs::read_to_string(path) {
             Ok(content) => {
+                let path = &path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
                 let mut document = Document {
                     file: path.to_path_buf(),
                     name: path
@@ -868,6 +879,8 @@ impl RusidianApp {
         next.settings_open = self.settings_open;
         next.appearance = self.appearance;
         next.recent = std::mem::take(&mut self.recent);
+        next.sidebar_visible = self.sidebar_visible;
+        next.expanded_folders = std::mem::take(&mut self.expanded_folders);
         next.theme = self.theme;
         next.auto_update = self.auto_update;
         next.update_status = std::mem::replace(&mut self.update_status, UpdateStatus::Idle);
@@ -2985,7 +2998,22 @@ impl Render for RusidianApp {
         } else {
             reading
         };
-        let body = if let Some(vault) = &self.vault {
+        if let Some(document) = &self.document
+            && self.revealed_in_tree.as_ref() != Some(&document.file)
+        {
+            // Open the folders containing a newly shown note; later collapses are kept.
+            let file = document.file.clone();
+            if let Some(vault) = &self.vault {
+                self.expanded_folders.extend(
+                    file.ancestors()
+                        .skip(1)
+                        .take_while(|folder| *folder != vault.root)
+                        .map(Path::to_path_buf),
+                );
+            }
+            self.revealed_in_tree = Some(file);
+        }
+        let body = if let Some(vault) = self.vault.as_ref().filter(|_| self.sidebar_visible) {
             let current = self
                 .document
                 .as_ref()
@@ -3006,6 +3034,65 @@ impl Render for RusidianApp {
                 }
             )
             .into();
+            let rows = vault
+                .tree_rows(&self.expanded_folders)
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let (depth, label, selected) = match &row {
+                        TreeRow::Folder {
+                            name,
+                            depth,
+                            expanded,
+                            ..
+                        } => (
+                            *depth,
+                            format!("{} {name}", if *expanded { "▾" } else { "▸" }),
+                            false,
+                        ),
+                        TreeRow::Note { path, name, depth } => {
+                            (*depth, name.clone(), current == Some(path.as_path()))
+                        }
+                    };
+                    let is_folder = matches!(row, TreeRow::Folder { .. });
+                    let vault_root = root.clone();
+                    div()
+                        .id(("vault-row", index))
+                        .pl(px(12.0 + depth as f32 * 14.0))
+                        .pr_3()
+                        .py_1()
+                        .text_sm()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .cursor_pointer()
+                        .when(is_folder, |element| element.text_color(rgb(theme.muted)))
+                        .when(selected, |element| {
+                            element
+                                .bg(rgb(theme.accent_soft_bg))
+                                .text_color(rgb(theme.accent_soft_text))
+                        })
+                        .when(!selected, |element| {
+                            element.hover(|element| element.bg(rgb(theme.hover)))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| match &row {
+                            TreeRow::Folder { path, .. } => {
+                                if !this.expanded_folders.remove(path) {
+                                    this.expanded_folders.insert(path.clone());
+                                }
+                                cx.notify();
+                            }
+                            TreeRow::Note { path, .. } => this.request_close(
+                                PendingClose::Open {
+                                    path: path.clone(),
+                                    vault_root: Some(vault_root.clone()),
+                                    fragment: None,
+                                },
+                                cx,
+                            ),
+                        }))
+                        .child(label)
+                });
             div()
                 .flex_1()
                 .flex()
@@ -3025,6 +3112,9 @@ impl Render for RusidianApp {
                                 .px_3()
                                 .flex()
                                 .items_center()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(name),
                         )
@@ -3033,39 +3123,8 @@ impl Render for RusidianApp {
                                 .flex_1()
                                 .id("vault-files")
                                 .overflow_y_scroll()
-                                .children(vault.files.iter().enumerate().map(|(index, path)| {
-                                    let selected = current == Some(path.as_path());
-                                    let file = path.clone();
-                                    let vault_root = root.clone();
-                                    let label: SharedString = path
-                                        .strip_prefix(&root)
-                                        .unwrap_or(path)
-                                        .to_string_lossy()
-                                        .into_owned()
-                                        .into();
-                                    div()
-                                        .id(("vault-file", index))
-                                        .px_3()
-                                        .py_2()
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .when(selected, |element| {
-                                            element
-                                                .bg(rgb(theme.accent_soft_bg))
-                                                .text_color(rgb(theme.accent_soft_text))
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.request_close(
-                                                PendingClose::Open {
-                                                    path: file.clone(),
-                                                    vault_root: Some(vault_root.clone()),
-                                                    fragment: None,
-                                                },
-                                                cx,
-                                            );
-                                        }))
-                                        .child(label)
-                                })),
+                                .pb_2()
+                                .children(rows),
                         ),
                 )
                 .child(body)
@@ -3085,6 +3144,10 @@ impl Render for RusidianApp {
             .on_action(cx.listener(Self::choose_file))
             .on_action(cx.listener(Self::choose_folder))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.sidebar_visible = !this.sidebar_visible;
+                cx.notify();
+            }))
             .on_action(cx.listener(Self::enter_source_normal))
             .on_key_down(cx.listener(Self::key_down))
             .flex()

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -28,6 +28,8 @@ pub struct ObsidianSettings {
 
 impl Vault {
     pub fn open(root: &Path) -> io::Result<Self> {
+        // Absolute paths keep note and tree comparisons independent of how the vault was named.
+        let root = &root.canonicalize()?;
         let config = root.join(".obsidian/app.json");
         let settings: ObsidianSettings = fs::read_to_string(&config)
             .ok()
@@ -80,6 +82,94 @@ impl Vault {
             [only] => Some(only.clone()),
             _ => None,
         }
+    }
+}
+
+/// One visible row of the vault's file tree.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeRow {
+    Folder {
+        path: PathBuf,
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    Note {
+        path: PathBuf,
+        name: String,
+        depth: usize,
+    },
+}
+
+#[derive(Default)]
+struct TreeFolder {
+    /// Keyed by lowercase name so folders sort case-insensitively, like Obsidian.
+    folders: BTreeMap<String, (String, TreeFolder)>,
+    notes: BTreeMap<String, (String, PathBuf)>,
+}
+
+impl Vault {
+    /// Folders first, then notes, each sorted by name; children of collapsed folders are hidden.
+    pub fn tree_rows(&self, expanded: &HashSet<PathBuf>) -> Vec<TreeRow> {
+        let mut tree = TreeFolder::default();
+        for file in &self.files {
+            let Ok(relative) = file.strip_prefix(&self.root) else {
+                continue;
+            };
+            let mut folder = &mut tree;
+            let components = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let Some((name, parents)) = components.split_last() else {
+                continue;
+            };
+            for parent in parents {
+                folder = &mut folder
+                    .folders
+                    .entry(parent.to_lowercase())
+                    .or_insert_with(|| (parent.clone(), TreeFolder::default()))
+                    .1;
+            }
+            let stem = Path::new(name)
+                .file_stem()
+                .map_or_else(|| name.clone(), |stem| stem.to_string_lossy().into_owned());
+            folder
+                .notes
+                .insert(name.to_lowercase(), (stem, file.clone()));
+        }
+        let mut rows = Vec::new();
+        flatten(&tree, &self.root, 0, expanded, &mut rows);
+        rows
+    }
+}
+
+fn flatten(
+    folder: &TreeFolder,
+    path: &Path,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    rows: &mut Vec<TreeRow>,
+) {
+    for (name, child) in folder.folders.values() {
+        let path = path.join(name);
+        let open = expanded.contains(&path);
+        rows.push(TreeRow::Folder {
+            path: path.clone(),
+            name: name.clone(),
+            depth,
+            expanded: open,
+        });
+        if open {
+            flatten(child, &path, depth + 1, expanded, rows);
+        }
+    }
+    for (name, path) in folder.notes.values() {
+        rows.push(TreeRow::Note {
+            path: path.clone(),
+            name: name.clone(),
+            depth,
+        });
     }
 }
 
@@ -234,6 +324,8 @@ mod tests {
             r#"{"strictLineBreaks":true,"alwaysUpdateLinks":true,"userIgnoreFilters":["Templates/","/regex/"]}"#,
         )
         .unwrap();
+        // The vault stores canonical paths; macOS temp folders sit behind a symlink.
+        let root = root.canonicalize().unwrap();
 
         let vault = Vault::open(&root).unwrap();
         assert_eq!(
@@ -289,6 +381,52 @@ mod tests {
         );
         assert_eq!(enclosing_vault_root(Path::new("examples/tikz.md")), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn builds_a_folder_first_collapsible_tree() {
+        let root = PathBuf::from("/vault");
+        let vault = Vault {
+            files: [
+                "zeta.md",
+                "Alpha.md",
+                "notes/b.md",
+                "notes/deep/c.md",
+                "Archive/old.md",
+            ]
+            .iter()
+            .map(|file| root.join(file))
+            .collect(),
+            root: root.clone(),
+            by_name: HashMap::new(),
+            is_obsidian: false,
+            settings: ObsidianSettings::default(),
+        };
+        let names = |rows: Vec<TreeRow>| {
+            rows.into_iter()
+                .map(|row| match row {
+                    TreeRow::Folder { name, depth, .. } => format!("{depth}:{name}/"),
+                    TreeRow::Note { name, depth, .. } => format!("{depth}:{name}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(vault.tree_rows(&HashSet::new())),
+            ["0:Archive/", "0:notes/", "0:Alpha", "0:zeta"]
+        );
+        let expanded = HashSet::from([root.join("notes"), root.join("notes/deep")]);
+        assert_eq!(
+            names(vault.tree_rows(&expanded)),
+            [
+                "0:Archive/",
+                "0:notes/",
+                "1:deep/",
+                "2:c",
+                "1:b",
+                "0:Alpha",
+                "0:zeta"
+            ]
+        );
     }
 
     #[test]
