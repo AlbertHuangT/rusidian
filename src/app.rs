@@ -8091,7 +8091,8 @@ fn cursor_for_line(
     for (line, text) in block.text.split('\n').enumerate() {
         let length = text.chars().count();
         if line == target_line {
-            return (length > 0).then_some(ReadingCursor {
+            // Lazily: an empty line has no last column.
+            return (length > 0).then(|| ReadingCursor {
                 block: block_index,
                 offset: offset + column.min(length - 1),
             });
@@ -8745,6 +8746,153 @@ mod tests {
         // Consecutive letters in the name beat scattered ones in folders.
         assert!(score("plan", "", "plan") > score("plan", "people/landing/", "notes"));
         assert!(score("日记", "Daily/", "2026 日记") > score("日记", "日/", "记录"));
+    }
+
+    /// Random notes and reading motions: the cursor stays on a block and nothing panics.
+    #[test]
+    #[ignore = "slow: random inputs"]
+    fn moves_through_random_notes_without_panicking() {
+        let pieces = [
+            "%%",
+            "[[",
+            "]]",
+            "![[",
+            "|",
+            "#",
+            "^id",
+            "> ",
+            "> [!note]- ",
+            "> [!tip]+ x",
+            "- ",
+            "- [ ] ",
+            "- [/] ",
+            "1. ",
+            "$",
+            "$$",
+            "==",
+            "**",
+            "*",
+            "_",
+            "~~",
+            "`",
+            "```",
+            "\n",
+            "\n\n",
+            "\t",
+            "    ",
+            "中文",
+            "😀",
+            "é",
+            "a",
+            "b c",
+            "http://x.y/z",
+            "#tag",
+            "[^1]",
+            "[^1]: ",
+            "<span>",
+            "---\n",
+            "|a|b|\n|-|-|\n",
+            "\\",
+            "[x](y.md)",
+            "![i](p.png)",
+            "%",
+            "]",
+            "[",
+            "\u{200b}",
+            "^",
+            "> > ",
+            "* * *",
+            "\n> ",
+            "\n- ",
+        ];
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut app = RusidianApp::open(Some(Path::new("examples/markdown.md")));
+        for round in 0..10000 {
+            let count = (next() % 60) as usize;
+            let mut source = String::new();
+            for _ in 0..count {
+                source.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            {
+                let document = app.document.as_mut().unwrap();
+                document.lines = source.split('\n').map(str::to_owned).collect();
+                document.parse(round % 2 == 0);
+            }
+            let blocks_len = app.document.as_ref().unwrap().markdown.blocks.len();
+            app.reading_cursor = initial_cursor(&app.document.as_ref().unwrap().markdown.blocks);
+            app.reading_selection = None;
+            app.reading_column = None;
+            app.callout_toggles.clear();
+            app.callout_cursor_parked = None;
+            for id in 0..4 {
+                if next() % 2 == 0 {
+                    app.callout_toggles.insert(id);
+                }
+            }
+            for _ in 0..80 {
+                match next() % 16 {
+                    0 => app.move_reading_line(true),
+                    1 => app.move_reading_line(false),
+                    2 => app.move_reading_cursor(true),
+                    3 => app.move_reading_cursor(false),
+                    4 => app.move_reading_word(WordMotion::Next),
+                    5 => app.move_reading_word(WordMotion::Previous),
+                    6 => app.move_reading_word(WordMotion::End),
+                    7 => app.move_reading_line_edge(true),
+                    8 => app.move_reading_line_edge(false),
+                    9 => app.move_reading_first_nonblank(),
+                    10 => app.move_reading_document_edge(next() % 2 == 0),
+                    11 => {
+                        app.reading_selection = Some(ReadingSelection {
+                            anchor: app.reading_cursor,
+                            linewise: next() % 2 == 0,
+                        })
+                    }
+                    12 => {
+                        if let Some(selection) = app.reading_selection {
+                            let _ = app.selected_clipboard(selection);
+                        }
+                    }
+                    13 => {
+                        let blocks = &app.document.as_ref().unwrap().markdown.blocks;
+                        let target = ['a', 'b', '中', ' ', '|', 'é'][(next() % 6) as usize];
+                        let find = FindPending {
+                            forward: next() % 2 == 0,
+                            till: next() % 2 == 0,
+                        };
+                        if let Some(cursor) =
+                            find_character(blocks, app.reading_cursor, target, find, 2)
+                        {
+                            app.reading_cursor = cursor;
+                        }
+                        let _ = word_under_cursor(blocks, app.reading_cursor);
+                    }
+                    14 => app.rest_on_fold(),
+                    _ => {
+                        let document = app.document.as_ref().unwrap();
+                        let line = (next() as usize) % (document.lines.len() + 1);
+                        let column = (next() as usize) % 8;
+                        let offset = source_offset(&document.lines, line, column);
+                        if let Some(cursor) = reading_position(&document.markdown.blocks, offset) {
+                            app.reading_cursor = cursor;
+                        }
+                    }
+                }
+                let blocks = &app.document.as_ref().unwrap().markdown.blocks;
+                if blocks_len > 0 {
+                    assert!(app.reading_cursor.block < blocks_len, "{source:?}");
+                }
+                if let Some(selection) = app.reading_selection {
+                    let _ = selection_bounds(blocks, selection, app.reading_cursor);
+                }
+            }
+        }
     }
 
     #[test]
