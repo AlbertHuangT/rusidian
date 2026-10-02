@@ -12,8 +12,8 @@ use gpui::{
     KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
     SharedString, Size, StrikethroughStyle, StyledText, TextLayout, UTF16Selection, UnderlineStyle,
-    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*,
-    px, rgb, rgba, size,
+    ScrollStrategy, UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list,
 };
 use gpui_platform::application;
 use std::{
@@ -424,6 +424,10 @@ struct RusidianApp {
     recent: Vec<PathBuf>,
     sidebar_visible: bool,
     expanded_folders: HashSet<PathBuf>,
+    /// The tree's rows for the current vault and expanded folders, built once until either
+    /// changes: large vaults made rebuilding it every frame slow.
+    tree_rows: RefCell<Option<Rc<Vec<TreeRow>>>>,
+    tree_scroll: UniformListScrollHandle,
     /// The note whose folders were last expanded in the tree.
     revealed_in_tree: Option<PathBuf>,
     /// Resolved at the start of every render from `appearance` and the window's appearance.
@@ -796,6 +800,8 @@ impl RusidianApp {
             recent: settings.recent,
             sidebar_visible: true,
             expanded_folders: HashSet::new(),
+            tree_rows: RefCell::new(None),
+            tree_scroll: UniformListScrollHandle::new(),
             revealed_in_tree: None,
             theme: Theme::DARK,
             notice: None,
@@ -873,6 +879,7 @@ impl RusidianApp {
     }
 
     fn attach_vault(&mut self, vault: Vault) {
+        self.tree_rows.replace(None);
         if let Some(document) = &mut self.document {
             document.parse(vault.settings.strict_line_breaks);
         }
@@ -1867,6 +1874,21 @@ impl RusidianApp {
         });
     }
 
+    /// The vault tree's visible rows, built when the vault or expanded folders changed.
+    fn tree(&self) -> Rc<Vec<TreeRow>> {
+        if let Some(rows) = self.tree_rows.borrow().as_ref() {
+            return rows.clone();
+        }
+        let rows = Rc::new(
+            self.vault
+                .as_ref()
+                .map(|vault| vault.tree_rows(&self.expanded_folders))
+                .unwrap_or_default(),
+        );
+        self.tree_rows.replace(Some(rows.clone()));
+        rows
+    }
+
     /// Forget measured block heights after anything that can change a block's size: the
     /// note's text, or a formula, diagram, image or embed finishing loading.
     fn invalidate_block_heights(&self) {
@@ -2194,6 +2216,7 @@ impl RusidianApp {
                         .is_some_and(|current| current.root == root)
                     {
                         this.vault = Some(vault);
+                        this.tree_rows.replace(None);
                         // Links and backlinks may now resolve differently.
                         this.find_unresolved_links();
                         this.load_backlinks(true, cx);
@@ -5232,6 +5255,12 @@ impl Render for RusidianApp {
                         .take_while(|folder| *folder != vault.root)
                         .map(Path::to_path_buf),
                 );
+                self.tree_rows.replace(None);
+                if let Some(index) = self.tree().iter().position(
+                    |row| matches!(row, TreeRow::Note { path, .. } if same_file(path, &file)),
+                ) {
+                    self.tree_scroll.scroll_to_item(index, ScrollStrategy::Center);
+                }
             }
             self.revealed_in_tree = Some(file);
         }
@@ -5256,65 +5285,79 @@ impl Render for RusidianApp {
                 }
             )
             .into();
-            let rows = vault
-                .tree_rows(&self.expanded_folders)
-                .into_iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let (depth, label, selected) = match &row {
-                        TreeRow::Folder {
-                            name,
-                            depth,
-                            expanded,
-                            ..
-                        } => (
-                            *depth,
-                            format!("{} {name}", if *expanded { "▾" } else { "▸" }),
-                            false,
-                        ),
-                        TreeRow::Note { path, name, depth } => {
-                            (*depth, name.clone(), current == Some(path.as_path()))
-                        }
-                    };
-                    let is_folder = matches!(row, TreeRow::Folder { .. });
-                    let vault_root = root.clone();
-                    div()
-                        .id(("vault-row", index))
-                        .pl(px(12.0 + depth as f32 * 14.0))
-                        .pr_3()
-                        .py_1()
-                        .text_sm()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .cursor_pointer()
-                        .when(is_folder, |element| element.text_color(rgb(theme.muted)))
-                        .when(selected, |element| {
-                            element
-                                .bg(rgb(theme.accent_soft_bg))
-                                .text_color(rgb(theme.accent_soft_text))
-                        })
-                        .when(!selected, |element| {
-                            element.hover(|element| element.bg(rgb(theme.hover)))
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| match &row {
-                            TreeRow::Folder { path, .. } => {
-                                if !this.expanded_folders.remove(path) {
-                                    this.expanded_folders.insert(path.clone());
-                                }
-                                cx.notify();
-                            }
-                            TreeRow::Note { path, .. } => this.request_close(
-                                PendingClose::Open {
-                                    path: path.clone(),
-                                    vault_root: Some(vault_root.clone()),
-                                    fragment: None,
-                                },
-                                cx,
+            // Only the rows in view are built: a vault folder can hold thousands of notes.
+            let rows = self.tree();
+            let row_count = rows.len();
+            let current = current.map(Path::to_path_buf);
+            let view = cx.entity().downgrade();
+            let tree = uniform_list("vault-files", row_count, move |range, _, _| {
+                range
+                    .map(|index| {
+                        let row = rows[index].clone();
+                        let (depth, label, selected) = match &row {
+                            TreeRow::Folder {
+                                name,
+                                depth,
+                                expanded,
+                                ..
+                            } => (
+                                *depth,
+                                format!("{} {name}", if *expanded { "▾" } else { "▸" }),
+                                false,
                             ),
-                        }))
-                        .child(label)
-                });
+                            TreeRow::Note { path, name, depth } => {
+                                (*depth, name.clone(), current.as_ref() == Some(path))
+                            }
+                        };
+                        let is_folder = matches!(row, TreeRow::Folder { .. });
+                        let vault_root = root.clone();
+                        let view = view.clone();
+                        div()
+                            .id(("vault-row", index))
+                            .pl(px(12.0 + depth as f32 * 14.0))
+                            .pr_3()
+                            .py_1()
+                            .text_sm()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .cursor_pointer()
+                            .when(is_folder, |element| element.text_color(rgb(theme.muted)))
+                            .when(selected, |element| {
+                                element
+                                    .bg(rgb(theme.accent_soft_bg))
+                                    .text_color(rgb(theme.accent_soft_text))
+                            })
+                            .when(!selected, |element| {
+                                element.hover(|element| element.bg(rgb(theme.hover)))
+                            })
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| match &row {
+                                    TreeRow::Folder { path, .. } => {
+                                        if !this.expanded_folders.remove(path) {
+                                            this.expanded_folders.insert(path.clone());
+                                        }
+                                        this.tree_rows.replace(None);
+                                        cx.notify();
+                                    }
+                                    TreeRow::Note { path, .. } => this.request_close(
+                                        PendingClose::Open {
+                                            path: path.clone(),
+                                            vault_root: Some(vault_root.clone()),
+                                            fragment: None,
+                                        },
+                                        cx,
+                                    ),
+                                })
+                                .ok();
+                            })
+                            .child(label)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flex_1()
+            .pb_2()
+            .track_scroll(&self.tree_scroll);
             div()
                 .flex_1()
                 .flex()
@@ -5340,14 +5383,7 @@ impl Render for RusidianApp {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(name),
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .id("vault-files")
-                                .overflow_y_scroll()
-                                .pb_2()
-                                .children(rows),
-                        ),
+                        .child(tree),
                 )
                 .child(body)
                 .into_any_element()
