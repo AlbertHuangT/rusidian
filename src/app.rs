@@ -2626,7 +2626,8 @@ impl RusidianApp {
                 .bg(rgb(theme.warning_bg))
                 .text_color(rgb(theme.warning_text))
                 .text_sm()
-                .child(div().flex_1().child(warning))
+                // Without min_w_0 the text claims its unwrapped width and runs off the window.
+                .child(div().flex_1().min_w_0().child(warning))
                 .child(
                     div()
                         .id("dismiss-nvim-warning")
@@ -2676,7 +2677,7 @@ impl RusidianApp {
                 .text_color(rgb(theme.muted))
                 .text_sm()
                 .child(
-                    div().flex_1().child(
+                    div().flex_1().min_w_0().child(
                         "提示：可以用 im-select.nvim 在 Insert/Normal 间自动切换中英文输入源。",
                     ),
                 )
@@ -3390,9 +3391,12 @@ impl RusidianApp {
             .items_center()
             .justify_center()
             .bg(rgb(theme.overlay).opacity(theme.overlay_opacity))
+            .p_4()
             .child(
                 div()
                     .w(px(620.0))
+                    // Short windows scroll the settings instead of cutting off the header.
+                    .max_h_full()
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(theme.card_border))
@@ -3401,6 +3405,7 @@ impl RusidianApp {
                     .flex_col()
                     .child(
                         div()
+                            .flex_none()
                             .h(px(76.0))
                             .px_6()
                             .flex()
@@ -3456,6 +3461,9 @@ impl RusidianApp {
                     )
                     .child(
                         div()
+                            .id("settings-body")
+                            .min_h_0()
+                            .overflow_y_scroll()
                             .border_t_1()
                             .border_color(rgb(theme.border))
                             .p_6()
