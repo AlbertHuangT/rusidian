@@ -5367,7 +5367,10 @@ impl RusidianApp {
                         "按行、屏幕行、词移动".to_owned(),
                     ),
                     ("/ ? n N · * #".to_owned(), "查找".to_owned()),
-                    ("v V · y".to_owned(), "选择并复制".to_owned()),
+                    (
+                        format!("v V · y · {command}C"),
+                        "选择并复制（也可用鼠标拖选）".to_owned(),
+                    ),
                     ("za".to_owned(), "折叠 / 展开可折叠的 callout".to_owned()),
                     (
                         "gf · gx".to_owned(),
