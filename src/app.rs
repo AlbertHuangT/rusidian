@@ -123,6 +123,17 @@ pub fn run(initial_path: Option<PathBuf>) {
                 window
                     .observe_window_appearance(|window, _| window.refresh())
                     .detach();
+                // Pick up edits made outside Rusidian (sync tools, git) when the window returns.
+                app.update(cx, |_, cx| {
+                    cx.observe_window_activation(window, |this, window, _| {
+                        if window.is_window_active()
+                            && let Some(nvim) = &this.nvim
+                        {
+                            nvim.check_time();
+                        }
+                    })
+                    .detach();
+                });
                 let focus = app.read(cx).focus_handle.clone();
                 if let Some(focus) = focus {
                     window.focus(&focus, cx);

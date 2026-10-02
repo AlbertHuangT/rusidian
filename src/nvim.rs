@@ -66,6 +66,7 @@ enum Command {
     FollowCurrentBuffer,
     /// Neovim detached our buffer (reloads such as :edit! or 'autoread' do that).
     Reattach,
+    CheckTime,
     Close,
 }
 
@@ -379,6 +380,9 @@ impl Client {
                             // unloaded one cannot be attached; BufEnter will follow its successor.
                             let _ = buffer.attach(true, Vec::new()).await;
                         }
+                        Command::CheckTime => {
+                            let _ = nvim.command("silent! checktime").await;
+                        }
                         Command::FollowCurrentBuffer => {
                             let Ok(current) = nvim.get_current_buf().await else {
                                 continue;
@@ -449,6 +453,11 @@ impl Client {
             row,
             column,
         });
+    }
+
+    /// Ask Neovim to reload buffers changed on disk ('autoread' decides how).
+    pub fn check_time(&self) {
+        let _ = self.commands.send(Command::CheckTime);
     }
 
     pub fn close(&self) -> bool {
