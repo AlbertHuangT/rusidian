@@ -573,8 +573,24 @@ fn search_notes(files: &[PathBuf], root: Option<&Path>, query: &str, limit: usiz
         let relative = root
             .and_then(|root| path.strip_prefix(root).ok())
             .unwrap_or(path);
+        // A `#tag` query also finds the tag in the front matter's tags, like Obsidian.
+        let tag = needle
+            .strip_prefix('#')
+            .filter(|tag| !tag.is_empty() && !tag.contains(char::is_whitespace));
+        let mut front_matter = false;
+        let mut in_tags = false;
         for (line, content) in text.lines().enumerate() {
-            if !content.to_lowercase().contains(&needle) {
+            let tagged = if line == 0 && content.trim() == "---" {
+                front_matter = true;
+                false
+            } else if front_matter && content.trim() == "---" {
+                front_matter = false;
+                false
+            } else {
+                front_matter
+                    && tag.is_some_and(|tag| front_matter_has_tag(content, &mut in_tags, tag))
+            };
+            if !tagged && !content.to_lowercase().contains(&needle) {
                 continue;
             }
             hits.push(TextHit {
@@ -662,6 +678,42 @@ fn find_backlinks(files: &[PathBuf], root: &Path, note: &Path) -> Vec<TextHit> {
         }
     }
     hits
+}
+
+/// Whether a front-matter line lists `tag` (lowercase, without `#`) or a tag nested in it,
+/// in `tags: [a, b]`, `tags: a` or a `- a` item under `tags:`. `in_tags` tracks the latter.
+fn front_matter_has_tag(line: &str, in_tags: &mut bool, tag: &str) -> bool {
+    let trimmed = line.trim();
+    let values: Vec<&str> = if let Some(item) = trimmed.strip_prefix("- ") {
+        if !*in_tags {
+            return false;
+        }
+        vec![item]
+    } else if !line.starts_with(char::is_whitespace)
+        && let Some((key, value)) = line.split_once(':')
+    {
+        *in_tags = matches!(key.trim().to_lowercase().as_str(), "tags" | "tag");
+        if !*in_tags {
+            return false;
+        }
+        let value = value.trim();
+        value
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(value)
+            .split(',')
+            .collect()
+    } else {
+        return false;
+    };
+    values.iter().any(|value| {
+        let value = value
+            .trim()
+            .trim_matches(|character| character == '"' || character == '\'')
+            .trim_start_matches('#')
+            .to_lowercase();
+        value == tag || value.starts_with(&format!("{tag}/"))
+    })
 }
 
 /// The part of a long line around the match of `needle` (lowercase).
@@ -6005,7 +6057,50 @@ fn render_block(
                 .border_color(rgb(theme.border))
                 .text_sm()
                 .on_mouse_down(MouseButton::Left, context.click_at(0))
-                .children(properties.into_iter().map(|(key, value)| {
+                .children(properties.into_iter().map(|property| {
+                    let tags = property.is_tags();
+                    let value = if property.list || tags {
+                        // Lists as chips; tags search the vault for the tag.
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .children(property.values.into_iter().map(|value| {
+                                let tag = format!("#{}", value.trim_start_matches('#'));
+                                let view = context.view.clone();
+                                div()
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(if tags {
+                                        theme.accent_soft_bg
+                                    } else {
+                                        theme.inline_code
+                                    }))
+                                    .when(tags, |element| {
+                                        element
+                                            .cursor_pointer()
+                                            .text_color(rgb(theme.accent_soft_text))
+                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                if view
+                                                    .update(cx, |this, cx| {
+                                                        this.search_tag(tag.clone(), cx);
+                                                    })
+                                                    .is_ok()
+                                                {
+                                                    cx.stop_propagation();
+                                                }
+                                            })
+                                    })
+                                    .child(if tags {
+                                        format!("#{}", value.trim_start_matches('#'))
+                                    } else {
+                                        value
+                                    })
+                            }))
+                            .into_any_element()
+                    } else {
+                        div().child(property.values.join(", ")).into_any_element()
+                    };
                     div()
                         .py_1()
                         .flex()
@@ -6018,7 +6113,7 @@ fn render_block(
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .text_color(rgb(theme.muted))
-                                .child(key),
+                                .child(property.key),
                         )
                         .child(div().flex_1().min_w_0().child(value))
                 }))
@@ -6751,7 +6846,22 @@ fn initial_cursor(blocks: &[Block]) -> ReadingCursor {
 
 /// Simple YAML front matter (`key: value`, flow lists and `- item` lists) as display rows.
 /// Anything more complex returns `None` and is shown as source.
-fn parse_properties(yaml: &str) -> Option<Vec<(String, String)>> {
+/// A front-matter property: its key and value, or values when it is a list.
+#[derive(Debug, PartialEq)]
+struct Property {
+    key: String,
+    values: Vec<String>,
+    list: bool,
+}
+
+impl Property {
+    /// Tags, shown as chips that search for the tag.
+    fn is_tags(&self) -> bool {
+        matches!(self.key.to_lowercase().as_str(), "tags" | "tag")
+    }
+}
+
+fn parse_properties(yaml: &str) -> Option<Vec<Property>> {
     let clean = |value: &str| {
         let value = value.trim();
         value
@@ -6765,14 +6875,16 @@ fn parse_properties(yaml: &str) -> Option<Vec<(String, String)>> {
             .unwrap_or(value)
             .to_owned()
     };
-    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    let mut rows: Vec<Property> = Vec::new();
     for line in yaml.lines().filter(|line| !line.trim().is_empty()) {
         let trimmed = line.trim_start();
         if let Some(item) = trimmed
             .strip_prefix("- ")
             .or((trimmed == "-").then_some(""))
         {
-            rows.last_mut()?.1.push(clean(item));
+            let row = rows.last_mut()?;
+            row.values.push(clean(item));
+            row.list = true;
         } else if line.starts_with(char::is_whitespace) || trimmed.starts_with('#') {
             return None;
         } else {
@@ -6782,10 +6894,10 @@ fn parse_properties(yaml: &str) -> Option<Vec<(String, String)>> {
                 return None;
             }
             let value = value.trim();
-            let values = match value
+            let inline = value
                 .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-            {
+                .and_then(|value| value.strip_suffix(']'));
+            let values = match inline {
                 Some(list) => list
                     .split(',')
                     .map(clean)
@@ -6794,14 +6906,14 @@ fn parse_properties(yaml: &str) -> Option<Vec<(String, String)>> {
                 None if value.is_empty() => Vec::new(),
                 None => vec![clean(value)],
             };
-            rows.push((clean(key), values));
+            rows.push(Property {
+                key: clean(key),
+                values,
+                list: inline.is_some(),
+            });
         }
     }
-    (!rows.is_empty()).then(|| {
-        rows.into_iter()
-            .map(|(key, values)| (key, values.join(", ")))
-            .collect()
-    })
+    (!rows.is_empty()).then_some(rows)
 }
 
 /// Zero-based line and byte column in the source for a reading-view position.
@@ -7653,6 +7765,23 @@ mod tests {
         );
         assert_eq!(search_notes(&files, Some(&root), "gpui", 1).len(), 1);
         assert!(search_notes(&files, Some(&root), "  ", 10).is_empty());
+        std::fs::write(
+            root.join("c.md"),
+            "---\ntags: [Project/rusidian, other]\naliases:\n  - project\n---\ntext\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("d.md"), "---\ntags:\n  - project\n---\n").unwrap();
+        let tagged = search_notes(
+            &[root.join("c.md"), root.join("d.md")],
+            Some(&root),
+            "#project",
+            10,
+        );
+        let found: Vec<_> = tagged
+            .iter()
+            .map(|hit| (hit.name.as_str(), hit.line))
+            .collect();
+        assert_eq!(found, [("c", 1), ("d", 2)]);
         std::fs::remove_dir_all(root).unwrap();
 
         let long = format!("{}needle{}", "a".repeat(200), "b".repeat(200));
@@ -7861,10 +7990,26 @@ mod tests {
                 "title: \"Edge: cases\"\ntags: [a, 'b']\naliases:\n  - one\n  - two\nempty:"
             ),
             Some(vec![
-                ("title".into(), "Edge: cases".into()),
-                ("tags".into(), "a, b".into()),
-                ("aliases".into(), "one, two".into()),
-                ("empty".into(), String::new()),
+                Property {
+                    key: "title".into(),
+                    values: vec!["Edge: cases".into()],
+                    list: false,
+                },
+                Property {
+                    key: "tags".into(),
+                    values: vec!["a".into(), "b".into()],
+                    list: true,
+                },
+                Property {
+                    key: "aliases".into(),
+                    values: vec!["one".into(), "two".into()],
+                    list: true,
+                },
+                Property {
+                    key: "empty".into(),
+                    values: Vec::new(),
+                    list: false,
+                },
             ])
         );
         assert_eq!(parse_properties("nested:\n  key: value"), None);
