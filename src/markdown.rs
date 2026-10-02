@@ -1,5 +1,6 @@
 use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Options,
+    Parser, Tag, TagEnd,
 };
 use std::ops::Range;
 
@@ -155,6 +156,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     let mut cell_start = None;
     let mut table_alignments = Vec::new();
     let mut footnote: Option<String> = None;
+    let mut wiki_fragment = false;
     // Footnote labels in the order they are first referenced.
     let mut footnotes: Vec<String> = Vec::new();
 
@@ -254,7 +256,16 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 Tag::Strong => bold += 1,
                 Tag::Emphasis => italic += 1,
                 Tag::Strikethrough => strike += 1,
-                Tag::Link { dest_url, .. } => link = Some(dest_url.into_string()),
+                Tag::Link {
+                    dest_url,
+                    link_type,
+                    ..
+                } => {
+                    // `[[note#Heading]]` without its own text reads `note > Heading`.
+                    wiki_fragment = link_type == LinkType::WikiLink { has_pothole: false }
+                        && dest_url.contains('#');
+                    link = Some(dest_url.into_string());
+                }
                 Tag::Image { dest_url, .. } => {
                     current
                         .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items));
@@ -269,7 +280,10 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 TagEnd::Strong => bold -= 1,
                 TagEnd::Emphasis => italic -= 1,
                 TagEnd::Strikethrough => strike -= 1,
-                TagEnd::Link => link = None,
+                TagEnd::Link => {
+                    link = None;
+                    wiki_fragment = false;
+                }
                 TagEnd::Image => {
                     if let (Some(block), Some(image)) = (&mut current, image.take()) {
                         block.push_image(image);
@@ -324,6 +338,11 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 _ => {}
             },
             Event::Text(text) => {
+                let text = if wiki_fragment && link.as_deref() == Some(&*text) {
+                    CowStr::from(wiki_link_label(&text))
+                } else {
+                    text
+                };
                 if let Some(image) = &mut image {
                     image.alt.push_str(&text);
                 } else {
@@ -561,6 +580,16 @@ fn push_current(blocks: &mut Vec<Block>, current: &mut Option<Block>) {
         }
         block.finish();
         blocks.push(block);
+    }
+}
+
+/// How Obsidian shows a link to a heading or block: `note > Heading`, or just `Heading` within
+/// the note.
+fn wiki_link_label(target: &str) -> String {
+    match target.split_once('#') {
+        Some(("", fragment)) => fragment.to_owned(),
+        Some((note, fragment)) => format!("{note} > {fragment}"),
+        None => target.to_owned(),
     }
 }
 
@@ -1124,6 +1153,19 @@ mod tests {
         // The item's second paragraph has no marker of its own.
         assert_eq!(loose.blocks[1].list_marker, None);
         assert_eq!(loose.blocks[2].list_marker.as_deref(), Some("2."));
+    }
+
+    #[test]
+    fn labels_heading_wikilinks_like_obsidian() {
+        let document = parse("[[note#Part]], [[#Local]], [[note#Part|own]] and [[plain]]\n");
+        let block = &document.blocks[0];
+        assert_eq!(block.text, "note > Part, Local, own and plain");
+        let destinations: Vec<_> = block
+            .links
+            .iter()
+            .map(|link| link.destination.as_str())
+            .collect();
+        assert_eq!(destinations, ["note#Part", "#Local", "note#Part", "plain"]);
     }
 
     #[test]
