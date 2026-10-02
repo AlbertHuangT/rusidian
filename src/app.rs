@@ -2283,6 +2283,9 @@ impl RusidianApp {
         self.reading_cursor = ReadingCursor::default();
         self.layouts_ready.set(false);
         self.invalidate_block_heights();
+        // Fold toggles number callouts within one note.
+        self.callout_toggles.clear();
+        self.callout_cursor_parked = None;
         self.place_initial_cursor = true;
         self.tikz_lines.clear();
         self.synced_cursor = None;
