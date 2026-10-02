@@ -35,7 +35,8 @@ pub enum Event {
         lines: Vec<String>,
         more: bool,
     },
-    Warning(String),
+    /// Normal mode maps `<Esc>` (buffer-local first) to this right-hand side.
+    EscapeMapped(String),
     Error(String),
     CloseRefused(String),
     /// The cursor of the current window: zero-based line and byte column.
@@ -357,16 +358,10 @@ impl Client {
                 }
                 let local_maps = buffer.get_keymap("n").await.unwrap_or_default();
                 let global_maps = nvim.get_keymap("n").await.unwrap_or_default();
-                let mut warnings = Vec::new();
                 if let Some(mapping) = escape_mapping(&local_maps)
                     .or_else(|| escape_mapping(&global_maps))
                 {
-                    warnings.push(format!(
-                        "Neovim Normal 的 Esc 已映射为 {mapping}；Rusidian 当前会优先用 Esc 返回阅读视图"
-                    ));
-                }
-                if !warnings.is_empty() {
-                    let _ = event_sender.send(Event::Warning(warnings.join("\n"))).await;
+                    let _ = event_sender.send(Event::EscapeMapped(mapping)).await;
                 }
                 if !clean
                     && nvim
@@ -1463,7 +1458,7 @@ mod tests {
                                     break grid;
                                 }
                             }
-                            Event::Warning(_)
+                            Event::EscapeMapped(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
@@ -1493,7 +1488,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_)
+                            Event::EscapeMapped(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
@@ -1522,7 +1517,7 @@ mod tests {
                                 mode.clone_from(&grid.mode);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_)
+                            Event::EscapeMapped(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
@@ -1551,7 +1546,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_)
+                            Event::EscapeMapped(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
@@ -1578,7 +1573,7 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_)
+                            Event::EscapeMapped(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)

@@ -18,6 +18,41 @@ pub struct Settings {
     pub remote_image_vaults: Vec<PathBuf>,
     /// The user asked not to be reminded about im-select.nvim again.
     pub hide_ime_hint: bool,
+    pub reading_key: ReadingKey,
+}
+
+/// The key that returns from the source view's Normal mode to the reading view. Users whose
+/// Neovim maps `<Esc>` in Normal mode can move Rusidian off it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadingKey {
+    #[default]
+    Escape,
+    /// ⌘Enter on macOS, Ctrl+Enter elsewhere.
+    SecondaryEnter,
+}
+
+impl ReadingKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Escape => "Esc",
+            Self::SecondaryEnter if cfg!(target_os = "macos") => "⌘Enter",
+            Self::SecondaryEnter => "Ctrl+Enter",
+        }
+    }
+
+    pub fn matches(self, keystroke: &gpui::Keystroke) -> bool {
+        let modifiers = &keystroke.modifiers;
+        match self {
+            Self::Escape => keystroke.key == "escape",
+            Self::SecondaryEnter => {
+                keystroke.key == "enter"
+                    && modifiers.secondary()
+                    && !modifiers.shift
+                    && !modifiers.alt
+            }
+        }
+    }
 }
 
 const RECENT_LIMIT: usize = 10;
@@ -87,12 +122,23 @@ mod tests {
                 recent: Vec::new(),
                 remote_image_vaults: Vec::new(),
                 hide_ime_hint: false,
+                reading_key: ReadingKey::Escape,
             }
         );
         update_at(&path, |settings| settings.appearance = Appearance::Dark).unwrap();
         let settings = load_from(&path);
         assert!(settings.auto_update);
         assert_eq!(settings.appearance, Appearance::Dark);
+        update_at(&path, |settings| {
+            settings.reading_key = ReadingKey::SecondaryEnter;
+        })
+        .unwrap();
+        assert!(
+            String::from_utf8(fs::read(&path).unwrap())
+                .unwrap()
+                .contains(r#""reading_key": "secondary-enter""#)
+        );
+        assert_eq!(load_from(&path).reading_key, ReadingKey::SecondaryEnter);
         let mut remembered = Settings::default();
         for index in 0..12 {
             remembered.remember(PathBuf::from(format!("/notes/{index}.md")));
@@ -104,5 +150,21 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert_eq!(load_from(&path), Settings::default());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reading_keys_match_their_keystrokes() {
+        let key = |source: &str| gpui::Keystroke::parse(source).unwrap();
+        let secondary = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
+        assert!(ReadingKey::Escape.matches(&key("escape")));
+        assert!(!ReadingKey::Escape.matches(&key("enter")));
+        assert!(ReadingKey::SecondaryEnter.matches(&key(secondary)));
+        assert!(!ReadingKey::SecondaryEnter.matches(&key("enter")));
+        assert!(!ReadingKey::SecondaryEnter.matches(&key("escape")));
+        assert!(!ReadingKey::SecondaryEnter.matches(&key(&format!("shift-{secondary}"))));
     }
 }

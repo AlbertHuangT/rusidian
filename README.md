@@ -91,7 +91,7 @@ cargo run --locked -- examples/markdown.md
 | :--- | :--- | :--- |
 | 打开文件 / 文件夹 | `⌘ O` / `⌘ ⇧ O` | `Ctrl+O` / `Ctrl+Shift+O` |
 | 阅读 → 源码 Normal | `Enter` | `Enter` |
-| 源码 Normal → 阅读 | `Esc` | `Esc` |
+| 源码 Normal → 阅读 | `Esc`（可在设置中改为 `⌘Enter`） | `Esc`（可在设置中改为 `Ctrl+Enter`） |
 | 阅读视图移动 | `h j k l`、`gj gk`、`w b e`、`0 ^ $`、`gg G` | 同左 |
 | 翻页 | `Ctrl-d/u`、`Ctrl-f/b` | 同左 |
 | 查找（全小写时不区分大小写） | `/ ?`、`n N`、`* #`、`f F t T` | 同左 |
@@ -103,7 +103,7 @@ cargo run --locked -- examples/markdown.md
 | 保存文件 | 在 Neovim 中执行 `:w` | 同左 |
 | 打开设置 / 更新 | `⌘ ,` | `Ctrl+,` |
 
-Linux 上 `Ctrl` 组合键在源码视图中全部交给 Neovim。切回阅读视图不会保存文件；状态栏和窗口标题中的 `●` 表示有未保存修改。切换笔记时未保存的笔记留在后台标签中；关闭这样的标签或退出应用时，Neovim 会拒绝丢弃修改，请先用 `:w`（或 `:wa`）保存，或用 `:e!` 放弃修改。检测到 Normal 模式的 `Esc` 映射冲突时只提示，应用仍优先使用该键切换视图。
+Linux 上 `Ctrl` 组合键在源码视图中全部交给 Neovim。切回阅读视图不会保存文件；状态栏和窗口标题中的 `●` 表示有未保存修改。切换笔记时未保存的笔记留在后台标签中；关闭这样的标签或退出应用时，Neovim 会拒绝丢弃修改，请先用 `:w`（或 `:wa`）保存，或用 `:e!` 放弃修改。Neovim 在 Normal 模式映射了 `Esc`（例如 `:nohlsearch`）时会提示冲突；在设置中把“返回阅读视图”改为 `⌘Enter`（Linux 为 `Ctrl+Enter`）后，`Esc` 完全交给 Neovim。
 
 启动时检测到 Neovim swap 冲突，Rusidian 会停止打开源码视图并保留阅读内容；之后切换到有 swap 的笔记时以只读方式打开。两种情况都不会自动删除 swap 或覆盖文件，请先用 Neovim 的恢复模式检查内容。
 

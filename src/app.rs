@@ -1,6 +1,7 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use crate::math::{FONT_SIZE, Formula};
 use crate::nvim::{Client as NvimClient, CursorShape, Event as NvimEvent, Grid as NvimGrid};
+use crate::settings::ReadingKey;
 use crate::theme::{Appearance, Theme};
 use crate::update;
 use crate::vault::{TreeRow, Vault};
@@ -32,6 +33,8 @@ const GRID_PADDING: f32 = 12.0;
 const IME_MARKED_BACKGROUND: u32 = 0x7a3b20;
 /// TikZ diagrams sit on a white card in every theme.
 const WHITE: u32 = 0xffffff;
+/// Starts the warning about Neovim's `<Esc>` mapping, so changing the reading key can clear it.
+const ESCAPE_MAPPED_PREFIX: &str = "Neovim Normal 模式把 Esc 映射为 ";
 
 actions!(
     rusidian,
@@ -291,6 +294,9 @@ struct RusidianApp {
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
     appearance: Appearance,
+    reading_key: ReadingKey,
+    /// Neovim's Normal-mode `<Esc>` mapping, which the reading key may shadow.
+    escape_mapping: Option<String>,
     recent: Vec<PathBuf>,
     sidebar_visible: bool,
     expanded_folders: HashSet<PathBuf>,
@@ -434,6 +440,8 @@ impl RusidianApp {
             marked_selection: 0..0,
             settings_open: false,
             appearance: settings.appearance,
+            reading_key: settings.reading_key,
+            escape_mapping: None,
             recent: settings.recent,
             sidebar_visible: true,
             expanded_folders: HashSet::new(),
@@ -873,6 +881,43 @@ impl RusidianApp {
         cx.notify();
     }
 
+    fn set_reading_key(&mut self, key: ReadingKey, cx: &mut Context<Self>) {
+        self.reading_key = key;
+        if let Err(error) = crate::settings::update(|settings| settings.reading_key = key) {
+            self.show_notice(error, true, cx);
+        }
+        if key != ReadingKey::Escape
+            && self
+                .nvim_warning
+                .as_ref()
+                .is_some_and(|warning| warning.starts_with(ESCAPE_MAPPED_PREFIX))
+        {
+            self.nvim_warning = None;
+        }
+        cx.notify();
+    }
+
+    /// Point out a Neovim `<Esc>` mapping that the reading key hides, and how to free it.
+    fn warn_about_escape_mapping(&mut self) {
+        if self.reading_key != ReadingKey::Escape {
+            return;
+        }
+        if let Some(mapping) = &self.escape_mapping {
+            let settings = if cfg!(target_os = "macos") {
+                "⌘,"
+            } else {
+                "Ctrl+,"
+            };
+            self.nvim_warning = Some(
+                format!(
+                    "{ESCAPE_MAPPED_PREFIX}{mapping}，Rusidian 用 Esc 返回阅读视图时它不会生效。可在设置（{settings}）中改用 {} 返回阅读，把 Esc 留给 Neovim。",
+                    ReadingKey::SecondaryEnter.label()
+                )
+                .into(),
+            );
+        }
+    }
+
     fn set_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
         self.appearance = appearance;
         if let Err(error) = crate::settings::update(|settings| settings.appearance = appearance) {
@@ -966,8 +1011,9 @@ impl RusidianApp {
                             this.ime_hint = !crate::settings::load().hide_ime_hint;
                             cx.notify();
                         }
-                        NvimEvent::Warning(warning) => {
-                            this.nvim_warning = Some(warning.into());
+                        NvimEvent::EscapeMapped(mapping) => {
+                            this.escape_mapping = Some(mapping);
+                            this.warn_about_escape_mapping();
                             cx.notify();
                         }
                         NvimEvent::CloseRefused(warning) => {
@@ -2451,7 +2497,12 @@ impl RusidianApp {
             cx.notify();
             return;
         }
-        if self.nvim.is_none() {
+        let unusable = self.nvim_error.is_some() || self.nvim.is_none();
+        // Without a working Neovim, Esc also leaves: nothing else can receive it.
+        let leaves_source = (self.reading_key.matches(&event.keystroke)
+            && (self.grid.is_normal() || unusable))
+            || (unusable && event.keystroke.key == "escape");
+        if self.nvim.is_none() && !leaves_source {
             // Neovim exited or failed to start; Enter starts it again.
             if event.keystroke.key == "enter" && self.document.is_some() {
                 self.nvim_error = None;
@@ -2461,10 +2512,7 @@ impl RusidianApp {
                 return;
             }
         }
-        if event.keystroke.key == "escape"
-            && self.has_reading_view()
-            && (self.grid.is_normal() || self.nvim_error.is_some() || self.nvim.is_none())
-        {
+        if self.has_reading_view() && leaves_source {
             self.view = View::Reading;
             if let Some(nvim) = &self.nvim {
                 nvim.query_cursor();
@@ -3039,7 +3087,13 @@ impl RusidianApp {
         let hint = match self.view {
             View::Reading if self.document.is_some() => "Enter 编辑",
             View::Source if self.nvim.is_none() && self.document.is_some() => "Enter 重新打开",
-            View::Source if self.has_reading_view() && self.grid.is_normal() => "Esc 返回阅读",
+            View::Source if self.has_reading_view() && self.grid.is_normal() => {
+                match self.reading_key {
+                    ReadingKey::Escape => "Esc 返回阅读",
+                    ReadingKey::SecondaryEnter if cfg!(target_os = "macos") => "⌘Enter 返回阅读",
+                    ReadingKey::SecondaryEnter => "Ctrl+Enter 返回阅读",
+                }
+            }
             _ => "",
         };
         let message = if let Some(prompt) = search_prompt {
@@ -3325,6 +3379,50 @@ impl RusidianApp {
                         .child(label)
                 }),
             );
+        let reading_key_picker = div()
+            .flex()
+            .p_1()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme.card_border))
+            .bg(rgb(theme.card))
+            .children(
+                [ReadingKey::Escape, ReadingKey::SecondaryEnter]
+                    .into_iter()
+                    .map(|key| {
+                        let selected = self.reading_key == key;
+                        div()
+                            .id(key.label())
+                            .flex_1()
+                            .py_2()
+                            .rounded_md()
+                            .text_center()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(selected, |element| {
+                                element
+                                    .bg(rgb(theme.button))
+                                    .text_color(rgb(theme.button_text))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                            })
+                            .when(!selected, |element| {
+                                element.hover(|element| element.bg(rgb(theme.hover)))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_reading_key(key, cx);
+                            }))
+                            .child(key.label())
+                    }),
+            );
+        let reading_key_note: SharedString = match &self.escape_mapping {
+            Some(mapping) => format!(
+                "在 Neovim Normal 模式按此键返回阅读视图。你的 Neovim 把 Esc 映射为 {mapping}；选择 {} 可让这个映射生效。",
+                ReadingKey::SecondaryEnter.label()
+            )
+            .into(),
+            None => "在 Neovim Normal 模式按此键返回阅读视图；其他按键都交给 Neovim。".into(),
+        };
         let tex_button = |id: &'static str, label: &'static str, vault: Option<PathBuf>| {
             div()
                 .id(id)
@@ -3478,6 +3576,20 @@ impl RusidianApp {
                                     .child("外观"),
                             )
                             .child(appearance_picker)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.accent))
+                                    .child("返回阅读视图"),
+                            )
+                            .child(reading_key_picker)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(theme.faint))
+                                    .child(reading_key_note),
+                            )
                             .child(
                                 div()
                                     .text_sm()
