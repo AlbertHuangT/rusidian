@@ -4,12 +4,22 @@ use nvim_rs::{
     Handler, Neovim, Value, compat::tokio::Compat, create::tokio as create,
     uioptions::UiAttachOptions,
 };
-use std::{collections::HashMap, ops::Range, path::PathBuf, thread};
+use std::{collections::HashMap, path::PathBuf, thread};
 use tokio::{process::ChildStdin, sync::mpsc};
 
 pub struct Client {
     pub events: Receiver<Event>,
     commands: mpsc::UnboundedSender<Command>,
+}
+
+/// A cheap handle that lets layout code request a new grid size.
+#[derive(Clone)]
+pub struct Resizer(mpsc::UnboundedSender<Command>);
+
+impl Resizer {
+    pub fn resize(&self, width: i64, height: i64) {
+        let _ = self.0.send(Command::Resize(width, height));
+    }
 }
 
 pub enum Event {
@@ -73,7 +83,7 @@ impl Handler for EventHandler {
 }
 
 impl Client {
-    pub fn start(path: PathBuf, clean: bool) -> Self {
+    pub fn start(path: PathBuf, clean: bool, (width, height): (i64, i64)) -> Self {
         let (event_sender, events) = async_channel::unbounded();
         let (commands, mut command_receiver) = mpsc::unbounded_channel();
 
@@ -114,7 +124,7 @@ impl Client {
 
                 let mut options = UiAttachOptions::new();
                 options.set_rgb(true).set_linegrid_external(true);
-                if let Err(error) = nvim.ui_attach(120, 40, &options).await {
+                if let Err(error) = nvim.ui_attach(width, height, &options).await {
                     let _ = event_sender
                         .send(Event::Error(format!("无法连接 Neovim UI：{error}")))
                         .await;
@@ -255,8 +265,13 @@ impl Client {
         self.commands.send(Command::Close).is_ok()
     }
 
+    #[cfg(test)]
     pub fn resize(&self, width: i64, height: i64) {
-        let _ = self.commands.send(Command::Resize(width, height));
+        self.resizer().resize(width, height);
+    }
+
+    pub fn resizer(&self) -> Resizer {
+        Resizer(self.commands.clone())
     }
 }
 
@@ -303,6 +318,9 @@ pub struct Grid {
     background: Option<u32>,
     pub cursor: (usize, usize),
     mode: String,
+    mode_index: usize,
+    cursor_shapes: Vec<CursorShape>,
+    busy: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -315,11 +333,61 @@ struct Cell {
 pub struct Highlight {
     pub foreground: Option<u32>,
     pub background: Option<u32>,
+    pub special: Option<u32>,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub reverse: bool,
 }
 
-type StyledLine = (String, Vec<(Range<usize>, Highlight)>, Option<Range<usize>>);
+/// Concrete colors for one highlight after applying defaults and `reverse`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedHighlight {
+    pub foreground: u32,
+    /// `None` means the grid's default background, which the container already paints.
+    pub background: Option<u32>,
+    pub special: u32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+/// Consecutive cells that can be drawn as one string starting at an exact column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridRun {
+    pub column: usize,
+    /// Width in grid cells.
+    pub width: usize,
+    pub text: String,
+    pub highlight: ResolvedHighlight,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    /// Height as a fraction of the cell.
+    Horizontal(f32),
+    /// Width as a fraction of the cell.
+    Vertical(f32),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridCursor {
+    pub row: usize,
+    pub column: usize,
+    pub width: usize,
+    pub text: String,
+    pub shape: CursorShape,
+}
+
+pub const DEFAULT_FOREGROUND: u32 = 0xe6e9ed;
+pub const DEFAULT_BACKGROUND: u32 = 0x0c0f12;
+
+#[cfg(test)]
+type StyledLine = (String, Option<std::ops::Range<usize>>);
 
 impl Grid {
     pub fn apply_redraw(&mut self, events: &[Value]) -> bool {
@@ -341,9 +409,12 @@ impl Grid {
                     "grid_line" => self.line(args),
                     "grid_cursor_goto" => self.cursor(args),
                     "grid_scroll" => self.scroll(args),
+                    "mode_info_set" => self.set_mode_info(args),
                     "mode_change" => self.set_mode(args),
                     "default_colors_set" => self.set_default_colors(args),
                     "hl_attr_define" => self.define_highlight(args),
+                    "busy_start" => self.busy = true,
+                    "busy_stop" => self.busy = false,
                     "flush" => flush = true,
                     _ => {}
                 }
@@ -353,50 +424,152 @@ impl Grid {
     }
 
     #[cfg(test)]
-    pub fn lines(&self) -> impl Iterator<Item = (String, Option<Range<usize>>)> + '_ {
-        self.styled_lines().map(|(text, _, cursor)| (text, cursor))
-    }
-
-    pub fn styled_lines(&self) -> impl Iterator<Item = StyledLine> + '_ {
+    pub fn lines(&self) -> impl Iterator<Item = StyledLine> + '_ {
         self.cells.iter().enumerate().map(|(row, cells)| {
             let content_end = cells
                 .iter()
                 .rposition(|cell| cell.text != " ")
                 .map_or(0, |column| column + 1);
-            let end = if row == self.cursor.0 {
-                content_end.max(self.cursor.1.saturating_add(1).min(cells.len()))
-            } else {
-                content_end
-            };
-            let text = cells[..end]
+            let text = cells[..content_end]
                 .iter()
                 .map(|cell| cell.text.as_str())
                 .collect::<String>();
-            let mut highlights = Vec::new();
-            let mut offset = 0;
-            for cell in &cells[..end] {
-                let next = offset + cell.text.len();
-                if cell.highlight != 0
-                    && let Some(highlight) = self.highlights.get(&cell.highlight)
-                {
-                    highlights.push((offset..next, *highlight));
-                }
-                offset = next;
-            }
-            let cursor = (row == self.cursor.0 && self.cursor.1 < end).then(|| {
+            let cursor = (row == self.cursor.0 && self.cursor.1 < content_end).then(|| {
                 let start = cells[..self.cursor.1]
                     .iter()
                     .map(|cell| cell.text.len())
                     .sum::<usize>();
-                let len = cells[self.cursor.1].text.len().max(1);
-                start..(start + len).min(text.len())
+                start..start + cells[self.cursor.1].text.len().max(1)
             });
-            (text, highlights, cursor)
+            (text, cursor)
         })
     }
 
-    pub fn colors(&self) -> (Option<u32>, Option<u32>) {
-        (self.foreground, self.background)
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Runs for one row. ASCII cells with the same highlight are merged; every other cell gets
+    /// its own run so wide and fallback-font glyphs cannot shift the following columns.
+    pub fn row_runs(&self, row: usize) -> Vec<GridRun> {
+        let Some(cells) = self.cells.get(row) else {
+            return Vec::new();
+        };
+        let mut runs: Vec<(GridRun, u64, bool)> = Vec::new();
+        let mut column = 0;
+        while column < cells.len() {
+            let cell = &cells[column];
+            if cell.text.is_empty() {
+                column += 1;
+                continue;
+            }
+            let width = if cells
+                .get(column + 1)
+                .is_some_and(|next| next.text.is_empty())
+            {
+                2
+            } else {
+                1
+            };
+            let simple = width == 1 && cell.text.is_ascii();
+            match runs.last_mut() {
+                Some((run, highlight, true))
+                    if simple
+                        && *highlight == cell.highlight
+                        && run.column + run.width == column =>
+                {
+                    run.text.push_str(&cell.text);
+                    run.width += 1;
+                }
+                _ => runs.push((
+                    GridRun {
+                        column,
+                        width,
+                        text: cell.text.clone(),
+                        highlight: self.resolve(cell.highlight),
+                    },
+                    cell.highlight,
+                    simple,
+                )),
+            }
+            column += width;
+        }
+        runs.into_iter()
+            .map(|(run, _, _)| run)
+            .filter(|run| {
+                !run.text.chars().all(|character| character == ' ')
+                    || run.highlight.background.is_some()
+                    || run.highlight.underline
+                    || run.highlight.strikethrough
+            })
+            .collect()
+    }
+
+    pub fn resolve(&self, id: u64) -> ResolvedHighlight {
+        let highlight = self.highlights.get(&id).copied().unwrap_or_default();
+        let (default_foreground, default_background) = self.colors();
+        let foreground = highlight.foreground.unwrap_or(default_foreground);
+        let background = highlight.background;
+        let (foreground, background) = if highlight.reverse {
+            (background.unwrap_or(default_background), Some(foreground))
+        } else {
+            (foreground, background)
+        };
+        ResolvedHighlight {
+            foreground,
+            background,
+            special: highlight.special.unwrap_or(foreground),
+            bold: highlight.bold,
+            italic: highlight.italic,
+            underline: highlight.underline,
+            strikethrough: highlight.strikethrough,
+        }
+    }
+
+    /// The visible cursor, or `None` while Neovim reports itself busy.
+    pub fn visible_cursor(&self) -> Option<GridCursor> {
+        if self.busy {
+            return None;
+        }
+        let (row, column) = self.cursor;
+        let cells = self.cells.get(row)?;
+        let cell = cells.get(column)?;
+        let width = if cells
+            .get(column + 1)
+            .is_some_and(|next| next.text.is_empty())
+        {
+            2
+        } else {
+            1
+        };
+        Some(GridCursor {
+            row,
+            column,
+            width,
+            text: cell.text.clone(),
+            shape: self
+                .cursor_shapes
+                .get(self.mode_index)
+                .copied()
+                .unwrap_or_else(|| self.fallback_cursor_shape()),
+        })
+    }
+
+    fn fallback_cursor_shape(&self) -> CursorShape {
+        if self.mode.starts_with("insert") || self.mode == "cmdline_insert" {
+            CursorShape::Vertical(0.25)
+        } else if self.mode.starts_with("replace") {
+            CursorShape::Horizontal(0.2)
+        } else {
+            CursorShape::Block
+        }
+    }
+
+    pub fn colors(&self) -> (u32, u32) {
+        (
+            self.foreground.unwrap_or(DEFAULT_FOREGROUND),
+            self.background.unwrap_or(DEFAULT_BACKGROUND),
+        )
     }
 
     pub fn is_normal(&self) -> bool {
@@ -418,6 +591,39 @@ impl Grid {
         if let Some(mode) = args.first().and_then(Value::as_str) {
             self.mode = mode.to_owned();
         }
+        if let Some(index) = args.get(1).and_then(Value::as_u64) {
+            self.mode_index = index as usize;
+        }
+    }
+
+    fn set_mode_info(&mut self, args: &[Value]) {
+        let enabled = args.first().and_then(Value::as_bool).unwrap_or(true);
+        let Some(modes) = args.get(1).and_then(Value::as_array) else {
+            return;
+        };
+        self.cursor_shapes = modes
+            .iter()
+            .map(|mode| {
+                if !enabled {
+                    return CursorShape::Block;
+                }
+                let field = |name: &str| {
+                    mode.as_map()?
+                        .iter()
+                        .find(|(key, _)| key.as_str() == Some(name))
+                        .map(|(_, value)| value)
+                };
+                let percentage = field("cell_percentage")
+                    .and_then(Value::as_u64)
+                    .filter(|percentage| (1..=100).contains(percentage))
+                    .map_or(0.25, |percentage| percentage as f32 / 100.0);
+                match field("cursor_shape").and_then(Value::as_str) {
+                    Some("horizontal") => CursorShape::Horizontal(percentage),
+                    Some("vertical") => CursorShape::Vertical(percentage),
+                    _ => CursorShape::Block,
+                }
+            })
+            .collect();
     }
 
     fn resize(&mut self, args: &[Value]) {
@@ -432,16 +638,16 @@ impl Grid {
         };
         self.width = width as usize;
         self.height = height as usize;
-        self.cells = vec![
-            vec![
-                Cell {
-                    text: " ".into(),
-                    highlight: 0
-                };
-                self.width
-            ];
-            self.height
-        ];
+        let blank = Cell {
+            text: " ".into(),
+            highlight: 0,
+        };
+        // Neovim redraws after a resize, but keep the overlapping area so the frame does not flash.
+        self.cells
+            .resize(self.height, vec![blank.clone(); self.width]);
+        for row in &mut self.cells {
+            row.resize(self.width, blank.clone());
+        }
     }
 
     fn clear(&mut self, args: &[Value]) {
@@ -560,31 +766,28 @@ impl Grid {
             for column in left..right.min(self.width) {
                 let source_row = row as i64 + rows;
                 let source_column = column as i64 + columns;
-                self.cells[row][column] = if source_row >= top as i64
+                // Rows scrolled in from outside the region are left for Neovim to redraw.
+                if source_row >= top as i64
                     && source_row < bottom as i64
                     && source_column >= left as i64
                     && source_column < right as i64
                 {
-                    old[source_row as usize][source_column as usize].clone()
-                } else {
-                    Cell {
-                        text: " ".into(),
-                        highlight: 0,
-                    }
-                };
+                    self.cells[row][column] =
+                        old[source_row as usize][source_column as usize].clone();
+                }
             }
         }
     }
 
     fn set_default_colors(&mut self, args: &[Value]) {
-        self.foreground = args
-            .first()
-            .and_then(Value::as_u64)
-            .map(|value| value as u32);
-        self.background = args
-            .get(1)
-            .and_then(Value::as_u64)
-            .map(|value| value as u32);
+        let color = |index: usize| {
+            args.get(index)
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0)
+                .map(|value| value as u32)
+        };
+        self.foreground = color(0);
+        self.background = color(1);
     }
 
     fn define_highlight(&mut self, args: &[Value]) {
@@ -600,20 +803,29 @@ impl Grid {
                 .find(|(key, _)| key.as_str() == Some(name))
                 .map(|(_, value)| value)
         };
-        let mut highlight = Highlight {
-            foreground: value("foreground")
+        let flag = |name: &str| value(name).and_then(Value::as_bool).unwrap_or(false);
+        let color = |name: &str| {
+            value(name)
                 .and_then(Value::as_u64)
-                .map(|value| value as u32),
-            background: value("background")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32),
-            bold: value("bold").and_then(Value::as_bool).unwrap_or(false),
-            italic: value("italic").and_then(Value::as_bool).unwrap_or(false),
+                .map(|value| value as u32)
         };
-        if value("reverse").and_then(Value::as_bool).unwrap_or(false) {
-            std::mem::swap(&mut highlight.foreground, &mut highlight.background);
-        }
-        self.highlights.insert(id, highlight);
+        self.highlights.insert(
+            id,
+            Highlight {
+                foreground: color("foreground"),
+                background: color("background"),
+                special: color("special"),
+                bold: flag("bold"),
+                italic: flag("italic"),
+                underline: flag("underline")
+                    || flag("undercurl")
+                    || flag("underdouble")
+                    || flag("underdotted")
+                    || flag("underdashed"),
+                strikethrough: flag("strikethrough"),
+                reverse: flag("reverse"),
+            },
+        );
     }
 }
 
@@ -669,10 +881,31 @@ mod tests {
 
         assert!(grid.apply_redraw(&events));
         assert_eq!(grid.lines().next().unwrap().0, "A  B");
-        assert_eq!(grid.colors(), (Some(0xe6e9ed), Some(0x0c0f12)));
+        assert_eq!(grid.colors(), (0xe6e9ed, 0x0c0f12));
         assert_eq!(
-            grid.styled_lines().next().unwrap().1[0].1.foreground,
-            Some(0x88c0d0)
+            grid.row_runs(0),
+            [
+                GridRun {
+                    column: 0,
+                    width: 1,
+                    text: "A".into(),
+                    highlight: ResolvedHighlight {
+                        foreground: 0x88c0d0,
+                        background: None,
+                        special: 0x88c0d0,
+                        bold: true,
+                        italic: false,
+                        underline: false,
+                        strikethrough: false,
+                    },
+                },
+                GridRun {
+                    column: 1,
+                    width: 4,
+                    text: "  B ".into(),
+                    highlight: grid.resolve(0),
+                },
+            ]
         );
         assert!(grid.is_normal());
 
@@ -702,6 +935,73 @@ mod tests {
     }
 
     #[test]
+    fn positions_wide_cells_and_resolves_reverse_video() {
+        let mut grid = Grid::default();
+        grid.apply_redraw(&[
+            Value::Array(vec![
+                "hl_attr_define".into(),
+                Value::Array(vec![
+                    7.into(),
+                    Value::Map(vec![("reverse".into(), true.into())]),
+                ]),
+            ]),
+            Value::Array(vec![
+                "grid_resize".into(),
+                Value::Array(vec![1.into(), 6.into(), 1.into()]),
+            ]),
+            Value::Array(vec![
+                "grid_line".into(),
+                Value::Array(vec![
+                    1.into(),
+                    0.into(),
+                    0.into(),
+                    Value::Array(vec![
+                        Value::Array(vec!["中".into(), 0.into()]),
+                        Value::Array(vec!["".into(), 0.into()]),
+                        Value::Array(vec!["a".into(), 0.into()]),
+                        Value::Array(vec!["b".into(), 7.into()]),
+                    ]),
+                    false.into(),
+                ]),
+            ]),
+            Value::Array(vec![
+                "mode_info_set".into(),
+                Value::Array(vec![
+                    true.into(),
+                    Value::Array(vec![
+                        Value::Map(vec![("cursor_shape".into(), "block".into())]),
+                        Value::Map(vec![
+                            ("cursor_shape".into(), "vertical".into()),
+                            ("cell_percentage".into(), 25.into()),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            Value::Array(vec![
+                "mode_change".into(),
+                Value::Array(vec!["insert".into(), 1.into()]),
+            ]),
+        ]);
+        let runs = grid.row_runs(0);
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.column, run.width, run.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, 2, "中"), (2, 1, "a"), (3, 1, "b")]
+        );
+        assert_eq!(runs[2].highlight.foreground, DEFAULT_BACKGROUND);
+        assert_eq!(runs[2].highlight.background, Some(DEFAULT_FOREGROUND));
+        let cursor = grid.visible_cursor().unwrap();
+        assert_eq!((cursor.width, cursor.text.as_str()), (2, "中"));
+        assert_eq!(cursor.shape, CursorShape::Vertical(0.25));
+        grid.apply_redraw(&[Value::Array(vec![
+            "busy_start".into(),
+            Value::Array(vec![]),
+        ])]);
+        assert!(grid.visible_cursor().is_none());
+    }
+
+    #[test]
     fn detects_normal_escape_mapping() {
         let maps = vec![vec![
             ("lhs".into(), "<Esc>".into()),
@@ -717,7 +1017,7 @@ mod tests {
     #[test]
     #[ignore = "requires the external Neovim installation"]
     fn starts_neovim_and_receives_redraw() {
-        let client = Client::start(PathBuf::from("examples/tikz.md"), true);
+        let client = Client::start(PathBuf::from("examples/tikz.md"), true, (120, 40));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -898,7 +1198,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::write(&path, "original\n").unwrap();
-        let owner = Client::start(path.clone(), true);
+        let owner = Client::start(path.clone(), true, (120, 40));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -943,7 +1243,7 @@ mod tests {
         owner.input(":preserve<CR>");
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(100)).await });
 
-        let contender = Client::start(path.clone(), true);
+        let contender = Client::start(path.clone(), true, (120, 40));
         let error = runtime
             .block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {

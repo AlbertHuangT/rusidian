@@ -1,6 +1,6 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use crate::math::{FONT_SIZE, Formula};
-use crate::nvim::{Client as NvimClient, Event as NvimEvent, Grid as NvimGrid};
+use crate::nvim::{Client as NvimClient, CursorShape, Event as NvimEvent, Grid as NvimGrid};
 use crate::update;
 use crate::vault::Vault;
 use cargo_packager_updater::Update;
@@ -8,18 +8,43 @@ use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, PathPromptOptions, Pixels, Point, ScrollHandle,
-    SharedString, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, Window,
+    SharedString, Size, StrikethroughStyle, StyledText, UTF16Selection, UnderlineStyle, Window,
     WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, OnceLock},
 };
 
 const WINDOW_WIDTH: f32 = 960.0;
 const WINDOW_HEIGHT: f32 = 640.0;
+const SOURCE_FONT_SIZE: f32 = 14.0;
+const SOURCE_LINE_HEIGHT: f32 = 20.0;
+const GRID_PADDING: f32 = 12.0;
+/// Monospace families in preference order; the Neovim grid needs a real fixed-width font.
+const MONO_FAMILIES: &[&str] = if cfg!(target_os = "macos") {
+    &["Menlo", "SF Mono", "Monaco", "Courier New"]
+} else {
+    &[
+        "DejaVu Sans Mono",
+        "Noto Sans Mono",
+        "Liberation Mono",
+        "Ubuntu Mono",
+        "FreeMono",
+    ]
+};
+static MONO_FAMILY: OnceLock<SharedString> = OnceLock::new();
+
+fn mono_family() -> SharedString {
+    MONO_FAMILY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| MONO_FAMILIES[0].into())
+}
 
 actions!(
     rusidian,
@@ -28,6 +53,12 @@ actions!(
 
 pub fn run(initial_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
+        let installed = cx.text_system().all_font_names();
+        let family = MONO_FAMILIES
+            .iter()
+            .find(|family| installed.iter().any(|name| name == *family))
+            .unwrap_or(&MONO_FAMILIES[0]);
+        MONO_FAMILY.get_or_init(|| (*family).into());
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-shift-o", OpenFolder, None),
@@ -110,7 +141,9 @@ struct RusidianApp {
     grid: NvimGrid,
     nvim_error: Option<SharedString>,
     nvim_warning: Option<SharedString>,
-    nvim_size: (i64, i64),
+    /// Grid size last requested from Neovim; shared with the layout pass that measures it.
+    nvim_size: Rc<Cell<(i64, i64)>>,
+    cell_size: Size<Pixels>,
     reading_cursor: ReadingCursor,
     reading_column: Option<usize>,
     reading_pending_g: bool,
@@ -198,132 +231,80 @@ enum TikzState {
 }
 
 impl RusidianApp {
+    fn empty() -> Self {
+        Self {
+            document: None,
+            vault: None,
+            error: None,
+            tikz: HashMap::new(),
+            math: HashMap::new(),
+            view: View::Reading,
+            nvim: None,
+            pending_close: None,
+            grid: NvimGrid::default(),
+            nvim_error: None,
+            nvim_warning: None,
+            nvim_size: Rc::new(Cell::new((120, 40))),
+            cell_size: size(px(SOURCE_FONT_SIZE * 0.6), px(SOURCE_LINE_HEIGHT)),
+            reading_cursor: ReadingCursor::default(),
+            reading_column: None,
+            reading_pending_g: false,
+            reading_count: None,
+            reading_find: None,
+            reading_selection: None,
+            reading_search: None,
+            last_search: None,
+            reading_scroll: ScrollHandle::new(),
+            focus_handle: None,
+            marked_text: String::new(),
+            marked_selection: 0..0,
+            settings_open: false,
+            auto_update: update::auto_update_enabled(),
+            update_status: UpdateStatus::Idle,
+            available_update: None,
+        }
+    }
+
     fn open(path: Option<&Path>) -> Self {
+        let mut app = Self::empty();
         let Some(path) = path else {
-            return Self {
-                document: None,
-                vault: None,
-                error: None,
-                tikz: HashMap::new(),
-                math: HashMap::new(),
-                view: View::Reading,
-                nvim: None,
-                pending_close: None,
-                grid: NvimGrid::default(),
-                nvim_error: None,
-                nvim_warning: None,
-                nvim_size: (120, 40),
-                reading_cursor: ReadingCursor::default(),
-                reading_column: None,
-                reading_pending_g: false,
-                reading_count: None,
-                reading_find: None,
-                reading_selection: None,
-                reading_search: None,
-                last_search: None,
-                reading_scroll: ScrollHandle::new(),
-                focus_handle: None,
-                marked_text: String::new(),
-                marked_selection: 0..0,
-                settings_open: false,
-                auto_update: update::auto_update_enabled(),
-                update_status: UpdateStatus::Idle,
-                available_update: None,
-            };
+            return app;
         };
 
         if path.is_dir() {
-            return match Vault::open(path) {
+            match Vault::open(path) {
                 Ok(vault) => {
                     let first = vault.files.first().cloned();
-                    let mut app = Self::open(first.as_deref());
+                    app = Self::open(first.as_deref());
                     app.attach_vault(vault);
-                    app
                 }
                 Err(error) => {
-                    let mut app = Self::open(None);
                     app.error = Some(format!("无法打开文件夹 {}：{error}", path.display()).into());
-                    app
                 }
-            };
+            }
+            return app;
         }
 
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let lines = source_lines(&content);
-                Self {
-                    document: Some(Document {
-                        file: path.to_path_buf(),
-                        name: path
-                            .file_name()
-                            .unwrap_or(path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned()
-                            .into(),
-                        path: path.to_string_lossy().into_owned().into(),
-                        lines,
-                        markdown: crate::markdown::parse(&content),
-                    }),
-                    vault: None,
-                    error: None,
-                    tikz: HashMap::new(),
-                    math: HashMap::new(),
-                    view: View::Reading,
-                    nvim: None,
-                    pending_close: None,
-                    grid: NvimGrid::default(),
-                    nvim_error: None,
-                    nvim_warning: None,
-                    nvim_size: (120, 40),
-                    reading_cursor: ReadingCursor::default(),
-                    reading_column: None,
-                    reading_pending_g: false,
-                    reading_count: None,
-                    reading_find: None,
-                    reading_selection: None,
-                    reading_search: None,
-                    last_search: None,
-                    reading_scroll: ScrollHandle::new(),
-                    focus_handle: None,
-                    marked_text: String::new(),
-                    marked_selection: 0..0,
-                    settings_open: false,
-                    auto_update: update::auto_update_enabled(),
-                    update_status: UpdateStatus::Idle,
-                    available_update: None,
-                }
+                app.document = Some(Document {
+                    file: path.to_path_buf(),
+                    name: path
+                        .file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                        .into(),
+                    path: path.to_string_lossy().into_owned().into(),
+                    lines: source_lines(&content),
+                    markdown: crate::markdown::parse(&content),
+                });
             }
-            Err(error) => Self {
-                document: None,
-                vault: None,
-                error: Some(format!("无法打开 {}：{error}", path.display()).into()),
-                tikz: HashMap::new(),
-                math: HashMap::new(),
-                view: View::Reading,
-                nvim: None,
-                pending_close: None,
-                grid: NvimGrid::default(),
-                nvim_error: None,
-                nvim_warning: None,
-                nvim_size: (120, 40),
-                reading_cursor: ReadingCursor::default(),
-                reading_column: None,
-                reading_pending_g: false,
-                reading_count: None,
-                reading_find: None,
-                reading_selection: None,
-                reading_search: None,
-                last_search: None,
-                reading_scroll: ScrollHandle::new(),
-                focus_handle: None,
-                marked_text: String::new(),
-                marked_selection: 0..0,
-                settings_open: false,
-                auto_update: update::auto_update_enabled(),
-                update_status: UpdateStatus::Idle,
-                available_update: None,
-            },
+            Err(error) => {
+                app.error = Some(format!("无法打开 {}：{error}", path.display()).into());
+            }
         }
+        app
     }
 
     fn attach_vault(&mut self, vault: Vault) {
@@ -540,7 +521,7 @@ impl RusidianApp {
         let Some(path) = self.document.as_ref().map(|document| document.file.clone()) else {
             return;
         };
-        let client = NvimClient::start(path, false);
+        let client = NvimClient::start(path, false, self.nvim_size.get());
         let events = client.events.clone();
         self.nvim = Some(client);
 
@@ -1372,7 +1353,7 @@ impl RusidianApp {
         }
     }
 
-    fn render_source(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_source(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if let Some(error) = &self.nvim_error {
             return div()
                 .flex_1()
@@ -1385,86 +1366,193 @@ impl RusidianApp {
                 .into_any_element();
         }
 
+        let family = mono_family();
+        let font_size = px(SOURCE_FONT_SIZE);
+        let line_height = px(SOURCE_LINE_HEIGHT);
+        let font_id = window
+            .text_system()
+            .resolve_font(&gpui::font(family.clone()));
+        let cell_width = window
+            .text_system()
+            .advance(font_id, font_size, 'm')
+            .map(|advance| advance.width)
+            .ok()
+            .filter(|width| *width > px(0.0))
+            .unwrap_or(px(SOURCE_FONT_SIZE * 0.6));
+        self.cell_size = size(cell_width, line_height);
+
         let view = cx.entity();
         let focus = self.focus_handle.clone();
-        let marked_text = self.marked_text.clone();
-        let warning = self.nvim_warning.clone();
         let (foreground, background) = self.grid.colors();
+        let padding = px(GRID_PADDING);
+        let cell = |column: usize, row: usize| {
+            (
+                padding + cell_width * column as f32,
+                padding + line_height * row as f32,
+            )
+        };
+
+        let mut layers = Vec::new();
+        for row in 0..self.grid.height() {
+            for run in self.grid.row_runs(row) {
+                let (left, top) = cell(run.column, row);
+                let style = run.highlight;
+                layers.push(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(cell_width * run.width as f32)
+                        .h(line_height)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .when_some(style.background, |element, color| element.bg(rgb(color)))
+                        .text_color(rgb(style.foreground))
+                        .when(style.bold, |element| element.font_weight(FontWeight::BOLD))
+                        .when(style.italic, |element| element.italic())
+                        .when(style.underline, |element| {
+                            element
+                                .underline()
+                                .text_decoration_color(rgb(style.special))
+                        })
+                        .when(style.strikethrough, |element| element.line_through())
+                        .child(run.text)
+                        .into_any_element(),
+                );
+            }
+        }
+        if let Some(cursor) = self.grid.visible_cursor() {
+            let (left, top) = cell(cursor.column, cursor.row);
+            let width = cell_width * cursor.width as f32;
+            let element = if !self.marked_text.is_empty() {
+                // IME composition is drawn at the cursor until the text is committed to Neovim.
+                div()
+                    .absolute()
+                    .left(left)
+                    .top(top)
+                    .h(line_height)
+                    .whitespace_nowrap()
+                    .bg(rgb(0x7a3b20))
+                    .text_color(rgb(0xffffff))
+                    .underline()
+                    .child(self.marked_text.clone())
+            } else {
+                match cursor.shape {
+                    CursorShape::Block => div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(width)
+                        .h(line_height)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .bg(rgb(foreground))
+                        .text_color(rgb(background))
+                        .child(cursor.text),
+                    CursorShape::Vertical(fraction) => div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w((cell_width * fraction).max(px(2.0)))
+                        .h(line_height)
+                        .bg(rgb(foreground)),
+                    CursorShape::Horizontal(fraction) => {
+                        let height = (line_height * fraction).max(px(2.0));
+                        div()
+                            .absolute()
+                            .left(left)
+                            .top(top + line_height - height)
+                            .w(width)
+                            .h(height)
+                            .bg(rgb(foreground))
+                    }
+                }
+            };
+            layers.push(element.into_any_element());
+        }
+
+        let resizer = self.nvim.as_ref().map(NvimClient::resizer);
+        let requested = self.nvim_size.clone();
+        let warning = self.nvim_warning.clone().map(|warning| {
+            div()
+                .flex_none()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .m_3()
+                .mb_0()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x4a3518))
+                .text_color(rgb(0xffd38a))
+                .text_sm()
+                .child(div().flex_1().child(warning))
+                .child(
+                    div()
+                        .id("dismiss-nvim-warning")
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|element| element.bg(rgb(0x5c4420)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.nvim_warning = None;
+                            cx.notify();
+                        }))
+                        .child("×"),
+                )
+        });
 
         div()
             .flex_1()
-            .id("nvim-grid")
-            .relative()
-            .overflow_scroll()
-            .p_4()
-            .bg(rgb(background.unwrap_or(0x0c0f12)))
-            .text_color(rgb(foreground.unwrap_or(0xe6e9ed)))
-            .font_family("SFMono-Regular")
-            .text_sm()
-            .when_some(warning, |element, warning| {
-                element.child(
-                    div()
-                        .mb_3()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(0x4a3518))
-                        .text_color(rgb(0xffd38a))
-                        .child(warning),
-                )
-            })
-            .children(self.grid.styled_lines().map(|(mut line, styles, cursor)| {
-                let mut highlights = styles
-                    .into_iter()
-                    .map(|(range, style)| {
-                        (
-                            range,
-                            HighlightStyle {
-                                color: style.foreground.map(|color| rgb(color).into()),
-                                background_color: style.background.map(|color| rgb(color).into()),
-                                font_weight: style.bold.then_some(FontWeight::BOLD),
-                                font_style: style.italic.then_some(FontStyle::Italic),
-                                ..Default::default()
-                            },
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(background))
+            .children(warning)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .text_color(rgb(foreground))
+                    .font_family(family)
+                    .text_size(font_size)
+                    .line_height(line_height)
+                    .children(layers)
+                    .when_some(focus, |element, focus| {
+                        element.track_focus(&focus).child(
+                            canvas(
+                                move |bounds, _, _| {
+                                    let columns = ((bounds.size.width - padding * 2.0) / cell_width)
+                                        .floor()
+                                        .max(20.0)
+                                        as i64;
+                                    let rows = ((bounds.size.height - padding * 2.0) / line_height)
+                                        .floor()
+                                        .max(5.0)
+                                        as i64;
+                                    if requested.get() != (columns, rows) {
+                                        requested.set((columns, rows));
+                                        if let Some(resizer) = &resizer {
+                                            resizer.resize(columns, rows);
+                                        }
+                                    }
+                                },
+                                move |bounds, _, window, cx| {
+                                    window.handle_input(
+                                        &focus,
+                                        ElementInputHandler::new(bounds, view),
+                                        cx,
+                                    );
+                                },
+                            )
+                            .absolute()
+                            .size_full(),
                         )
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(range) = cursor {
-                    if marked_text.is_empty() {
-                        highlights.push((
-                            range,
-                            HighlightStyle {
-                                color: Some(rgb(background.unwrap_or(0x0c0f12)).into()),
-                                background_color: Some(rgb(foreground.unwrap_or(0xe6e9ed)).into()),
-                                ..Default::default()
-                            },
-                        ));
-                    } else {
-                        let start = range.start;
-                        insert_marked_text(&mut line, &mut highlights, start, &marked_text);
-                        highlights.push((
-                            start..start + marked_text.len(),
-                            HighlightStyle {
-                                background_color: Some(rgb(0x7a3b20).into()),
-                                ..Default::default()
-                            },
-                        ));
-                    }
-                }
-                let text = StyledText::new(line).with_highlights(merge_highlights(highlights));
-                div().whitespace_nowrap().child(text)
-            }))
-            .when_some(focus, |element, focus| {
-                element.track_focus(&focus).child(
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds, _, window, cx| {
-                            window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
-                        },
-                    )
-                    .absolute()
-                    .size_full(),
-                )
-            })
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1744,21 +1832,6 @@ impl RusidianApp {
             )
             .into_any_element()
     }
-
-    fn resize_nvim(&mut self, window: &Window) {
-        let viewport = window.viewport_size();
-        let width = ((f32::from(viewport.width) - 32.0) / 8.0).floor().max(20.0) as i64;
-        let height = ((f32::from(viewport.height) - 84.0) / 18.0)
-            .floor()
-            .max(8.0) as i64;
-        let size = (width, height);
-        if size != self.nvim_size {
-            self.nvim_size = size;
-            if let Some(nvim) = &self.nvim {
-                nvim.resize(width, height);
-            }
-        }
-    }
 }
 
 impl EntityInputHandler for RusidianApp {
@@ -1851,12 +1924,13 @@ impl EntityInputHandler for RusidianApp {
                 size(px(8.0), px(18.0)),
             ));
         }
+        let (row, column) = self.grid.cursor;
         Some(Bounds::new(
             point(
-                element_bounds.left() + px(16.0 + self.grid.cursor.1 as f32 * 8.0),
-                element_bounds.top() + px(16.0 + self.grid.cursor.0 as f32 * 18.0),
+                element_bounds.left() + px(GRID_PADDING) + self.cell_size.width * column as f32,
+                element_bounds.top() + px(GRID_PADDING) + self.cell_size.height * row as f32,
             ),
-            size(px(8.0), px(18.0)),
+            self.cell_size,
         ))
     }
 
@@ -1881,9 +1955,6 @@ impl EntityInputHandler for RusidianApp {
 
 impl Render for RusidianApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.view == View::Source {
-            self.resize_nvim(window);
-        }
         let title = self
             .document
             .as_ref()
@@ -1968,7 +2039,7 @@ impl Render for RusidianApp {
         };
 
         let body = if self.view == View::Source {
-            self.render_source(cx)
+            self.render_source(window, cx)
         } else {
             reading
         };
@@ -2110,7 +2181,7 @@ impl Render for RusidianApp {
                         .flex()
                         .items_center()
                         .bg(rgb(0x1c2229))
-                        .font_family("SFMono-Regular")
+                        .font_family(mono_family())
                         .child(prompt),
                 )
             })
@@ -2136,23 +2207,6 @@ impl Render for RusidianApp {
                 },
             )
             .when_some(settings, |element, settings| element.child(settings))
-    }
-}
-
-fn insert_marked_text(
-    line: &mut String,
-    highlights: &mut [(std::ops::Range<usize>, HighlightStyle)],
-    at: usize,
-    marked: &str,
-) {
-    line.insert_str(at, marked);
-    for (range, _) in highlights {
-        if range.start >= at {
-            range.start += marked.len();
-            range.end += marked.len();
-        } else if range.end > at {
-            range.end += marked.len();
-        }
     }
 }
 
@@ -2329,7 +2383,7 @@ fn render_block(
             .p_4()
             .rounded_md()
             .bg(rgb(0x1c2229))
-            .font_family("SFMono-Regular")
+            .font_family(mono_family())
             .when_some(language.as_ref(), |element, language| {
                 element.child(
                     div()
@@ -2346,7 +2400,7 @@ fn render_block(
             .p_4()
             .rounded_md()
             .bg(rgb(0x1c2229))
-            .font_family("SFMono-Regular")
+            .font_family(mono_family())
             .child(text)
             .into_any_element(),
         BlockKind::Rule => div()
@@ -3272,28 +3326,6 @@ mod tests {
         app.document.as_mut().unwrap().markdown = crate::markdown::parse("$$x_i$$");
         assert_eq!(app.pending_math(), vec![("x_i".into(), true)]);
         assert!(!app.math.contains_key(&("x_i".into(), false)));
-    }
-
-    #[test]
-    fn composition_keeps_highlights_on_character_boundaries() {
-        let mut line = "abc中文".to_owned();
-        let mut highlights = vec![
-            (0..2, HighlightStyle::default()),
-            (1..3, HighlightStyle::default()),
-            (3..9, HighlightStyle::default()),
-        ];
-        insert_marked_text(&mut line, &mut highlights, 1, "输入");
-        assert_eq!(line, "a输入bc中文");
-        assert_eq!(
-            highlights
-                .iter()
-                .map(|(range, _)| range.clone())
-                .collect::<Vec<_>>(),
-            [0..8, 7..9, 9..15]
-        );
-        for (range, _) in highlights {
-            assert!(line.is_char_boundary(range.start) && line.is_char_boundary(range.end));
-        }
     }
 
     #[test]
