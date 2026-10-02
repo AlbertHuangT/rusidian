@@ -757,6 +757,8 @@ struct SwitcherItem {
     name: String,
     folder: String,
     alias: Option<String>,
+    /// A note not written yet, named by the query: choosing it creates it.
+    create: bool,
 }
 
 /// Most rows the quick switcher lists; it scrolls past the first dozen.
@@ -1464,6 +1466,7 @@ impl RusidianApp {
                     .map(|folder| folder.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 alias: None,
+                create: false,
             }
         };
         if query.trim().is_empty() {
@@ -1507,7 +1510,68 @@ impl RusidianApp {
                 .then_with(|| first.name.len().cmp(&second.name.len()))
                 .then_with(|| first.path.cmp(&second.path))
         });
-        scored.into_iter().map(|(_, item)| item).collect()
+        let mut items: Vec<SwitcherItem> = scored.into_iter().map(|(_, item)| item).collect();
+        if let Some(new) = self.switcher_new_note(query) {
+            // After the matches, but still among the rows listed.
+            items.insert(items.len().min(SWITCHER_ROWS - 1), new);
+        }
+        items
+    }
+
+    /// Like Obsidian's switcher, offer to create the note typed when no note has that name.
+    fn switcher_new_note(&self, query: &str) -> Option<SwitcherItem> {
+        let typed = query.trim().trim_end_matches(".md").trim_end_matches('/');
+        let (folder, name) = typed.rsplit_once('/').unwrap_or(("", typed));
+        // Note names compare without case, as in Obsidian's links.
+        let root = self.vault.as_ref().map(|vault| vault.root.as_path());
+        let same =
+            |a: &std::ffi::OsStr, b: &str| a.to_string_lossy().to_lowercase() == b.to_lowercase();
+        let mut files = match &self.vault {
+            Some(vault) => vault.files.iter(),
+            None => self.recent.iter(),
+        };
+        if files.any(|path| {
+            let relative = root
+                .and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            crate::vault::is_markdown(path)
+                && relative.file_stem().is_some_and(|stem| same(stem, name))
+                && (folder.is_empty()
+                    || relative
+                        .parent()
+                        .is_some_and(|parent| same(parent.as_os_str(), folder)))
+        }) {
+            return None;
+        }
+        // Where Obsidian puts new notes; beside the open note without a vault.
+        let note = match (&self.document, &self.vault) {
+            (Some(document), _) => document.file.clone(),
+            (None, Some(vault)) => vault.root.join("_"),
+            (None, None) => return None,
+        };
+        let path = crate::vault::new_note_path(&note, self.vault.as_ref(), typed)
+            .filter(|path| path.parent().is_some_and(Path::is_dir) && !path.exists())?;
+        let shown = self
+            .vault
+            .as_ref()
+            .and_then(|vault| path.parent()?.strip_prefix(&vault.root).ok())
+            .map(|folder| folder.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                path.parent()
+                    .map(|folder| folder.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        Some(SwitcherItem {
+            name: path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            folder: shown,
+            path,
+            alias: None,
+            create: true,
+        })
     }
 
     fn open_switcher_selection(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
@@ -1518,17 +1582,18 @@ impl RusidianApp {
             Some(switcher) if switcher.text => switcher
                 .hits
                 .get(selected)
-                .map(|hit| (hit.path.clone(), Some(line_fragment(hit.line)))),
+                .map(|hit| (hit.path.clone(), Some(line_fragment(hit.line)), false)),
             _ => self
                 .switcher_items()
                 .get(selected)
-                .map(|item| (item.path.clone(), None)),
+                .map(|item| (item.path.clone(), None, item.create)),
         };
-        let Some((path, fragment)) = target else {
+        let Some((path, fragment, create)) = target else {
             return;
         };
         self.switcher = None;
         self.marked_text.clear();
+        let name = display_name(&path);
         self.request_close(
             PendingClose::Open {
                 vault_root: self
@@ -1541,6 +1606,10 @@ impl RusidianApp {
             },
             cx,
         );
+        if create {
+            // Neovim opens a new buffer; the file exists once saved, as with links.
+            self.show_notice(format!("新笔记 {name}：用 :w 保存后创建"), false, cx);
+        }
         cx.notify();
     }
 
@@ -4538,6 +4607,15 @@ impl RusidianApp {
             self.switcher_items()
                 .into_iter()
                 .map(|item| match item.alias {
+                    _ if item.create => (
+                        format!("＋ {}", item.name),
+                        if item.folder.is_empty() {
+                            "新建笔记".to_owned()
+                        } else {
+                            format!("新建笔记 · {}", item.folder)
+                        },
+                        None,
+                    ),
                     // An alias match shows the alias, then the note it names.
                     Some(alias) => {
                         let note = if item.folder.is_empty() {
@@ -8142,6 +8220,29 @@ mod tests {
                 .is_some_and(|vault| vault.files.len() >= 3)
         );
         assert!(vault.document.is_some());
+    }
+
+    #[test]
+    fn offers_to_create_the_note_typed_in_the_switcher() {
+        let mut app = RusidianApp::open(Some(Path::new("examples")));
+        let mut items = |query: &str| {
+            app.switcher = Some(Switcher {
+                query: query.into(),
+                ..Switcher::default()
+            });
+            let items = app.switcher_items();
+            (items.iter().position(|item| item.create), items)
+        };
+        assert_eq!(items("markdown").0, None);
+        assert_eq!(items("MARKDOWN.md").0, None);
+        assert_eq!(items("../escape").0, None);
+        assert_eq!(items("").0, None);
+        let (Some(new), items) = items("Fresh idea") else {
+            panic!("no offer to create the note");
+        };
+        assert_eq!(new, items.len() - 1);
+        assert_eq!(items[new].name, "Fresh idea");
+        assert!(items[new].path.ends_with("examples/Fresh idea.md"));
     }
 
     #[test]
