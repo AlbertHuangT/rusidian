@@ -5113,19 +5113,19 @@ impl Render for RusidianApp {
             });
             let blocks = &document.markdown.blocks;
             // Space below each block: outside it, or inside a quote that continues.
-            let spacing: Vec<(Pixels, bool)> = blocks
+            let spacing: Vec<(Pixels, usize)> = blocks
                 .iter()
                 .enumerate()
                 .map(|(index, block)| {
                     let next = blocks.get(index + 1);
-                    (block_gap(block, next), continues_quote(block, next))
+                    (block_gap(block, next), shared_quote_depth(block, next))
                 })
                 .collect();
             let drawn = self.plan_blocks(
                 blocks,
                 spacing
                     .iter()
-                    .map(|&(gap, joined)| if joined { px(0.0) } else { gap })
+                    .map(|&(gap, shared)| if shared > 0 { px(0.0) } else { gap })
                     .collect(),
             );
             let plan = self.block_heights.borrow();
@@ -5141,7 +5141,8 @@ impl Render for RusidianApp {
                 }
                 let index = run.start;
                 let block = &blocks[index];
-                let (gap, joined) = spacing[index];
+                let (gap, shared) = spacing[index];
+                let joined = shared > 0;
                 div()
                     .id(("block", index))
                     .mx_auto()
@@ -5161,7 +5162,7 @@ impl Render for RusidianApp {
                         selection.and_then(|bounds| {
                             selection_for_block(bounds, index, block_len(block))
                         }),
-                        if joined { gap } else { px(0.0) },
+                        (if joined { gap } else { px(0.0) }, shared),
                     ))
                     .into_any_element()
             });
@@ -5786,19 +5787,33 @@ fn block_gap(block: &Block, next: Option<&Block>) -> Pixels {
     }
 }
 
-/// Whether the next block belongs to the same outermost quote, so the two read as one.
-fn continues_quote(block: &Block, next: Option<&Block>) -> bool {
-    block.quote_root.is_some() && next.is_some_and(|next| next.quote_root == block.quote_root)
+/// How many quote levels the next block shares with this one; above zero the two read as
+/// one quote. Blocks in the same innermost quote share all levels, sibling quotes all but the
+/// innermost, and otherwise the shallower one's levels.
+fn shared_quote_depth(block: &Block, next: Option<&Block>) -> usize {
+    let Some(next) =
+        next.filter(|next| block.quote_root.is_some() && next.quote_root == block.quote_root)
+    else {
+        return 0;
+    };
+    if next.quote == block.quote {
+        block.quote_depth
+    } else if next.quote_depth == block.quote_depth {
+        block.quote_depth.saturating_sub(1).max(1)
+    } else {
+        block.quote_depth.min(next.quote_depth)
+    }
 }
 
-/// `inner_gap` is spacing kept inside a quote's border or a callout's background.
+/// `inner_gap` is spacing kept inside the first `continued` levels of a quote (a callout's
+/// background), which continue into the next block.
 fn render_block(
     context: RenderContext,
     block: &Block,
     tikz: Option<&TikzState>,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
-    inner_gap: Pixels,
+    (inner_gap, continued): (Pixels, usize),
 ) -> AnyElement {
     let theme = context.theme;
     let links = context.links;
@@ -5853,6 +5868,7 @@ fn render_block(
                         .child(format!("![{alt}]({source_label})"))
                         .into_any_element(),
                     inner_gap,
+                    continued,
                 );
             };
             div()
@@ -6060,7 +6076,7 @@ fn render_block(
     } else {
         content
     };
-    decorate_block(theme, block, content, inner_gap)
+    decorate_block(theme, block, content, inner_gap, continued)
 }
 
 /// A note, heading section or block shown with `![[note]]`, in a card titled with its name.
@@ -6135,7 +6151,8 @@ fn render_embedded_blocks(context: RenderContext, blocks: &[Block]) -> AnyElemen
             } else {
                 px(0.0)
             };
-            let joined = continues_quote(block, next);
+            let shared = shared_quote_depth(block, next);
+            let joined = shared > 0;
             let nested = RenderContext {
                 layouts: &layouts,
                 view: &inert,
@@ -6153,7 +6170,7 @@ fn render_embedded_blocks(context: RenderContext, blocks: &[Block]) -> AnyElemen
                     context.tikz.get(&block.text),
                     None,
                     None,
-                    if joined { gap } else { px(0.0) },
+                    (if joined { gap } else { px(0.0) }, shared),
                 ))
         }))
         .into_any_element()
@@ -6198,6 +6215,7 @@ fn decorate_block(
     block: &Block,
     content: AnyElement,
     inner_gap: Pixels,
+    continued: usize,
 ) -> AnyElement {
     let marker: Option<SharedString> = if let Some(checked) = block.task {
         Some(if checked { "☑" } else { "☐" }.into())
@@ -6222,14 +6240,16 @@ fn decorate_block(
     };
     if let Some(kind) = &block.callout {
         let color = crate::theme::callout_color(kind);
-        div()
+        // The callout continues, or only a quote around it does: then its box ends here.
+        let continues = continued >= block.quote_depth;
+        let callout = div()
             .flex()
             .flex_col()
             .ml(px(12.0 * block.quote_depth.saturating_sub(1) as f32))
             .pl_3()
             .pr_3()
             // The callout's own bottom padding where it ends.
-            .pb(inner_gap.max(px(10.0)))
+            .pb(if continues { inner_gap } else { px(0.0) }.max(px(10.0)))
             .border_l_2()
             .border_color(rgb(color))
             .bg(rgba((color << 8) | 0x14))
@@ -6242,18 +6262,34 @@ fn decorate_block(
                         .child(title),
                 )
             })
-            .child(content)
-            .into_any_element()
+            .child(content);
+        if continues {
+            callout.into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .pb(inner_gap)
+                .child(callout)
+                .into_any_element()
+        }
     } else if block.quote_depth > 0 {
+        // One border per level; the space below stays inside the levels that continue.
+        let mut quoted = content;
+        for level in (1..=block.quote_depth).rev() {
+            quoted = div()
+                .flex()
+                .flex_col()
+                .pl_3()
+                .border_l_2()
+                .border_color(rgb(theme.quote_border))
+                .when(level == continued, |element| element.pb(inner_gap))
+                .child(quoted)
+                .into_any_element();
+        }
         div()
-            .flex()
-            .flex_col()
-            .pl(px(12.0 * block.quote_depth as f32))
-            .pb(inner_gap)
-            .border_l_2()
-            .border_color(rgb(theme.quote_border))
             .text_color(rgb(theme.quote_text))
-            .child(content)
+            .child(quoted)
             .into_any_element()
     } else {
         content
@@ -7479,6 +7515,20 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn shares_quote_levels_with_the_next_block() {
+        let blocks =
+            crate::markdown::parse("> a\n>\n> b\n> > c\n>\n> > d\n>\n> e\n\n> f\n\ng\n").blocks;
+        let texts: Vec<_> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["a", "b", "c", "d", "e", "f", "g"]);
+        let shared: Vec<_> = (0..blocks.len())
+            .map(|index| shared_quote_depth(&blocks[index], blocks.get(index + 1)))
+            .collect();
+        // a-b one level; b-c the outer one; c-d sibling nested quotes share the outer one;
+        // d-e the outer; e and f are separate quotes; f-g none.
+        assert_eq!(shared, [1, 1, 1, 1, 0, 0, 0]);
     }
 
     #[test]
