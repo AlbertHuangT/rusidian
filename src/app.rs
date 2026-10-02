@@ -50,6 +50,7 @@ actions!(
         PreviousTab,
         ToggleSidebar,
         QuickSwitcher,
+        SearchVault,
         EnterSourceNormal
     ]
 );
@@ -92,6 +93,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         ),
         KeyBinding::new(&format!("{modifier}-\\"), ToggleSidebar, context),
         KeyBinding::new(&format!("{modifier}-p"), QuickSwitcher, context),
+        KeyBinding::new(&format!("{modifier}-shift-f"), SearchVault, context),
         KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
     ]
 }
@@ -128,6 +130,7 @@ pub fn run(initial_path: Option<PathBuf>) {
             Menu::new("文件").items([
                 MenuItem::action("新建窗口", NewWindow),
                 MenuItem::action("快速打开笔记…", QuickSwitcher),
+                MenuItem::action("在笔记中搜索…", SearchVault),
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
                 MenuItem::separator(),
@@ -410,6 +413,7 @@ struct RusidianApp {
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
     switcher: Option<Switcher>,
+    switcher_scroll: ScrollHandle,
     /// The window showing this app, to close it once Neovim agrees.
     window: Option<AnyWindowHandle>,
     appearance: Appearance,
@@ -508,11 +512,108 @@ struct SearchPrompt {
     forward: bool,
 }
 
-/// The quick switcher: find a note by name and open it.
+/// The quick switcher: find a note by name, or by text in it, and open it.
 #[derive(Default)]
 struct Switcher {
     query: String,
     selected: usize,
+    /// Searching the notes' text instead of their names.
+    text: bool,
+    /// Lines containing the query, once the background search for it finished.
+    hits: Vec<TextHit>,
+    /// Counts searches, so a slower earlier one cannot replace newer results.
+    generation: u64,
+}
+
+/// A line of a note containing the searched text.
+#[derive(Clone)]
+struct TextHit {
+    path: PathBuf,
+    name: String,
+    folder: String,
+    /// Zero-based source line.
+    line: usize,
+    text: String,
+}
+
+/// Opening a note at a line goes through the fragment used for headings and blocks; NUL never
+/// appears in fragments written in Markdown.
+const LINE_FRAGMENT: &str = "\u{0}line ";
+
+fn line_fragment(line: usize) -> String {
+    format!("{LINE_FRAGMENT}{line}")
+}
+
+fn line_from_fragment(fragment: &str) -> Option<usize> {
+    fragment.strip_prefix(LINE_FRAGMENT)?.parse().ok()
+}
+
+/// Most text hits gathered per search.
+const SEARCH_LIMIT: usize = 200;
+
+/// Lines of `files` containing `query`, ignoring case, in file order; at most `limit`.
+fn search_notes(files: &[PathBuf], root: Option<&Path>, query: &str, limit: usize) -> Vec<TextHit> {
+    let needle = query.trim().to_lowercase();
+    let mut hits = Vec::new();
+    if needle.is_empty() {
+        return hits;
+    }
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let relative = root
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path);
+        for (line, content) in text.lines().enumerate() {
+            if !content.to_lowercase().contains(&needle) {
+                continue;
+            }
+            hits.push(TextHit {
+                path: path.clone(),
+                name: relative
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                folder: relative
+                    .parent()
+                    .map(|folder| folder.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                line,
+                text: hit_excerpt(content, &needle),
+            });
+            if hits.len() >= limit {
+                return hits;
+            }
+        }
+    }
+    hits
+}
+
+/// The part of a long line around the match of `needle` (lowercase).
+fn hit_excerpt(line: &str, needle: &str) -> String {
+    let line = line.trim();
+    let characters: Vec<char> = line.chars().collect();
+    if characters.len() <= 100 {
+        return line.to_owned();
+    }
+    let lower: Vec<char> = line
+        .chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .collect();
+    let wanted: Vec<char> = needle.chars().collect();
+    let at = (0..lower.len())
+        .find(|&index| lower[index..].starts_with(&wanted))
+        .unwrap_or(0);
+    let start = at.saturating_sub(30);
+    let end = (start + 100).min(characters.len());
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        characters[start..end].iter().collect::<String>(),
+        if end < characters.len() { "…" } else { "" }
+    )
 }
 
 /// A note the quick switcher offers: its path, name and folder.
@@ -522,8 +623,8 @@ struct SwitcherItem {
     folder: String,
 }
 
-/// Rows the quick switcher shows.
-const SWITCHER_ROWS: usize = 12;
+/// Most rows the quick switcher lists; it scrolls past the first dozen.
+const SWITCHER_ROWS: usize = 50;
 
 /// How well `query` matches `text` (a note's folder and name), ignoring case and spaces: its
 /// characters must appear in order. Consecutive characters, word starts and matches in the
@@ -618,6 +719,7 @@ impl RusidianApp {
             marked_selection: 0..0,
             settings_open: false,
             switcher: None,
+            switcher_scroll: ScrollHandle::new(),
             window: None,
             appearance: settings.appearance,
             reading_key: settings.reading_key,
@@ -1052,10 +1154,86 @@ impl RusidianApp {
     }
 
     fn open_switcher(&mut self, _: &QuickSwitcher, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_switcher(false, cx);
+    }
+
+    fn open_text_search(&mut self, _: &SearchVault, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_switcher(true, cx);
+    }
+
+    fn show_switcher(&mut self, text: bool, cx: &mut Context<Self>) {
         self.settings_open = false;
         self.marked_text.clear();
-        self.switcher = Some(Switcher::default());
+        self.switcher = Some(Switcher {
+            text,
+            ..Switcher::default()
+        });
         cx.notify();
+    }
+
+    /// The notes the switcher searches: the vault's, or recent files without a vault.
+    fn switcher_files(&self) -> Vec<PathBuf> {
+        match &self.vault {
+            Some(vault) => vault.files.clone(),
+            None => self
+                .recent
+                .iter()
+                .filter(|path| path.is_file() && crate::vault::is_markdown(path))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Rows the switcher lists now.
+    fn switcher_rows(&self) -> usize {
+        match &self.switcher {
+            Some(switcher) if switcher.text => switcher.hits.len(),
+            Some(_) => self.switcher_items().len(),
+            None => 0,
+        }
+        .min(SWITCHER_ROWS)
+    }
+
+    /// Search the notes' text for the query in the background, shortly after typing pauses.
+    fn search_text(&mut self, cx: &mut Context<Self>) {
+        let Some(switcher) = self.switcher.as_mut().filter(|switcher| switcher.text) else {
+            return;
+        };
+        switcher.generation += 1;
+        switcher.selected = 0;
+        let generation = switcher.generation;
+        let query = switcher.query.clone();
+        if query.trim().is_empty() {
+            switcher.hits.clear();
+            return;
+        }
+        let files = self.switcher_files();
+        let root = self.vault.as_ref().map(|vault| vault.root.clone());
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(std::time::Duration::from_millis(120)).await;
+            let current = |this: &RusidianApp| {
+                this.switcher
+                    .as_ref()
+                    .is_some_and(|switcher| switcher.generation == generation)
+            };
+            if !this.read_with(cx, |this, _| current(this)).unwrap_or(false) {
+                return;
+            }
+            let hits = executor
+                .spawn(async move { search_notes(&files, root.as_deref(), &query, SEARCH_LIMIT) })
+                .await;
+            this.update(cx, |this, cx| {
+                if current(this)
+                    && let Some(switcher) = &mut this.switcher
+                {
+                    switcher.hits = hits;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Notes matching the switcher's query, best first: the vault's notes, or recent files
@@ -1120,14 +1298,22 @@ impl RusidianApp {
     }
 
     fn open_switcher_selection(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
-        let items = self.switcher_items();
         let selected = index
             .or_else(|| self.switcher.as_ref().map(|switcher| switcher.selected))
             .unwrap_or(0);
-        let Some(item) = items.get(selected.min(items.len().saturating_sub(1))) else {
+        let target = match &self.switcher {
+            Some(switcher) if switcher.text => switcher
+                .hits
+                .get(selected)
+                .map(|hit| (hit.path.clone(), Some(line_fragment(hit.line)))),
+            _ => self
+                .switcher_items()
+                .get(selected)
+                .map(|item| (item.path.clone(), None)),
+        };
+        let Some((path, fragment)) = target else {
             return;
         };
-        let path = item.path.clone();
         self.switcher = None;
         self.marked_text.clear();
         self.request_close(
@@ -1138,7 +1324,7 @@ impl RusidianApp {
                     .filter(|vault| path.starts_with(&vault.root))
                     .map(|vault| vault.root.clone()),
                 path,
-                fragment: None,
+                fragment,
             },
             cx,
         );
@@ -1894,6 +2080,16 @@ impl RusidianApp {
         let Some(document) = &self.document else {
             return false;
         };
+        if let Some(line) = line_from_fragment(fragment) {
+            let offset = source_offset(&document.lines, line, 0);
+            let Some(cursor) = reading_position(&document.markdown.blocks, offset) else {
+                return false;
+            };
+            self.reading_cursor = cursor;
+            self.reading_column = None;
+            self.reveal_reading_cursor();
+            return true;
+        }
         let target = if let Some(label) = crate::markdown::footnote_label(fragment) {
             document.markdown.blocks.iter().position(|block| {
                 matches!(&block.kind, BlockKind::Footnote { label: found, .. } if found == label)
@@ -2777,23 +2973,34 @@ impl RusidianApp {
             }
             return;
         }
-        if let Some(switcher) = &mut self.switcher {
+        if self.switcher.is_some() {
             let control = event.keystroke.modifiers.control;
+            let last = self.switcher_rows().saturating_sub(1);
+            let Some(switcher) = &mut self.switcher else {
+                return;
+            };
+            let up = matches!(event.keystroke.key.as_str(), "up")
+                || (control && matches!(event.keystroke.key.as_str(), "p" | "k"));
+            let down = matches!(event.keystroke.key.as_str(), "down")
+                || (control && matches!(event.keystroke.key.as_str(), "n" | "j"));
             match event.keystroke.key.as_str() {
                 "escape" => {
                     self.switcher = None;
                     self.marked_text.clear();
                 }
                 "enter" => self.open_switcher_selection(None, cx),
-                "up" => switcher.selected = switcher.selected.saturating_sub(1),
-                "p" | "k" if control => switcher.selected = switcher.selected.saturating_sub(1),
-                "down" => switcher.selected = (switcher.selected + 1).min(SWITCHER_ROWS - 1),
-                "n" | "j" if control => {
-                    switcher.selected = (switcher.selected + 1).min(SWITCHER_ROWS - 1);
+                _ if up || down => {
+                    switcher.selected = if up {
+                        switcher.selected.saturating_sub(1)
+                    } else {
+                        (switcher.selected + 1).min(last)
+                    };
+                    self.switcher_scroll.scroll_to_item(switcher.selected);
                 }
                 "backspace" => {
                     switcher.query.pop();
                     switcher.selected = 0;
+                    self.search_text(cx);
                 }
                 _ if event.keystroke.key_char.is_some()
                     && !control
@@ -3800,16 +4007,17 @@ impl RusidianApp {
 
     fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
-        let switcher = self.switcher.as_ref();
-        let query = switcher
-            .map(|switcher| switcher.query.clone())
-            .unwrap_or_default();
-        let items = self.switcher_items();
-        let selected = switcher
-            .map(|switcher| switcher.selected)
-            .unwrap_or(0)
-            .min(items.len().saturating_sub(1));
+        let Some(switcher) = self.switcher.as_ref() else {
+            return div().into_any_element();
+        };
+        let query = switcher.query.clone();
         let typed = format!("{query}{}", self.marked_text);
+        let placeholder = match (switcher.text, self.vault.is_some()) {
+            (true, true) => "搜索所有笔记的文字…",
+            (true, false) => "搜索最近打开的笔记的文字…",
+            (false, true) => "输入笔记名称…",
+            (false, false) => "输入最近打开的文件名…",
+        };
         let input = div()
             .px_4()
             .py_3()
@@ -3818,33 +4026,37 @@ impl RusidianApp {
             .border_b_1()
             .border_color(rgb(theme.border))
             .when(typed.is_empty(), |element| {
-                element
-                    .text_color(rgb(theme.faint))
-                    .child(if self.vault.is_some() {
-                        "输入笔记名称…"
-                    } else {
-                        "输入最近打开的文件名…"
-                    })
+                element.text_color(rgb(theme.faint)).child(placeholder)
             })
             .when(!typed.is_empty(), |element| element.child(typed))
             .child(div().ml_px().w(px(2.0)).h(px(18.0)).bg(rgb(theme.accent)));
-        let rows = items
-            .iter()
-            .take(SWITCHER_ROWS)
-            .enumerate()
-            .map(|(index, item)| {
+        // Each row: a title (note name), its folder, and for text hits the matching line.
+        let entries: Vec<(String, String, Option<String>)> = if switcher.text {
+            switcher
+                .hits
+                .iter()
+                .map(|hit| (hit.name.clone(), hit.folder.clone(), Some(hit.text.clone())))
+                .collect()
+        } else {
+            self.switcher_items()
+                .into_iter()
+                .map(|item| (item.name, item.folder, None))
+                .collect()
+        };
+        let empty = entries.is_empty();
+        let selected = switcher.selected.min(entries.len().saturating_sub(1));
+        let rows = entries.into_iter().take(SWITCHER_ROWS).enumerate().map(
+            |(index, (name, folder, line))| {
+                let current = index == selected;
                 div()
                     .id(("switcher-row", index))
                     .px_4()
                     .py_2()
                     .flex()
-                    .items_baseline()
-                    .gap_3()
+                    .flex_col()
                     .cursor_pointer()
-                    .when(index == selected, |element| {
-                        element.bg(rgb(theme.accent_soft_bg))
-                    })
-                    .when(index != selected, |element| {
+                    .when(current, |element| element.bg(rgb(theme.accent_soft_bg)))
+                    .when(!current, |element| {
                         element.hover(|element| element.bg(rgb(theme.hover)))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3852,30 +4064,57 @@ impl RusidianApp {
                     }))
                     .child(
                         div()
-                            .flex_none()
-                            .max_w(px(320.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_color(rgb(if index == selected {
-                                theme.accent_soft_text
-                            } else {
-                                theme.text
-                            }))
-                            .child(item.name.clone()),
+                            .flex()
+                            .items_baseline()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(320.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_color(rgb(if current {
+                                        theme.accent_soft_text
+                                    } else {
+                                        theme.text
+                                    }))
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .text_color(rgb(theme.faint))
+                                    .child(folder),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .text_color(rgb(theme.faint))
-                            .child(item.folder.clone()),
-                    )
-            });
+                    .when_some(line, |element, line| {
+                        element.child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_sm()
+                                .text_color(rgb(theme.muted))
+                                .child(line),
+                        )
+                    })
+            },
+        );
+        let status = if !empty {
+            None
+        } else if query.trim().is_empty() {
+            (!switcher.text).then_some("没有可打开的笔记")
+        } else if switcher.text {
+            Some("没有找到这段文字")
+        } else {
+            Some("没有匹配的笔记")
+        };
         div()
             .absolute()
             .size_full()
@@ -3895,7 +4134,6 @@ impl RusidianApp {
                 div()
                     .id("switcher")
                     .w(px(560.0))
-                    .max_h(px(520.0))
                     .flex()
                     .flex_col()
                     .overflow_hidden()
@@ -3906,19 +4144,22 @@ impl RusidianApp {
                     // Clicks inside the panel do not close it.
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(input)
-                    .children(rows)
-                    .when(items.is_empty(), |element| {
+                    .child(
+                        div()
+                            .id("switcher-rows")
+                            .max_h(px(440.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.switcher_scroll)
+                            .children(rows),
+                    )
+                    .when_some(status, |element, status| {
                         element.child(
                             div()
                                 .px_4()
                                 .py_3()
                                 .text_sm()
                                 .text_color(rgb(theme.muted))
-                                .child(if query.trim().is_empty() {
-                                    "没有可打开的笔记"
-                                } else {
-                                    "没有匹配的笔记"
-                                }),
+                                .child(status),
                         )
                     })
                     .child(
@@ -3929,7 +4170,11 @@ impl RusidianApp {
                             .border_color(rgb(theme.border))
                             .text_xs()
                             .text_color(rgb(theme.faint))
-                            .child("↑↓ 选择 · Enter 打开 · Esc 关闭"),
+                            .child(if switcher.text {
+                                "↑↓ 选择 · Enter 打开到该行 · Esc 关闭"
+                            } else {
+                                "↑↓ 选择 · Enter 打开 · Esc 关闭"
+                            }),
                     ),
             )
             .into_any_element()
@@ -4461,6 +4706,7 @@ impl EntityInputHandler for RusidianApp {
         if let Some(switcher) = &mut self.switcher {
             switcher.query.push_str(text);
             switcher.selected = 0;
+            self.search_text(cx);
             window.invalidate_character_coordinates();
             cx.notify();
             return;
@@ -4875,6 +5121,7 @@ impl Render for RusidianApp {
             .on_action(cx.listener(Self::choose_folder))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_switcher))
+            .on_action(cx.listener(Self::open_text_search))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_tab(cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, _, cx| {
                 this.request_close(PendingClose::CloseWindow, cx);
@@ -6991,6 +7238,41 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn searches_note_text() {
+        let root = std::env::temp_dir().join(format!("rusidian-search-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.md"), "# A\n\nRust and GPUI\nnothing\n").unwrap();
+        std::fs::write(root.join("sub/b.md"), "gpui again\n").unwrap();
+        let files = [root.join("a.md"), root.join("sub/b.md")];
+        let hits = search_notes(&files, Some(&root), "GPUI", 10);
+        let found: Vec<_> = hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.name.as_str(),
+                    hit.folder.as_str(),
+                    hit.line,
+                    hit.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [("a", "", 2, "Rust and GPUI"), ("b", "sub", 0, "gpui again")]
+        );
+        assert_eq!(search_notes(&files, Some(&root), "gpui", 1).len(), 1);
+        assert!(search_notes(&files, Some(&root), "  ", 10).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let long = format!("{}needle{}", "a".repeat(200), "b".repeat(200));
+        let excerpt = hit_excerpt(&long, "needle");
+        assert!(excerpt.starts_with('…') && excerpt.ends_with('…'));
+        assert!(excerpt.contains("needle"));
+        assert_eq!(line_from_fragment(&line_fragment(86)), Some(86));
+        assert_eq!(line_from_fragment("Heading"), None);
     }
 
     #[test]

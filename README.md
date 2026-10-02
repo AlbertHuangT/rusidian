@@ -99,6 +99,7 @@ cargo run --locked -- examples/markdown.md
 | 打开光标处的内部 / 外部链接 | `gf` / `gx`，或直接点击 | 同左 |
 | 切换标签 | `⌘ {` / `⌘ }`、`Ctrl+Tab` | `Ctrl+PageUp/PageDown`、`Ctrl+Tab` |
 | 快速打开笔记（按名称模糊查找） | `⌘ P` | `Ctrl+P` |
+| 在所有笔记中搜索文字 | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | 新建窗口 | `⌘ N` | `Ctrl+N` |
 | 关闭标签 / 窗口 | `⌘ W` / `⌘ ⇧ W` | `Ctrl+W` / `Ctrl+Shift+W` |
 | 显示 / 隐藏文件列表 | `⌘ \` | `Ctrl+\` |
@@ -128,13 +129,13 @@ TikZ 块写完整环境，外层文档由 Rusidian 补齐：
 
 | 已有实现，可参与验证 | 尚未完成验收或仍在规划 |
 | :--- | :--- |
-| 文件 / 文件夹打开、最近打开、可折叠 Vault 文件树、多文件标签、多窗口（每个窗口一个 Neovim） | 多窗口共享同一个内存 buffer、用户真实配置的完整兼容 |
+| 文件 / 文件夹打开、最近打开、可折叠 Vault 文件树、快速打开与全文搜索、多文件标签、多窗口（每个窗口一个 Neovim） | 多窗口共享同一个内存 buffer、用户真实配置的完整兼容 |
 | Neovim 嵌入、内存 buffer 预览、跟随 Neovim 内切换 buffer、外部修改重新载入、双向光标同步 | TeX 可信 vault 与外部命令等逐项权限 |
 | 常见 Markdown / GFM、脚注、wikilink、嵌入与附件、callout、高亮、属性、阅读导航（含屏幕折行）、选择、鼠标、远程图片按需加载 | 完整 Obsidian 语义（索引、反向链接、tags）、混合图文富文本复制 |
 | TikZ（按规定时机后台编译、前导内容配置）、GPUI 原生行内 / 块级公式、PDF 缓存 | 中文输入与字体的完整验收、性能指标 |
 | 亮色 / 暗色主题跟随系统、状态栏、未保存提示 | |
 
-后续优先级是让多个窗口共享同一个 Neovim buffer，再扩展全文搜索、反向链接、tags 与 properties。**Linux 可从源码实验性构建；Windows 不在支持目标内。**
+后续优先级是让多个窗口共享同一个 Neovim buffer，再扩展反向链接、tags 与 properties 的索引。**Linux 可从源码实验性构建；Windows 不在支持目标内。**
 
 HTML 按代码显示，Mermaid 保留源码；不执行 Obsidian 插件，也不承诺兼容其主题。应用体积、内存与启动速度目前仍是待测目标，不是已达成的性能宣传。
 
