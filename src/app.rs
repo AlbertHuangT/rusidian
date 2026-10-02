@@ -2842,10 +2842,16 @@ impl RusidianApp {
                 .markdown
                 .blocks
                 .get(self.reading_cursor.block)?;
-            match &block.kind {
-                BlockKind::Image(source) => Some(source.clone()),
-                _ => None,
+            if let BlockKind::Image(source) = &block.kind {
+                return Some(source.clone());
             }
+            // An image or attachment inside a paragraph.
+            let byte = text_range(&block.text, self.reading_cursor.offset)?.start;
+            block
+                .images
+                .iter()
+                .find(|image| image.range.contains(&byte))
+                .map(|image| image.source.clone())
         })
     }
 
@@ -6059,6 +6065,42 @@ fn render_block(
         BlockKind::Image(source) if let Some(path) = links.embedded_note(source) => {
             render_embed(context, source, &path, object_cursor)
         }
+        // PDFs, audio, video and other attachments: a card that gf opens with the system app.
+        BlockKind::Image(source)
+            if let Some(path) = links
+                .image(source)
+                .filter(|path| image_format(path).is_none()) =>
+        {
+            div()
+                .px_4()
+                .py_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(if object_cursor {
+                    theme.accent
+                } else {
+                    theme.border_strong
+                }))
+                .child(
+                    div()
+                        .text_color(rgb(theme.accent))
+                        .child(format!("📎 {}", display_name(&path))),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme.faint))
+                        .child(if path.exists() {
+                            "gf 用系统应用打开"
+                        } else {
+                            "找不到这个附件"
+                        }),
+                )
+                .into_any_element()
+        }
         BlockKind::Image(source) if crate::remote::is_remote(source) => div()
             .when(object_cursor, |element| {
                 element.border_2().border_color(rgb(theme.accent))
@@ -6876,6 +6918,23 @@ fn render_inline_paragraph(
                 div()
                     .when(!picture, |element| element.pt(px(ascent - text_baseline)))
                     .child(remote_image(context, &image.source, &image.alt, true))
+                    .into_any_element()
+            }
+            InlineAtom::Image(image)
+                if let Some(path) = links
+                    .image(&image.source)
+                    .filter(|path| image_format(path).is_none()) =>
+            {
+                div()
+                    .pt(px(ascent - text_baseline))
+                    .child(
+                        div()
+                            .px_1()
+                            .rounded_md()
+                            .bg(rgb(theme.inline_code))
+                            .text_color(rgb(theme.accent))
+                            .child(format!("📎 {}", display_name(&path))),
+                    )
                     .into_any_element()
             }
             InlineAtom::Image(image) => {
