@@ -22,6 +22,8 @@ pub struct Block {
     pub quote_depth: usize,
     /// The innermost blockquote containing this block, numbered in document order.
     pub quote: Option<usize>,
+    /// The outermost blockquote containing this block; blocks sharing it read as one quote.
+    pub quote_root: Option<usize>,
     /// The callout kind (`note`, `tip`, ...) of the innermost blockquote, if it is a callout.
     pub callout: Option<String>,
     /// The callout's title, on the first block of the callout only.
@@ -98,6 +100,7 @@ struct PendingImage {
 struct Quote {
     depth: usize,
     id: Option<usize>,
+    root: Option<usize>,
 }
 
 struct ListState {
@@ -175,6 +178,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     quote = Quote {
                         depth: quotes.len(),
                         id: quotes.last().copied(),
+                        root: quotes.first().copied(),
                     };
                 }
                 Tag::List(start) => {
@@ -254,6 +258,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     quote = Quote {
                         depth: quotes.len(),
                         id: quotes.last().copied(),
+                        root: quotes.first().copied(),
                     };
                 }
                 TagEnd::List(_) => {
@@ -428,6 +433,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         task: None,
         quote_depth: quote.depth,
         quote: quote.id,
+        quote_root: quote.root,
         callout: None,
         callout_title: None,
         fence_closed: false,
@@ -934,6 +940,14 @@ mod tests {
         let nested = &callouts.blocks[2];
         assert_eq!((nested.callout.as_deref(), nested.quote_depth), (None, 2));
         assert_eq!(callouts.blocks[3].callout, None);
+        // Separate quotes stay apart; a nested quote belongs to its outer one.
+        let roots: Vec<_> = callouts
+            .blocks
+            .iter()
+            .map(|block| block.quote_root)
+            .collect();
+        assert_eq!(roots, [Some(0), Some(1), Some(1), Some(3)]);
+        assert_ne!(nested.quote, nested.quote_root);
         assert_eq!(
             parse_callout_header("[!warning]"),
             Some(("warning".into(), None, 10))

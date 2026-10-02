@@ -3781,22 +3781,18 @@ impl Render for RusidianApp {
                         .iter()
                         .enumerate()
                         .map(|(index, block)| {
-                            // Table rows are separate blocks; space the table as a whole.
-                            let table_end = matches!(block.kind, BlockKind::Table { .. })
-                                && !matches!(
-                                    document
-                                        .markdown
-                                        .blocks
-                                        .get(index + 1)
-                                        .map(|next| &next.kind),
-                                    Some(BlockKind::Table { header: false })
-                                );
+                            let next = document.markdown.blocks.get(index + 1);
+                            let gap = block_gap(block, next);
+                            // Inside one quote the gap stays within the border and background.
+                            let joined = continues_quote(block, next);
                             div()
                                 .id(("block", index))
                                 .mx_auto()
                                 .w_full()
                                 .max_w(px(820.0))
-                                .when(table_end, |element| element.mb_4())
+                                .flex()
+                                .flex_col()
+                                .when(!joined, |element| element.mb(gap))
                                 .child(render_block(
                                     RenderContext {
                                         block_index: index,
@@ -3809,6 +3805,7 @@ impl Render for RusidianApp {
                                     selection.and_then(|bounds| {
                                         selection_for_block(bounds, index, block_len(block))
                                     }),
+                                    if joined { gap } else { px(0.0) },
                                 ))
                         }),
                 )
@@ -4321,12 +4318,39 @@ impl RenderContext<'_> {
     }
 }
 
+/// Space below a block. Blocks carry no outer margins of their own: GPUI lays divs out as CSS
+/// blocks, and taffy's measure cache drops margins that collapse through a parent, so spacing
+/// that relied on collapsing changed between layout passes (lost entirely next to the sidebar).
+fn block_gap(block: &Block, next: Option<&Block>) -> Pixels {
+    match block.kind {
+        // Table rows are separate blocks; space the table as a whole.
+        BlockKind::Table { .. }
+            if matches!(
+                next.map(|next| &next.kind),
+                Some(BlockKind::Table { header: false })
+            ) =>
+        {
+            px(0.0)
+        }
+        BlockKind::Rule | BlockKind::DefinitionTitle => px(0.0),
+        BlockKind::Footnote(_) | BlockKind::Definition => px(12.0),
+        _ => px(16.0),
+    }
+}
+
+/// Whether the next block belongs to the same outermost quote, so the two read as one.
+fn continues_quote(block: &Block, next: Option<&Block>) -> bool {
+    block.quote_root.is_some() && next.is_some_and(|next| next.quote_root == block.quote_root)
+}
+
+/// `inner_gap` is spacing kept inside a quote's border or a callout's background.
 fn render_block(
     context: RenderContext,
     block: &Block,
     tikz: Option<&TikzState>,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
+    inner_gap: Pixels,
 ) -> AnyElement {
     let theme = context.theme;
     let links = context.links;
@@ -4336,7 +4360,6 @@ fn render_block(
 
     let content = match &block.kind {
         BlockKind::Heading(level) => div()
-            .mb_4()
             .text_size(px(match level {
                 1 => 32.0,
                 2 => 27.0,
@@ -4352,9 +4375,8 @@ fn render_block(
         BlockKind::Paragraph if !block.maths.is_empty() => {
             render_inline_paragraph(context, block, cursor, selection)
         }
-        BlockKind::Paragraph => div().mb_4().child(text()).into_any_element(),
+        BlockKind::Paragraph => div().child(text()).into_any_element(),
         BlockKind::Image(source) if crate::remote::is_remote(source) => div()
-            .mb_4()
             .when(object_cursor, |element| {
                 element.border_2().border_color(rgb(theme.accent))
             })
@@ -4370,7 +4392,6 @@ fn render_block(
                     theme,
                     block,
                     div()
-                        .mb_4()
                         .p_4()
                         .rounded_md()
                         .when(object_cursor, |element| {
@@ -4380,10 +4401,10 @@ fn render_block(
                         .on_mouse_down(MouseButton::Left, context.click_at(0))
                         .child(format!("![{alt}]({source_label})"))
                         .into_any_element(),
+                    inner_gap,
                 );
             };
             div()
-                .mb_4()
                 .when(object_cursor, |element| {
                     element.border_2().border_color(rgb(theme.accent))
                 })
@@ -4406,7 +4427,6 @@ fn render_block(
                 let width = crate::tikz::png_size(image.bytes())
                     .map(|(width, _)| px(width as f32 / crate::tikz::PREVIEW_SCALE));
                 div()
-                    .mb_4()
                     .p_4()
                     .rounded_md()
                     .when(object_cursor, |element| {
@@ -4421,7 +4441,6 @@ fn render_block(
                     .into_any_element()
             }
             Some(TikzState::Failed(error)) => div()
-                .mb_4()
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
@@ -4432,7 +4451,6 @@ fn render_block(
                 .child(error.clone())
                 .into_any_element(),
             _ => div()
-                .mb_4()
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
@@ -4444,7 +4462,6 @@ fn render_block(
                 .into_any_element(),
         },
         BlockKind::Code(language) => div()
-            .mb_4()
             .p_4()
             .rounded_md()
             .bg(rgb(theme.block))
@@ -4467,7 +4484,6 @@ fn render_block(
                 && let Some(properties) = parse_properties(&block.text) =>
         {
             div()
-                .mb_4()
                 .px_4()
                 .py_2()
                 .rounded_md()
@@ -4495,7 +4511,6 @@ fn render_block(
                 .into_any_element()
         }
         BlockKind::Html | BlockKind::Metadata => div()
-            .mb_4()
             .p_4()
             .rounded_md()
             .bg(rgb(theme.block))
@@ -4541,7 +4556,6 @@ fn render_block(
             .into_any_element(),
         BlockKind::Math => match context.math.get(&(block.text.clone(), true)) {
             Some(MathState::Ready(formula)) => div()
-                .mb_4()
                 .p_4()
                 .rounded_md()
                 .bg(rgb(theme.block))
@@ -4550,7 +4564,6 @@ fn render_block(
                 .child(formula.element(FONT_SIZE))
                 .into_any_element(),
             Some(MathState::Failed(error)) => div()
-                .mb_4()
                 .p_4()
                 .rounded_md()
                 .bg(rgb(theme.error_bg))
@@ -4558,7 +4571,6 @@ fn render_block(
                 .child(format!("$${}$$：{}", block.text, error))
                 .into_any_element(),
             _ => div()
-                .mb_4()
                 .p_4()
                 .rounded_md()
                 .bg(rgb(theme.block))
@@ -4567,7 +4579,6 @@ fn render_block(
                 .into_any_element(),
         },
         BlockKind::Footnote(label) => div()
-            .mb_3()
             .flex()
             .text_sm()
             .child(
@@ -4583,7 +4594,7 @@ fn render_block(
             .font_weight(FontWeight::BOLD)
             .child(text())
             .into_any_element(),
-        BlockKind::Definition => div().mb_3().ml_6().child(text()).into_any_element(),
+        BlockKind::Definition => div().ml_6().child(text()).into_any_element(),
     };
     let content = if is_object(block) {
         div()
@@ -4593,10 +4604,15 @@ fn render_block(
     } else {
         content
     };
-    decorate_block(theme, block, content)
+    decorate_block(theme, block, content, inner_gap)
 }
 
-fn decorate_block(theme: &Theme, block: &Block, content: AnyElement) -> AnyElement {
+fn decorate_block(
+    theme: &Theme,
+    block: &Block,
+    content: AnyElement,
+    inner_gap: Pixels,
+) -> AnyElement {
     let marker: Option<SharedString> = if let Some(checked) = block.task {
         Some(if checked { "☑" } else { "☐" }.into())
     } else {
@@ -4615,9 +4631,13 @@ fn decorate_block(theme: &Theme, block: &Block, content: AnyElement) -> AnyEleme
     if let Some(kind) = &block.callout {
         let color = crate::theme::callout_color(kind);
         div()
+            .flex()
+            .flex_col()
             .ml(px(12.0 * block.quote_depth.saturating_sub(1) as f32))
             .pl_3()
             .pr_3()
+            // The callout's own bottom padding where it ends.
+            .pb(inner_gap.max(px(10.0)))
             .border_l_2()
             .border_color(rgb(color))
             .bg(rgba((color << 8) | 0x14))
@@ -4634,7 +4654,10 @@ fn decorate_block(theme: &Theme, block: &Block, content: AnyElement) -> AnyEleme
             .into_any_element()
     } else if block.quote_depth > 0 {
         div()
+            .flex()
+            .flex_col()
             .pl(px(12.0 * block.quote_depth as f32))
+            .pb(inner_gap)
             .border_l_2()
             .border_color(rgb(theme.quote_border))
             .text_color(rgb(theme.quote_text))
@@ -5006,7 +5029,6 @@ fn render_inline_paragraph(
         );
     }
     div()
-        .mb_4()
         .flex()
         .flex_wrap()
         .items_start()
