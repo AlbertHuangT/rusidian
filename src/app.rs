@@ -1984,8 +1984,30 @@ impl RusidianApp {
         if !self.callout_toggles.remove(&id) {
             self.callout_toggles.insert(id);
         }
+        // Folding moves the cursor out of the hidden part, onto the title line.
+        self.rest_on_fold();
         self.invalidate_block_heights();
         cx.notify();
+    }
+
+    /// Like on Vim's closed folds, a cursor inside a folded callout rests on its title rather
+    /// than opening it.
+    fn rest_on_fold(&mut self) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let blocks = &document.markdown.blocks;
+        if let Some(range) = fold_ranges(blocks, &self.folded_callouts(blocks))
+            .into_iter()
+            .find(|range| range.contains(&self.reading_cursor.block))
+            && let Some(id) = blocks[range.start].callout_quote
+        {
+            self.reading_cursor = ReadingCursor {
+                block: range.start,
+                offset: 0,
+            };
+            self.callout_cursor_parked = Some((id, self.reading_cursor));
+        }
     }
 
     /// Forget measured block heights after anything that can change a block's size: the
@@ -2821,6 +2843,7 @@ impl RusidianApp {
             && cursor != self.reading_cursor
         {
             self.reading_cursor = cursor;
+            self.rest_on_fold();
         } else if delta == px(0.0) {
             self.move_reading_document_edge(down);
         }
@@ -3007,26 +3030,35 @@ impl RusidianApp {
         };
         let (line, column) = cursor_line(current, self.reading_cursor.offset);
         let column = *self.reading_column.get_or_insert(column);
+        // A folded callout the cursor rests on is a single line.
+        let fold = fold_ranges(blocks, &self.folded_callouts(blocks))
+            .into_iter()
+            .find(|range| range.contains(&self.reading_cursor.block));
+        let lines = if fold.is_some() {
+            0
+        } else {
+            block_line_count(current)
+        };
 
         let target = if down {
-            ((line + 1)..block_line_count(current))
+            ((line + 1)..lines)
                 .find_map(|line| cursor_for_line(current, self.reading_cursor.block, line, column))
                 .or_else(|| {
                     blocks
                         .iter()
                         .enumerate()
-                        .skip(self.reading_cursor.block + 1)
+                        .skip(fold.map_or(self.reading_cursor.block + 1, |range| range.end))
                         .find_map(|(block, value)| cursor_for_line(value, block, 0, column))
                 })
         } else {
-            (0..line)
+            (0..line.min(lines))
                 .rev()
                 .find_map(|line| cursor_for_line(current, self.reading_cursor.block, line, column))
                 .or_else(|| {
                     blocks
                         .iter()
                         .enumerate()
-                        .take(self.reading_cursor.block)
+                        .take(fold.map_or(self.reading_cursor.block, |range| range.start))
                         .rev()
                         .find_map(|(block, value)| {
                             (0..block_line_count(value))
@@ -3037,6 +3069,7 @@ impl RusidianApp {
         };
         if let Some(target) = target {
             self.reading_cursor = target;
+            self.rest_on_fold();
         }
     }
 
@@ -3232,6 +3265,7 @@ impl RusidianApp {
         if let Some(target) = target {
             self.reading_cursor = target;
             self.reading_column = None;
+            self.rest_on_fold();
         }
     }
 
@@ -3504,23 +3538,7 @@ impl RusidianApp {
                     })
                 {
                     self.toggle_callout(id, cx);
-                    // Folding moves the cursor out of the hidden part, onto the title line.
-                    if self.document.as_ref().is_some_and(|document| {
-                        self.folded_callouts(&document.markdown.blocks)
-                            .contains(&id)
-                    }) && let Some(first) = self.document.as_ref().and_then(|document| {
-                        document
-                            .markdown
-                            .blocks
-                            .iter()
-                            .position(|block| block.callout_quote == Some(id))
-                    }) {
-                        self.reading_cursor = ReadingCursor {
-                            block: first,
-                            offset: 0,
-                        };
-                        self.callout_cursor_parked = Some((id, self.reading_cursor));
-                    }
+                    self.reveal_reading_cursor();
                 }
                 self.reading_count = None;
                 return;
@@ -5370,25 +5388,23 @@ impl Render for RusidianApp {
         let view = cx.entity().downgrade();
         self.fragment_layouts.borrow_mut().clear();
         self.layouts_ready.set(false);
-        // The cursor never hides: a folded callout it is in opens, unless it was just folded
-        // with the cursor parked on its title.
+        // The cursor never hides: folded callouts it is in open, unless it rests on the title.
         if self.view == View::Reading
             && let Some(document) = &self.document
-            && let Some(id) = document
-                .markdown
-                .blocks
-                .get(self.reading_cursor.block)
-                .and_then(|block| block.callout_quote)
-            && self
-                .folded_callouts(&document.markdown.blocks)
-                .contains(&id)
-            && self.callout_cursor_parked != Some((id, self.reading_cursor))
         {
-            if !self.callout_toggles.remove(&id) {
-                self.callout_toggles.insert(id);
+            let blocks = &document.markdown.blocks;
+            while let Some(range) = fold_ranges(blocks, &self.folded_callouts(blocks))
+                .into_iter()
+                .find(|range| range.contains(&self.reading_cursor.block))
+                && let Some(id) = blocks[range.start].callout_quote
+                && self.callout_cursor_parked != Some((id, self.reading_cursor))
+            {
+                if !self.callout_toggles.remove(&id) {
+                    self.callout_toggles.insert(id);
+                }
+                self.callout_cursor_parked = None;
+                self.invalidate_block_heights();
             }
-            self.callout_cursor_parked = None;
-            self.invalidate_block_heights();
         }
         let reading = if self.view == View::Source {
             div().into_any_element()
@@ -5424,18 +5440,21 @@ impl Render for RusidianApp {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
             });
             let blocks = &document.markdown.blocks;
-            let folded = self.folded_callouts(blocks);
             // A folded callout shows its title on its first block; the rest of it is hidden.
-            let in_folded =
-                |block: &Block| block.callout_quote.is_some_and(|id| folded.contains(&id));
+            // For each block: `Some(true)` for such a title, `Some(false)` when hidden.
+            let mut fold = vec![None; blocks.len()];
+            for range in fold_ranges(blocks, &self.folded_callouts(blocks)) {
+                fold[range.start] = Some(true);
+                fold[range.start + 1..range.end].fill(Some(false));
+            }
             // Space below each block: outside it, or inside a quote that continues.
             let spacing: Vec<(Pixels, usize)> = blocks
                 .iter()
                 .enumerate()
-                .map(|(index, block)| match in_folded(block) {
-                    true if block.callout_title.is_some() => (px(16.0), 0),
-                    true => (px(0.0), 0),
-                    false => {
+                .map(|(index, block)| match fold[index] {
+                    Some(true) => (px(16.0), 0),
+                    Some(false) => (px(0.0), 0),
+                    None => {
                         let next = blocks.get(index + 1);
                         (block_gap(block, next), shared_quote_depth(block, next))
                     }
@@ -5463,13 +5482,13 @@ impl Render for RusidianApp {
                 let block = &blocks[index];
                 let (gap, shared) = spacing[index];
                 let joined = shared > 0;
-                if in_folded(block) {
+                if let Some(title) = fold[index] {
                     let wrapper = div()
                         .id(("block", index))
                         .mx_auto()
                         .w_full()
                         .max_w(px(820.0));
-                    return match block.callout_title.as_ref() {
+                    return match block.callout_title.as_ref().filter(|_| title) {
                         Some(title) => wrapper
                             .mb(gap)
                             .child(render_folded_callout(
@@ -6528,6 +6547,30 @@ fn render_block(
 }
 
 /// A folded callout: its title alone, which a click (or `za`) opens.
+/// The blocks of each outermost folded callout, from its title block to its end. Everything
+/// in a folded callout folds with it, callouts nested in it included.
+fn fold_ranges(blocks: &[Block], folded: &HashSet<usize>) -> Vec<std::ops::Range<usize>> {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (start, block) in blocks.iter().enumerate() {
+        if block.callout_title.is_none()
+            || ranges.last().is_some_and(|range| range.contains(&start))
+        {
+            continue;
+        }
+        let Some(id) = block.callout_quote.filter(|id| folded.contains(id)) else {
+            continue;
+        };
+        // Like the callout's own blocks in the parser: its quote's, and deeper ones.
+        let depth = block.quote_depth;
+        let length = blocks[start + 1..]
+            .iter()
+            .take_while(|next| next.quote == Some(id) || next.quote_depth > depth)
+            .count();
+        ranges.push(start..start + 1 + length);
+    }
+    ranges
+}
+
 fn render_folded_callout(
     context: RenderContext,
     block: &Block,
@@ -8084,6 +8127,23 @@ mod tests {
         // a-b one level; b-c the outer one; c-d sibling nested quotes share the outer one;
         // d-e the outer; e and f are separate quotes; f-g none.
         assert_eq!(shared, [1, 1, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn folds_callouts_with_the_callouts_nested_in_them() {
+        let blocks = crate::markdown::parse(
+            "a\n\n> [!note]- Outer\n> b\n>\n> > [!tip]- Inner\n> > c\n>\n> d\n\n> [!faq]+ Next\n> e\n\nf\n",
+        )
+        .blocks;
+        let texts: Vec<_> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["a", "b", "c", "d", "e", "f"]);
+        let id = |index: usize| blocks[index].callout_quote.unwrap();
+        let folded = |ids: &[usize]| ids.iter().copied().collect::<HashSet<_>>();
+        assert!(fold_ranges(&blocks, &folded(&[])).is_empty());
+        // The outer callout hides the inner one, folded or not.
+        assert_eq!(fold_ranges(&blocks, &folded(&[id(1)])), vec![1..4]);
+        assert_eq!(fold_ranges(&blocks, &folded(&[id(1), id(2)])), vec![1..4]);
+        assert_eq!(fold_ranges(&blocks, &folded(&[id(2), id(4)])), [2..3, 4..5]);
     }
 
     #[test]
