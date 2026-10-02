@@ -1226,18 +1226,26 @@ impl RusidianApp {
         } else {
             display_name(&path).into()
         };
+        // A note in another Obsidian vault switches vaults; other files outside the current
+        // vault (a scratch file, the TeX preamble) keep it.
         if !self
             .vault
             .as_ref()
             .is_some_and(|vault| path.starts_with(&vault.root))
+            && let Some(vault) =
+                crate::vault::enclosing_vault_root(&path).and_then(|root| Vault::open(&root).ok())
         {
-            self.vault =
-                crate::vault::enclosing_vault_root(&path).and_then(|root| Vault::open(&root).ok());
+            self.vault = Some(vault);
+        }
+        let is_markdown = crate::vault::is_markdown(&path);
+        if !is_markdown {
+            // Only Markdown has a reading view.
+            self.view = View::Source;
         }
         self.document = Some(Document {
             name,
             path: path.to_string_lossy().into_owned().into(),
-            is_markdown: crate::vault::is_markdown(&path),
+            is_markdown,
             file: path,
             lines: vec![String::new()],
             markdown: MarkdownDocument { blocks: Vec::new() },
