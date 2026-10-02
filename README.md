@@ -29,11 +29,11 @@ Rusidian 是一个**本地优先的原生 Markdown 桌面应用**。它将你本
 
 ### 真正的 Neovim，熟悉的写作方式
 
-源码视图运行本机 `nvim --embed`，加载你的 Neovim 配置。Insert、Visual、命令行和用户映射由 Neovim 处理。阅读与源码在同一个窗口内切换，阅读视图读取内存中的 buffer，**无需先保存就能查看修改**。
+源码视图运行本机 `nvim --embed`，加载你的 Neovim 配置。Insert、Visual、命令行、鼠标和用户映射由 Neovim 处理。阅读与源码在同一个窗口内切换，阅读视图读取内存中的 buffer，**无需先保存就能查看修改**；两个视图的光标落在同一个字符上。在 Neovim 里 `:e` 其他文件、`:w` 新笔记或外部程序修改文件，阅读视图都会跟上；打开的笔记显示为标签，未保存的笔记可以留在后台。
 
 ### 给 Markdown 一个原生阅读空间
 
-GPUI 负责窗口、文字和图像绘制，不使用 Electron 或 WebView。阅读视图已有标题、强调、代码、列表、表格和本地图片，配合 Vim 式移动、查找与选择，让阅读也能留在键盘上。
+GPUI 负责窗口、文字和图像绘制，不使用 Electron 或 WebView。阅读视图已有标题、强调、代码、列表、表格、本地图片与 Obsidian 嵌入，配合 Vim 式移动、查找与选择，让阅读也能留在键盘上；点击可以放置光标或打开链接。阅读视图默认跟随系统亮色 / 暗色，也可以在设置中固定。
 
 ### 把 TikZ 留在笔记里
 
@@ -75,24 +75,37 @@ cargo run --locked -- /absolute/path/to/note.md
 
 默认构建使用 GPUI 的运行时 Metal shader 编译路径，不需要独立 Metal 编译器。`--no-default-features` 构建需要 `xcrun metal` 和 `xcrun metallib`；该路径不在当前 CI 验证范围内。
 
+Linux（实验性，未进入 CI）可以从源码构建，需要 GPUI 的 X11 / Wayland 开发库；TikZ 预览另需 Poppler 的 `pdftoppm`：
+
+```sh
+# Debian / Ubuntu
+sudo apt install neovim poppler-utils libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libfontconfig-dev
+cargo run --locked -- examples/markdown.md
+```
+
+从访达或程序坞启动时，应用会从登录 shell 的 `PATH` 以及 Homebrew、MacPorts、Nix、`~/.local/bin` 等常见目录查找 `nvim`、`tectonic`，并把这个 `PATH` 交给 Neovim。
+
 ## 日常操作
 
-| 操作 | 按键 |
-| :--- | :--- |
-| 打开文件 | `⌘ O` |
-| 阅读 → 源码 Normal | `Enter` |
-| 源码 Normal → 阅读 | `Esc` |
-| 阅读视图移动 | `h j k l`、`w b e`、`0 ^ $`、`gg G` |
-| 翻页 | `Ctrl-d/u`、`Ctrl-f/b` |
-| 查找 | `/ ?`、`n N`、`* #`、`f F t T` |
-| 选择并复制 | `v` / `V`，然后 `y` |
-| 打开光标处的内部 / 外部链接 | `gf` / `gx` |
-| 保存文件 | 在 Neovim 中执行 `:w` |
-| 打开设置 / 更新 | `⌘ ,` |
+| 操作 | macOS | Linux（阅读视图中） |
+| :--- | :--- | :--- |
+| 打开文件 / 文件夹 | `⌘ O` / `⌘ ⇧ O` | `Ctrl+O` / `Ctrl+Shift+O` |
+| 阅读 → 源码 Normal | `Enter` | `Enter` |
+| 源码 Normal → 阅读 | `Esc` | `Esc` |
+| 阅读视图移动 | `h j k l`、`gj gk`、`w b e`、`0 ^ $`、`gg G` | 同左 |
+| 翻页 | `Ctrl-d/u`、`Ctrl-f/b` | 同左 |
+| 查找（全小写时不区分大小写） | `/ ?`、`n N`、`* #`、`f F t T` | 同左 |
+| 选择并复制 | `v` / `V`，然后 `y` | 同左 |
+| 打开光标处的内部 / 外部链接 | `gf` / `gx`，或直接点击 | 同左 |
+| 切换标签 | `⌘ {` / `⌘ }`、`Ctrl+Tab` | `Ctrl+PageUp/PageDown`、`Ctrl+Tab` |
+| 关闭标签 / 窗口 | `⌘ W` / `⌘ ⇧ W` | `Ctrl+W` / `Ctrl+Shift+W` |
+| 显示 / 隐藏文件列表 | `⌘ \` | `Ctrl+\` |
+| 保存文件 | 在 Neovim 中执行 `:w` | 同左 |
+| 打开设置 / 更新 | `⌘ ,` | `Ctrl+,` |
 
-切回阅读视图不会保存文件。换文件或从应用菜单退出时，Neovim 会拒绝丢弃未保存修改；先用 `:w` 保存，或自行用 `:q!` 放弃修改。当前检测到 Normal 模式的 `Esc` 映射冲突时只提示，应用仍优先使用该键切换视图。
+Linux 上 `Ctrl` 组合键在源码视图中全部交给 Neovim。切回阅读视图不会保存文件；状态栏和窗口标题中的 `●` 表示有未保存修改。切换笔记时未保存的笔记留在后台标签中；关闭这样的标签或退出应用时，Neovim 会拒绝丢弃修改，请先用 `:w`（或 `:wa`）保存，或用 `:e!` 放弃修改。检测到 Normal 模式的 `Esc` 映射冲突时只提示，应用仍优先使用该键切换视图。
 
-检测到 Neovim swap 冲突时，Rusidian 会停止打开源码视图并保留阅读内容，不会自动删除 swap 或覆盖文件；请先用 Neovim 的恢复模式检查内容。
+启动时检测到 Neovim swap 冲突，Rusidian 会停止打开源码视图并保留阅读内容；之后切换到有 swap 的笔记时以只读方式打开。两种情况都不会自动删除 swap 或覆盖文件，请先用 Neovim 的恢复模式检查内容。
 
 在设置中可以手动“检查更新”；应用优先使用正式 Release，没有正式版本时回退 nightly。自动安装默认关闭；点击“之后自动更新并安装”后，应用启动时会检查、验证并安装新版本，完成后由用户重启。Homebrew 安装同样提供设置页。
 
@@ -113,12 +126,13 @@ TikZ 块写完整环境，外层文档由 Rusidian 补齐：
 
 | 已有实现，可参与验证 | 尚未完成验收或仍在规划 |
 | :--- | :--- |
-| 单窗口文件打开、Vault 文件树、Neovim 嵌入、内存 buffer 预览 | 多文件标签、多窗口、用户真实配置的完整兼容、Neovim 内切换 buffer 的预览同步 |
-| 常见 Markdown / GFM、wikilink、阅读导航与选择 | 完整 Obsidian 语义、屏幕折行导航、混合图文富文本复制 |
-| TikZ、GPUI 原生行内 / 块级公式、PDF 缓存 | TikZ 编译触发时机、TeX 权限隔离与资源配置的完整闭环 |
-| 原生 GPUI 窗口、中文预编辑接口 | 中文输入与字体的完整验收、系统主题跟随、性能指标 |
+| 文件 / 文件夹打开、最近打开、可折叠 Vault 文件树、多文件标签 | 多窗口、用户真实配置的完整兼容 |
+| Neovim 嵌入、内存 buffer 预览、跟随 Neovim 内切换 buffer、外部修改重新载入、双向光标同步 | TikZ 编译触发时机、TeX 权限隔离与前导内容配置 |
+| 常见 Markdown / GFM、wikilink、嵌入与附件、阅读导航（含屏幕折行）、选择、鼠标 | 完整 Obsidian 语义、混合图文富文本复制、远程图片的按需加载 |
+| TikZ、GPUI 原生行内 / 块级公式、PDF 缓存 | 中文输入与字体的完整验收、性能指标 |
+| 亮色 / 暗色主题跟随系统、状态栏、未保存提示 | |
 
-后续优先级是多文件标签和多窗口，再扩展全文搜索、反向链接、tags 与 properties。**Linux 在后续计划中；Windows 不在支持目标内。**
+后续优先级是多窗口，再扩展全文搜索、反向链接、tags 与 properties。**Linux 可从源码实验性构建；Windows 不在支持目标内。**
 
 HTML 按代码显示，Mermaid 保留源码；不执行 Obsidian 插件，也不承诺兼容其主题。应用体积、内存与启动速度目前仍是待测目标，不是已达成的性能宣传。
 
