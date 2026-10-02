@@ -1159,6 +1159,7 @@ impl RusidianApp {
         next.cell_size = self.cell_size;
         next.grid_origin = self.grid_origin.clone();
         next.layouts_ready = self.layouts_ready.clone();
+        next.layouts_ready.set(false);
         next.settings_open = self.settings_open;
         next.appearance = self.appearance;
         next.recent = std::mem::take(&mut self.recent);
@@ -1294,6 +1295,7 @@ impl RusidianApp {
         });
         self.error = None;
         self.reading_cursor = ReadingCursor::default();
+        self.layouts_ready.set(false);
         self.place_initial_cursor = true;
         self.tikz_lines.clear();
         self.synced_cursor = None;
@@ -1438,6 +1440,8 @@ impl RusidianApp {
         document.lines.splice(first..end, replacement);
         if !more {
             document.parse(strict_line_breaks);
+            // Layouts from the last frame describe the old text until the next render.
+            self.layouts_ready.set(false);
             self.clamp_reading_cursor();
         }
         true
@@ -6000,6 +6004,16 @@ mod tests {
         );
         // Diagrams already compiled or compiling are left alone.
         assert!(tikz_ready_to_compile(&edited, &edited, Some(9), |_| true).is_empty());
+    }
+
+    #[test]
+    fn edits_invalidate_layouts_from_the_last_frame() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        app.layouts_ready.set(true);
+        assert!(app.update_buffer(0, None, vec!["# Changed".into()], false));
+        assert!(!app.layouts_ready.get());
+        assert!(!app.move_reading_screen_line(true));
+        assert!(app.reading_position_at(px(0.0), px(0.0), true).is_none());
     }
 
     #[test]
