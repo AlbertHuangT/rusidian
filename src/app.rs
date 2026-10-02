@@ -2340,7 +2340,16 @@ impl RusidianApp {
                 Ok(Ok(Some(paths))) => paths,
                 Ok(Err(error)) => {
                     this.update(cx, |this, cx| {
-                        this.show_notice(format!("无法打开系统文件选择器：{error}"), true, cx);
+                        let hint = if cfg!(target_os = "linux") {
+                            "（Linux 需要 xdg-desktop-portal）；也可以在终端运行 rusidian <路径>"
+                        } else {
+                            ""
+                        };
+                        this.show_notice(
+                            format!("无法打开系统文件选择器{hint}：{error}"),
+                            true,
+                            cx,
+                        );
                     })
                     .ok();
                     return;
