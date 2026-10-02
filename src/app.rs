@@ -564,12 +564,18 @@ impl RusidianApp {
     }
 
     fn compile_tikz_sources(&mut self, sources: Vec<String>, cx: &mut Context<Self>) {
+        if sources.is_empty() {
+            return;
+        }
+        let preamble: Arc<str> =
+            crate::tikz::preamble(self.vault.as_ref().map(|vault| vault.root.as_path())).into();
         for source in sources {
             let executor = cx.background_executor().clone();
+            let preamble = preamble.clone();
             cx.spawn(async move |this, cx| {
                 let input = source.clone();
                 let result = executor
-                    .spawn(async move { crate::tikz::compile(&input) })
+                    .spawn(async move { crate::tikz::compile(&input, &preamble) })
                     .await;
                 this.update(cx, |this, cx| {
                     if !this.tikz.contains_key(&source) {
@@ -841,6 +847,28 @@ impl RusidianApp {
         }
     }
 
+    /// Open the global (or a vault's) TeX preamble in Neovim, creating it from a template.
+    fn edit_preamble(&mut self, vault: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(path) = crate::tikz::preamble_path(vault.as_deref()) else {
+            self.show_notice("无法确定系统设置目录", true, cx);
+            return;
+        };
+        if let Err(error) = crate::tikz::ensure_preamble(&path) {
+            self.show_notice(error, true, cx);
+            return;
+        }
+        self.settings_open = false;
+        self.request_close(
+            PendingClose::Open {
+                path,
+                vault_root: self.vault.as_ref().map(|vault| vault.root.clone()),
+                fragment: None,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
     fn set_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
         self.appearance = appearance;
         if let Err(error) = crate::settings::update(|settings| settings.appearance = appearance) {
@@ -973,6 +1001,12 @@ impl RusidianApp {
                                 this.modified = modified;
                                 cx.notify();
                             }
+                        }
+                        NvimEvent::BufferWritten(path) if crate::tikz::is_preamble(&path) => {
+                            // Every diagram depends on the preamble.
+                            this.tikz.clear();
+                            this.tikz_lines.clear();
+                            this.show_notice("TeX 前导内容已保存，TikZ 将重新编译", false, cx);
                         }
                         NvimEvent::BufferWritten(path) => {
                             if this.vault.as_ref().is_some_and(|vault| {
@@ -3235,6 +3269,44 @@ impl RusidianApp {
                         .child(label)
                 }),
             );
+        let tex_button = |id: &'static str, label: &'static str, vault: Option<PathBuf>| {
+            div()
+                .id(id)
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme.card_border))
+                .bg(rgb(theme.card))
+                .cursor_pointer()
+                .hover(|element| element.bg(rgb(theme.hover)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.edit_preamble(vault.clone(), cx);
+                }))
+                .child(label)
+        };
+        let tex_buttons = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .text_sm()
+            .child(tex_button("edit-global-preamble", "编辑全局前导内容", None))
+            .when_some(
+                self.vault.as_ref().map(|vault| vault.root.clone()),
+                |element, root| {
+                    element.child(tex_button(
+                        "edit-vault-preamble",
+                        "编辑此 vault 的前导内容",
+                        Some(root),
+                    ))
+                },
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_color(rgb(theme.faint))
+                    .child("放在 \\begin{document} 之前，保存在系统设置目录，不写入 vault。"),
+            );
         let auto_toggle = div()
             .w(px(44.0))
             .h(px(24.0))
@@ -3343,6 +3415,14 @@ impl RusidianApp {
                                     .child("外观"),
                             )
                             .child(appearance_picker)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.accent))
+                                    .child("TikZ 前导内容"),
+                            )
+                            .child(tex_buttons)
                             .child(
                                 div()
                                     .text_sm()
