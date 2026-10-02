@@ -81,6 +81,7 @@ struct ItemState {
     used: bool,
 }
 
+#[cfg(test)]
 pub fn parse(source: &str) -> MarkdownDocument {
     parse_with_options(source, false)
 }

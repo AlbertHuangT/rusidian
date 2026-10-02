@@ -171,7 +171,19 @@ struct Document {
     name: SharedString,
     path: SharedString,
     lines: Vec<String>,
+    /// Only Markdown files have a reading view; other text files stay in Neovim.
+    is_markdown: bool,
     markdown: MarkdownDocument,
+}
+
+impl Document {
+    fn parse(&mut self, strict_line_breaks: bool) {
+        self.markdown = if self.is_markdown {
+            crate::markdown::parse_with_options(&self.lines.join("\n"), strict_line_breaks)
+        } else {
+            MarkdownDocument { blocks: Vec::new() }
+        };
+    }
 }
 
 struct RusidianApp {
@@ -347,7 +359,7 @@ impl RusidianApp {
 
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                app.document = Some(Document {
+                let mut document = Document {
                     file: path.to_path_buf(),
                     name: path
                         .file_name()
@@ -357,8 +369,14 @@ impl RusidianApp {
                         .into(),
                     path: path.to_string_lossy().into_owned().into(),
                     lines: source_lines(&content),
-                    markdown: crate::markdown::parse(&content),
-                });
+                    is_markdown: crate::vault::is_markdown(path),
+                    markdown: MarkdownDocument { blocks: Vec::new() },
+                };
+                document.parse(false);
+                if !document.is_markdown {
+                    app.view = View::Source;
+                }
+                app.document = Some(document);
             }
             Err(error) => {
                 app.error = Some(format!("无法打开 {}：{error}", path.display()).into());
@@ -369,10 +387,7 @@ impl RusidianApp {
 
     fn attach_vault(&mut self, vault: Vault) {
         if let Some(document) = &mut self.document {
-            document.markdown = crate::markdown::parse_with_options(
-                &document.lines.join("\n"),
-                vault.settings.strict_line_breaks,
-            );
+            document.parse(vault.settings.strict_line_breaks);
         }
         self.vault = Some(vault);
     }
@@ -658,7 +673,9 @@ impl RusidianApp {
                             } else {
                                 this.nvim_error =
                                     Some("Neovim 已退出；按 Enter 可重新打开源码视图".into());
-                                this.view = View::Reading;
+                                if this.has_reading_view() {
+                                    this.view = View::Reading;
+                                }
                                 cx.notify();
                             }
                             return false;
@@ -853,8 +870,7 @@ impl RusidianApp {
         }
         document.lines.splice(first..end, replacement);
         if !more {
-            document.markdown =
-                crate::markdown::parse_with_options(&document.lines.join("\n"), strict_line_breaks);
+            document.parse(strict_line_breaks);
             self.clamp_reading_cursor();
         }
         true
@@ -913,6 +929,12 @@ impl RusidianApp {
             self.reading_cursor = cursor;
             self.reading_column = None;
         }
+    }
+
+    fn has_reading_view(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(|document| document.is_markdown)
     }
 
     /// `note.md — vault` inside a vault, `note.md — Rusidian` otherwise.
@@ -1565,7 +1587,18 @@ impl RusidianApp {
             cx.notify();
             return;
         }
+        if self.nvim.is_none() {
+            // Neovim exited or failed to start; Enter starts it again.
+            if event.keystroke.key == "enter" && self.document.is_some() {
+                self.nvim_error = None;
+                self.grid = NvimGrid::default();
+                self.start_nvim(cx);
+                cx.notify();
+                return;
+            }
+        }
         if event.keystroke.key == "escape"
+            && self.has_reading_view()
             && (self.grid.is_normal() || self.nvim_error.is_some() || self.nvim.is_none())
         {
             self.view = View::Reading;
@@ -1822,7 +1855,8 @@ impl RusidianApp {
         }
         let hint = match self.view {
             View::Reading if self.document.is_some() => "Enter 编辑",
-            View::Source if self.grid.is_normal() || self.nvim.is_none() => "Esc 返回阅读",
+            View::Source if self.nvim.is_none() && self.document.is_some() => "Enter 重新打开",
+            View::Source if self.has_reading_view() && self.grid.is_normal() => "Esc 返回阅读",
             _ => "",
         };
         let message = if let Some(prompt) = search_prompt {
@@ -3874,6 +3908,15 @@ mod tests {
         assert!(is_text_file(Path::new("README.md")));
         assert!(!is_text_file(Path::new("assets/app-icon.png")));
         assert!(is_external_link("https://example.com") && !is_external_link("note.md"));
+    }
+
+    #[test]
+    fn opens_plain_text_files_in_source_view_only() {
+        let text = RusidianApp::open(Some(Path::new("Cargo.toml")));
+        assert!(text.view == View::Source && !text.has_reading_view());
+        assert!(text.document.as_ref().unwrap().markdown.blocks.is_empty());
+        let note = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        assert!(note.view == View::Reading && note.has_reading_view());
     }
 
     #[test]
