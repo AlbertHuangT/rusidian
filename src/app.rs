@@ -1099,6 +1099,9 @@ impl RusidianApp {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Linux backends commit a propagated key's character through the input handler, so
+        // every key handled here must stop; only real text input is allowed to continue.
+        cx.stop_propagation();
         if self.settings_open {
             if event.keystroke.key == "escape" {
                 self.settings_open = false;
@@ -1137,7 +1140,7 @@ impl RusidianApp {
                         }
                         cx.notify();
                     }
-                    _ => {}
+                    _ => cx.propagate(),
                 }
                 return;
             }
@@ -1344,12 +1347,19 @@ impl RusidianApp {
         } else if self.grid.accepts_text_input()
             && event.keystroke.key_char.is_some()
             && !event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.alt
+            && (!event.keystroke.modifiers.alt || composes_with_option(&event.keystroke))
             && !event.keystroke.modifiers.platform
+            && !matches!(
+                event.keystroke.key.as_str(),
+                "enter" | "escape" | "backspace" | "tab" | "delete"
+            )
         {
             // Printable text is committed through EntityInputHandler so IME composition is not duplicated.
-        } else if let Some(nvim) = &self.nvim {
-            nvim.input(nvim_key(&event.keystroke));
+            cx.propagate();
+        } else if let Some(nvim) = &self.nvim
+            && let Some(keys) = nvim_key(&event.keystroke)
+        {
+            nvim.input(keys);
         }
     }
 
@@ -1883,10 +1893,18 @@ impl EntityInputHandler for RusidianApp {
     ) {
         self.marked_text.clear();
         self.marked_selection = 0..0;
-        if let Some(search) = &mut self.reading_search {
-            search.query.push_str(text);
-        } else if let Some(nvim) = &self.nvim {
-            nvim.input_text(text);
+        match self.view {
+            View::Reading if !self.settings_open => {
+                if let Some(search) = &mut self.reading_search {
+                    search.query.push_str(text);
+                }
+            }
+            View::Source if !self.settings_open => {
+                if let Some(nvim) = &self.nvim {
+                    nvim.input_text(text);
+                }
+            }
+            _ => {}
         }
         window.invalidate_character_coordinates();
         cx.notify();
@@ -2210,41 +2228,75 @@ impl Render for RusidianApp {
     }
 }
 
-fn nvim_key(key: &Keystroke) -> String {
-    let key_name = match key.key.as_str() {
-        "enter" => "CR",
-        "escape" => "Esc",
-        "backspace" => "BS",
-        "delete" => "Del",
-        "tab" => "Tab",
-        "left" => "Left",
-        "right" => "Right",
-        "up" => "Up",
-        "down" => "Down",
-        "pageup" => "PageUp",
-        "pagedown" => "PageDown",
-        "home" => "Home",
-        "end" => "End",
-        _ if !key.modifiers.modified() => {
-            return key.key_char.clone().unwrap_or_else(|| key.key.clone());
+/// Translate a GPUI keystroke into Neovim key notation.
+fn nvim_key(key: &Keystroke) -> Option<String> {
+    let modifiers = &key.modifiers;
+    let named = match key.key.as_str() {
+        "enter" => Some("CR".to_owned()),
+        "escape" => Some("Esc".to_owned()),
+        "backspace" => Some("BS".to_owned()),
+        "delete" => Some("Del".to_owned()),
+        "insert" => Some("Insert".to_owned()),
+        "tab" => Some("Tab".to_owned()),
+        "space" => Some("Space".to_owned()),
+        "left" => Some("Left".to_owned()),
+        "right" => Some("Right".to_owned()),
+        "up" => Some("Up".to_owned()),
+        "down" => Some("Down".to_owned()),
+        "pageup" => Some("PageUp".to_owned()),
+        "pagedown" => Some("PageDown".to_owned()),
+        "home" => Some("Home".to_owned()),
+        "end" => Some("End".to_owned()),
+        function
+            if function.len() > 1
+                && function.starts_with('f')
+                && function[1..].parse::<u8>().is_ok() =>
+        {
+            Some(function.to_uppercase())
         }
-        other => other,
+        _ => None,
     };
+    if named.is_none()
+        && let Some(text) = key.key_char.as_deref().filter(|text| !text.is_empty())
+        && !modifiers.control
+        && !modifiers.platform
+        && (!modifiers.alt || composes_with_option(key))
+    {
+        // Shift (and macOS Option) are already applied to the typed character.
+        return Some(text.replace('<', "<lt>"));
+    }
+    let name = match named.clone() {
+        Some(name) => name,
+        None => match key.key.as_str() {
+            "<" => "lt".to_owned(),
+            "\\" => "Bslash".to_owned(),
+            "|" => "Bar".to_owned(),
+            key if key.chars().count() == 1 => key.to_owned(),
+            _ => return None,
+        },
+    };
+    let mut prefix = String::new();
+    if modifiers.control {
+        prefix.push_str("C-");
+    }
+    if modifiers.alt {
+        prefix.push_str("M-");
+    }
+    if modifiers.shift {
+        prefix.push_str("S-");
+    }
+    if modifiers.platform {
+        prefix.push_str("D-");
+    }
+    if prefix.is_empty() && named.is_none() {
+        return Some(key.key.replace('<', "<lt>"));
+    }
+    Some(format!("<{prefix}{name}>"))
+}
 
-    let mut modifiers = String::new();
-    if key.modifiers.control {
-        modifiers.push_str("C-");
-    }
-    if key.modifiers.alt {
-        modifiers.push_str("M-");
-    }
-    if key.modifiers.shift {
-        modifiers.push_str("S-");
-    }
-    if key.modifiers.platform {
-        modifiers.push_str("D-");
-    }
-    format!("<{modifiers}{key_name}>")
+/// On macOS, Option types layout characters such as `@` or `{` rather than acting as Meta.
+fn composes_with_option(key: &Keystroke) -> bool {
+    cfg!(target_os = "macos") && key.key_char.as_deref().is_some_and(|text| text != key.key)
 }
 
 fn source_lines(source: &str) -> Vec<String> {
@@ -3302,6 +3354,7 @@ fn end_word(blocks: &[Block], start: ReadingCursor) -> Option<ReadingCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Modifiers;
 
     #[test]
     fn reuses_math_after_edits_and_aligns_to_the_text_baseline() {
@@ -3348,9 +3401,28 @@ mod tests {
 
     #[test]
     fn translates_gpui_keys_for_neovim() {
-        assert_eq!(nvim_key(&Keystroke::parse("a").unwrap()), "a");
-        assert_eq!(nvim_key(&Keystroke::parse("ctrl-a").unwrap()), "<C-a>");
-        assert_eq!(nvim_key(&Keystroke::parse("left").unwrap()), "<Left>");
+        let key = |source: &str| nvim_key(&Keystroke::parse(source).unwrap());
+        assert_eq!(key("a").as_deref(), Some("a"));
+        assert_eq!(key("ctrl-a").as_deref(), Some("<C-a>"));
+        assert_eq!(key("left").as_deref(), Some("<Left>"));
+        assert_eq!(key("f5").as_deref(), Some("<F5>"));
+        assert_eq!(key("shift-tab").as_deref(), Some("<S-Tab>"));
+        assert_eq!(key("ctrl-<").as_deref(), Some("<C-lt>"));
+        let typed = |key: &str, character: &str, modifiers| {
+            nvim_key(&Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: Some(character.into()),
+            })
+        };
+        // Shifted symbols must arrive as the typed character, not as <S-4>.
+        assert_eq!(typed("4", "$", Modifiers::shift()).as_deref(), Some("$"));
+        assert_eq!(typed("a", "A", Modifiers::shift()).as_deref(), Some("A"));
+        assert_eq!(typed(",", "<", Modifiers::shift()).as_deref(), Some("<lt>"));
+        assert_eq!(
+            typed("enter", "\n", Modifiers::none()).as_deref(),
+            Some("<CR>")
+        );
     }
 
     #[test]
