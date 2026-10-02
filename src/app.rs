@@ -1266,7 +1266,7 @@ impl RusidianApp {
         )))
     }
 
-    fn execute_search(&mut self, prompt: &SearchPrompt, reverse: bool) {
+    fn execute_search(&mut self, prompt: &SearchPrompt, reverse: bool, cx: &mut Context<Self>) {
         let Some(blocks) = self
             .document
             .as_ref()
@@ -1274,18 +1274,28 @@ impl RusidianApp {
         else {
             return;
         };
-        if let Some(cursor) = search_cursor(
-            blocks,
-            self.reading_cursor,
-            &prompt.query,
-            prompt.forward != reverse,
-        ) {
-            self.reading_cursor = cursor;
-            self.reading_column = None;
+        let forward = prompt.forward != reverse;
+        match search_cursor(blocks, self.reading_cursor, &prompt.query, forward) {
+            Some((cursor, wrapped)) => {
+                self.reading_cursor = cursor;
+                self.reading_column = None;
+                if wrapped {
+                    self.show_notice(
+                        if forward {
+                            "已到文末，从开头继续搜索"
+                        } else {
+                            "已到开头，从文末继续搜索"
+                        },
+                        false,
+                        cx,
+                    );
+                }
+            }
+            None => self.show_notice(format!("找不到：{}", prompt.query), true, cx),
         }
     }
 
-    fn search_word(&mut self, forward: bool) {
+    fn search_word(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(blocks) = self
             .document
             .as_ref()
@@ -1297,7 +1307,7 @@ impl RusidianApp {
             return;
         };
         let prompt = SearchPrompt { query, forward };
-        self.execute_search(&prompt, false);
+        self.execute_search(&prompt, false, cx);
         self.last_search = Some(prompt);
     }
 
@@ -1736,7 +1746,7 @@ impl RusidianApp {
                         if let Some(prompt) = self.reading_search.take()
                             && !prompt.query.is_empty()
                         {
-                            self.execute_search(&prompt, false);
+                            self.execute_search(&prompt, false, cx);
                             self.last_search = Some(prompt);
                         }
                         self.marked_text.clear();
@@ -1825,14 +1835,16 @@ impl RusidianApp {
             }
             if key == Some("n") || key == Some("N") {
                 if let Some(search) = self.last_search.clone() {
-                    self.execute_search(&search, key == Some("N"));
+                    self.execute_search(&search, key == Some("N"), cx);
                     self.reveal_reading_cursor();
                     cx.notify();
+                } else {
+                    self.show_notice("还没有搜索过；用 / 或 ? 开始搜索", false, cx);
                 }
                 return;
             }
             if key == Some("*") || key == Some("#") {
-                self.search_word(key == Some("*"));
+                self.search_word(key == Some("*"), cx);
                 self.reveal_reading_cursor();
                 cx.notify();
                 return;
@@ -4589,12 +4601,15 @@ fn find_character(
     None
 }
 
+/// The next match of `query` from `start`, wrapping around the document like Vim, and whether
+/// the search wrapped. An all-lowercase query matches case-insensitively (smartcase).
 fn search_cursor(
     blocks: &[Block],
     start: ReadingCursor,
     query: &str,
     forward: bool,
-) -> Option<ReadingCursor> {
+) -> Option<(ReadingCursor, bool)> {
+    let ignore_case = !query.chars().any(char::is_uppercase);
     let query = query.chars().collect::<Vec<_>>();
     if query.is_empty() {
         return None;
@@ -4627,19 +4642,33 @@ fn search_cursor(
             continue;
         };
         if wrapped && cursor == start {
-            return None;
+            // The only match may be the one under the cursor.
+            return matches_query(blocks, cursor, &query, ignore_case).then_some((cursor, true));
         }
-        if matches_query(blocks, cursor, &query) {
-            return Some(cursor);
+        if matches_query(blocks, cursor, &query, ignore_case) {
+            return Some((cursor, wrapped));
         }
         candidate = step_cursor(blocks, cursor, forward);
     }
 }
 
-fn matches_query(blocks: &[Block], start: ReadingCursor, query: &[char]) -> bool {
+fn matches_query(
+    blocks: &[Block],
+    start: ReadingCursor,
+    query: &[char],
+    ignore_case: bool,
+) -> bool {
     let mut cursor = start;
     for (index, expected) in query.iter().enumerate() {
-        if cursor_character(blocks, cursor) != Some(*expected) {
+        let Some(actual) = cursor_character(blocks, cursor) else {
+            return false;
+        };
+        let equal = if ignore_case {
+            actual.to_lowercase().eq(expected.to_lowercase())
+        } else {
+            actual == *expected
+        };
+        if !equal {
             return false;
         }
         if index + 1 < query.len() {
@@ -5248,10 +5277,13 @@ mod tests {
         let blocks = &document.blocks;
         assert_eq!(
             search_cursor(blocks, ReadingCursor::default(), "alpha", true),
-            Some(ReadingCursor {
-                block: 0,
-                offset: 10
-            })
+            Some((
+                ReadingCursor {
+                    block: 0,
+                    offset: 10
+                },
+                false
+            ))
         );
         assert_eq!(
             search_cursor(
@@ -5263,9 +5295,39 @@ mod tests {
                 "alpha",
                 true
             ),
-            Some(ReadingCursor::default())
+            Some((ReadingCursor::default(), true))
         );
         assert!(search_cursor(blocks, ReadingCursor::default(), "betaalpha", true).is_none());
+        // Smartcase: lowercase queries ignore case, mixed-case queries do not.
+        let mixed = crate::markdown::parse("Rust and rust");
+        assert_eq!(
+            search_cursor(&mixed.blocks, ReadingCursor::default(), "rust", true),
+            Some((
+                ReadingCursor {
+                    block: 0,
+                    offset: 9
+                },
+                false
+            ))
+        );
+        assert_eq!(
+            search_cursor(
+                &mixed.blocks,
+                ReadingCursor {
+                    block: 0,
+                    offset: 9
+                },
+                "Rust",
+                true
+            ),
+            Some((ReadingCursor::default(), true))
+        );
+        // A single match under the cursor is found again after wrapping.
+        let single = crate::markdown::parse("only once");
+        assert_eq!(
+            search_cursor(&single.blocks, ReadingCursor::default(), "only", true),
+            Some((ReadingCursor::default(), true))
+        );
         assert_eq!(
             word_under_cursor(
                 blocks,
