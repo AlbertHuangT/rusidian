@@ -976,8 +976,16 @@ impl RusidianApp {
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(mut paths))) = selected.await else {
-                return;
+            let mut paths = match selected.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.show_notice(format!("无法打开系统文件选择器：{error}"), true, cx);
+                    })
+                    .ok();
+                    return;
+                }
+                Ok(Ok(None)) | Err(_) => return,
             };
             let Some(path) = paths.pop() else {
                 return;
