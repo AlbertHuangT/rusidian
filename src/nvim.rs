@@ -4,7 +4,12 @@ use nvim_rs::{
     Handler, Neovim, Value, compat::tokio::Compat, create::tokio as create,
     uioptions::UiAttachOptions,
 };
-use std::{collections::HashMap, path::PathBuf, thread};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    thread,
+};
 use tokio::{process::ChildStdin, sync::mpsc};
 
 pub struct Client {
@@ -38,6 +43,10 @@ pub enum Event {
         line: usize,
         column: usize,
     },
+    /// Neovim switched to another file buffer; its lines follow as `BufferLines`.
+    BufferEntered(PathBuf),
+    /// A buffer was written to this path.
+    BufferWritten(PathBuf),
     Exited,
 }
 
@@ -47,11 +56,17 @@ enum Command {
     /// Zero-based line and byte column.
     SetCursor(usize, usize),
     QueryCursor,
+    FollowCurrentBuffer,
     Close,
 }
 
 #[derive(Clone)]
-struct EventHandler(Sender<Event>);
+struct EventHandler {
+    events: Sender<Event>,
+    commands: mpsc::UnboundedSender<Command>,
+    /// The buffer whose line events are forwarded; others are left over from a switch.
+    attached: Arc<Mutex<Option<Value>>>,
+}
 
 #[async_trait]
 impl Handler for EventHandler {
@@ -60,9 +75,29 @@ impl Handler for EventHandler {
     async fn handle_notify(&self, name: String, args: Vec<Value>, _: Neovim<Self::Writer>) {
         match name.as_str() {
             "redraw" => {
-                let _ = self.0.try_send(Event::Redraw(args));
+                let _ = self.events.try_send(Event::Redraw(args));
+            }
+            "rusidian_buf_enter" => {
+                let _ = self.commands.send(Command::FollowCurrentBuffer);
+            }
+            "rusidian_buf_write" => {
+                if let Some(name) = args.first().and_then(Value::as_str) {
+                    let _ = self
+                        .events
+                        .try_send(Event::BufferWritten(PathBuf::from(name)));
+                }
             }
             "nvim_buf_lines_event" if args.get(1).is_some_and(|tick| !tick.is_nil()) => {
+                if self
+                    .attached
+                    .lock()
+                    .ok()
+                    .and_then(|buffer| buffer.clone())
+                    .as_ref()
+                    != args.first()
+                {
+                    return;
+                }
                 let Some(first) = args.get(2).and_then(Value::as_u64) else {
                     return;
                 };
@@ -78,7 +113,7 @@ impl Handler for EventHandler {
                     .map(str::to_owned)
                     .collect();
                 let more = args.get(5).and_then(Value::as_bool).unwrap_or(false);
-                let _ = self.0.try_send(Event::BufferLines {
+                let _ = self.events.try_send(Event::BufferLines {
                     first: first as usize,
                     last: (last >= 0).then_some(last as usize),
                     lines,
@@ -101,6 +136,7 @@ impl Client {
         let path = path.canonicalize().unwrap_or(path);
         let (event_sender, events) = async_channel::unbounded();
         let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let commands_for_handler = commands.clone();
 
         thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -114,8 +150,14 @@ impl Client {
                 }
             };
 
+            let attached = Arc::new(Mutex::new(None));
+            let follow = commands_for_handler;
             runtime.block_on(async move {
-                let handler = EventHandler(event_sender.clone());
+                let handler = EventHandler {
+                    events: event_sender.clone(),
+                    commands: follow,
+                    attached: attached.clone(),
+                };
                 let mut command = tokio::process::Command::new("nvim");
                 command.kill_on_drop(true);
                 if let Some(directory) = directory.filter(|directory| directory.is_dir()) {
@@ -182,7 +224,7 @@ impl Client {
                         }
                     }
                 }
-                let Some(buffer) = buffer else {
+                let Some(mut buffer) = buffer else {
                     let _ = event_sender
                         .send(Event::Error(format!(
                             "Neovim 未打开请求的文件：{}",
@@ -197,11 +239,36 @@ impl Client {
                         .await;
                     return;
                 }
+                if let Ok(mut current) = attached.lock() {
+                    *current = Some(buffer.get_value().clone());
+                }
                 if let Err(error) = buffer.attach(true, Vec::new()).await {
                     let _ = event_sender
                         .send(Event::Error(format!("无法监听 Neovim buffer：{error}")))
                         .await;
                     return;
+                }
+                // Follow buffer switches (:edit, :bnext, gf) and report writes. Only ordinary file
+                // buffers are followed; help, quickfix and terminal buffers keep the preview.
+                if let Some(channel) = nvim
+                    .get_api_info()
+                    .await
+                    .ok()
+                    .and_then(|info| info.first().and_then(Value::as_i64))
+                {
+                    let _ = nvim
+                        .exec_lua(
+                            "local channel = ...
+                            local group = vim.api.nvim_create_augroup('Rusidian', { clear = true })
+                            vim.api.nvim_create_autocmd('BufEnter', { group = group, callback = function(args)
+                              if vim.bo[args.buf].buftype == '' then vim.rpcnotify(channel, 'rusidian_buf_enter') end
+                            end })
+                            vim.api.nvim_create_autocmd('BufWritePost', { group = group, callback = function(args)
+                              vim.rpcnotify(channel, 'rusidian_buf_write', vim.api.nvim_buf_get_name(args.buf))
+                            end })",
+                            vec![Value::from(channel)],
+                        )
+                        .await;
                 }
                 let local_maps = buffer.get_keymap("n").await.unwrap_or_default();
                 let global_maps = nvim.get_keymap("n").await.unwrap_or_default();
@@ -274,6 +341,28 @@ impl Client {
                                     })
                                     .await;
                             }
+                        }
+                        Command::FollowCurrentBuffer => {
+                            let Ok(current) = nvim.get_current_buf().await else {
+                                continue;
+                            };
+                            if current.get_value() == buffer.get_value() {
+                                continue;
+                            }
+                            let name = current.get_name().await.unwrap_or_default();
+                            let _ = buffer.detach().await;
+                            if let Ok(mut attached) = attached.lock() {
+                                *attached = Some(current.get_value().clone());
+                            }
+                            let _ = event_sender
+                                .send(Event::BufferEntered(PathBuf::from(name)))
+                                .await;
+                            if let Err(error) = current.attach(true, Vec::new()).await {
+                                let _ = event_sender
+                                    .send(Event::Error(format!("无法监听 Neovim buffer：{error}")))
+                                    .await;
+                            }
+                            buffer = current;
                         }
                         Command::Resize(width, height) => {
                             if let Err(error) = nvim.ui_try_resize(width, height).await {
@@ -1092,7 +1181,10 @@ mod tests {
                                     break grid;
                                 }
                             }
-                            Event::Warning(_) | Event::Cursor { .. } => {}
+                            Event::Warning(_)
+                            | Event::Cursor { .. }
+                            | Event::BufferEntered(_)
+                            | Event::BufferWritten(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1115,7 +1207,10 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) | Event::Cursor { .. } => {}
+                            Event::Warning(_)
+                            | Event::Cursor { .. }
+                            | Event::BufferEntered(_)
+                            | Event::BufferWritten(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1137,7 +1232,10 @@ mod tests {
                                 mode.clone_from(&grid.mode);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) | Event::Cursor { .. } => {}
+                            Event::Warning(_)
+                            | Event::Cursor { .. }
+                            | Event::BufferEntered(_)
+                            | Event::BufferWritten(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1159,7 +1257,10 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) | Event::Cursor { .. } => {}
+                            Event::Warning(_)
+                            | Event::Cursor { .. }
+                            | Event::BufferEntered(_)
+                            | Event::BufferWritten(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1179,7 +1280,10 @@ mod tests {
                                 grid.apply_redraw(&events);
                             }
                             Event::BufferLines { .. } => {}
-                            Event::Warning(_) | Event::Cursor { .. } => {}
+                            Event::Warning(_)
+                            | Event::Cursor { .. }
+                            | Event::BufferEntered(_)
+                            | Event::BufferWritten(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }

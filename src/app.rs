@@ -691,6 +691,18 @@ impl RusidianApp {
                                 cx.notify();
                             }
                         }
+                        NvimEvent::BufferEntered(path) => {
+                            this.follow_buffer(path, cx);
+                        }
+                        NvimEvent::BufferWritten(path) => {
+                            if this.vault.as_ref().is_some_and(|vault| {
+                                path.starts_with(&vault.root)
+                                    && crate::vault::is_markdown(&path)
+                                    && !vault.files.iter().any(|file| same_file(file, &path))
+                            }) {
+                                this.refresh_vault(cx);
+                            }
+                        }
                         NvimEvent::Exited => {
                             this.nvim = None;
                             if let Some(action) = this.pending_close.take() {
@@ -798,6 +810,76 @@ impl RusidianApp {
         next.update_status = std::mem::replace(&mut self.update_status, UpdateStatus::Idle);
         next.available_update = self.available_update.take();
         *self = next;
+    }
+
+    /// Show the buffer Neovim switched to. Its lines arrive next as a full buffer update.
+    fn follow_buffer(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| same_file(&document.file, &path))
+        {
+            return;
+        }
+        let name: SharedString = if path.as_os_str().is_empty() {
+            "[未命名]".into()
+        } else {
+            display_name(&path).into()
+        };
+        if !self
+            .vault
+            .as_ref()
+            .is_some_and(|vault| path.starts_with(&vault.root))
+        {
+            self.vault =
+                crate::vault::enclosing_vault_root(&path).and_then(|root| Vault::open(&root).ok());
+        }
+        self.document = Some(Document {
+            name,
+            path: path.to_string_lossy().into_owned().into(),
+            is_markdown: crate::vault::is_markdown(&path),
+            file: path,
+            lines: vec![String::new()],
+            markdown: MarkdownDocument { blocks: Vec::new() },
+        });
+        self.error = None;
+        self.reading_cursor = ReadingCursor::default();
+        self.synced_cursor = None;
+        self.reading_column = None;
+        self.reading_selection = None;
+        self.reading_search = None;
+        self.reading_scroll.set_offset(point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    /// Rescan the vault in the background, e.g. after a new note is saved from Neovim.
+    fn refresh_vault(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.vault.as_ref().map(|vault| vault.root.clone()) else {
+            return;
+        };
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let scanned = executor
+                .spawn({
+                    let root = root.clone();
+                    async move { Vault::open(&root) }
+                })
+                .await;
+            if let Ok(vault) = scanned {
+                this.update(cx, |this, cx| {
+                    if this
+                        .vault
+                        .as_ref()
+                        .is_some_and(|current| current.root == root)
+                    {
+                        this.vault = Some(vault);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Move the reading cursor to a heading (`#Heading`) or block reference (`#^id`).
