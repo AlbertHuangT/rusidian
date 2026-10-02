@@ -56,7 +56,7 @@ fn compile_tex(tex: String) -> Result<Vec<u8>, String> {
                 } else {
                     &output.stderr
                 };
-                return Err(String::from_utf8_lossy(message).trim().to_owned());
+                return Err(explain_failure(String::from_utf8_lossy(message).trim()));
             }
 
             fs::rename(job.join("input.pdf"), &pdf)
@@ -73,6 +73,32 @@ fn compile_tex(tex: String) -> Result<Vec<u8>, String> {
     let _ = fs::remove_dir_all(&job);
 
     result
+}
+
+const OFFLINE_HINT: &str = "Tectonic 无法下载编译所需的 TeX 资源。联网后回到阅读视图会重新编译，资源会缓存在本机，之后可离线使用。";
+
+/// Whether compiling failed only for want of network, so trying again later can succeed.
+pub fn is_offline_failure(message: &str) -> bool {
+    message.starts_with(OFFLINE_HINT)
+}
+
+/// Tectonic's message, led by an explanation when it could not download TeX resources: on
+/// first use it fetches what a diagram needs and caches it on this computer.
+fn explain_failure(message: &str) -> String {
+    let offline = [
+        "error sending request",
+        "failed to download",
+        "relay.fullyjustified.net",
+        "unsuccessful tunnel",
+        "dns error",
+    ]
+    .iter()
+    .any(|sign| message.to_lowercase().contains(sign));
+    if offline {
+        format!("{OFFLINE_HINT}\n\n{message}")
+    } else {
+        message.to_owned()
+    }
 }
 
 /// Pixels per PDF point in the preview; the reading view draws it at `1 / PREVIEW_SCALE`.
@@ -256,6 +282,21 @@ mod tests {
         png.extend_from_slice(&120_u32.to_be_bytes());
         assert_eq!(png_size(&png), Some((300, 120)));
         assert_eq!(png_size(b"not a png"), None);
+    }
+
+    #[test]
+    fn explains_missing_tex_resources() {
+        let offline = explain_failure(
+            "error: error sending request for url (https://relay.fullyjustified.net/default_bundle_v33.tar)",
+        );
+        assert!(offline.starts_with("Tectonic 无法下载"));
+        assert!(is_offline_failure(&offline));
+        assert!(!is_offline_failure("! Undefined control sequence."));
+        assert!(offline.ends_with("default_bundle_v33.tar)"));
+        assert_eq!(
+            explain_failure("! Undefined control sequence."),
+            "! Undefined control sequence."
+        );
     }
 
     #[test]

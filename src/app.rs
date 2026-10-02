@@ -873,6 +873,10 @@ impl RusidianApp {
     }
 
     fn pending_tikz(&mut self) -> Vec<String> {
+        // Diagrams that failed only for want of network are tried again.
+        self.tikz.retain(|_, state| {
+            !matches!(state, TikzState::Failed(error) if crate::tikz::is_offline_failure(error))
+        });
         let sources: HashSet<_> = self
             .shown_blocks()
             .filter(|block| is_tikz(block))
