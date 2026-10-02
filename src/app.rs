@@ -41,6 +41,9 @@ actions!(
         OpenSettings,
         Quit,
         CloseWindow,
+        CloseTab,
+        NextTab,
+        PreviousTab,
         ToggleSidebar,
         EnterSourceNormal
     ]
@@ -59,7 +62,28 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&format!("{modifier}-shift-o"), OpenFolder, context),
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
         KeyBinding::new(&format!("{modifier}-q"), Quit, context),
-        KeyBinding::new(&format!("{modifier}-w"), CloseWindow, context),
+        KeyBinding::new(&format!("{modifier}-w"), CloseTab, context),
+        KeyBinding::new(&format!("{modifier}-shift-w"), CloseWindow, context),
+        KeyBinding::new("ctrl-tab", NextTab, context),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, context),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-}"
+            } else {
+                "ctrl-pagedown"
+            },
+            NextTab,
+            context,
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-{"
+            } else {
+                "ctrl-pageup"
+            },
+            PreviousTab,
+            context,
+        ),
         KeyBinding::new(&format!("{modifier}-\\"), ToggleSidebar, context),
         KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
     ]
@@ -98,9 +122,15 @@ pub fn run(initial_path: Option<PathBuf>) {
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
                 MenuItem::separator(),
+                MenuItem::action("关闭标签", CloseTab),
                 MenuItem::action("关闭窗口", CloseWindow),
             ]),
-            Menu::new("显示").items([MenuItem::action("显示/隐藏文件列表", ToggleSidebar)]),
+            Menu::new("显示").items([
+                MenuItem::action("显示/隐藏文件列表", ToggleSidebar),
+                MenuItem::separator(),
+                MenuItem::action("下一个标签", NextTab),
+                MenuItem::action("上一个标签", PreviousTab),
+            ]),
         ]);
 
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
@@ -272,6 +302,8 @@ struct RusidianApp {
     modified: bool,
     /// A heading or block to reveal once the note being opened in Neovim arrives.
     pending_fragment: Option<String>,
+    /// Notes open in Neovim (its listed buffers), shown as tabs, with unsaved flags.
+    open_buffers: Vec<(PathBuf, bool)>,
     auto_update: bool,
     update_status: UpdateStatus,
     available_update: Option<Update>,
@@ -399,6 +431,7 @@ impl RusidianApp {
             applied_title: None,
             modified: false,
             pending_fragment: None,
+            open_buffers: Vec::new(),
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
             available_update: None,
@@ -793,6 +826,10 @@ impl RusidianApp {
                             }
                             this.show_notice(text, error, cx);
                         }
+                        NvimEvent::Buffers(buffers) => {
+                            this.open_buffers = buffers;
+                            cx.notify();
+                        }
                         NvimEvent::Modified(modified) => {
                             if this.modified != modified {
                                 this.modified = modified;
@@ -811,6 +848,7 @@ impl RusidianApp {
                         NvimEvent::Exited => {
                             this.nvim = None;
                             this.modified = false;
+                            this.open_buffers.clear();
                             if let Some(action) = this.pending_close.take() {
                                 this.request_close(action, cx);
                             } else {
@@ -986,6 +1024,52 @@ impl RusidianApp {
             }
         }
         cx.notify();
+    }
+
+    fn current_tab(&self) -> Option<usize> {
+        let document = self.document.as_ref()?;
+        self.open_buffers
+            .iter()
+            .position(|(path, _)| same_file(path, &document.file))
+    }
+
+    fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.open_buffers.len();
+        let Some(current) = self.current_tab().filter(|_| count > 1) else {
+            return;
+        };
+        let next = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        let path = self.open_buffers[next].0.clone();
+        self.open_tab(path, cx);
+    }
+
+    fn open_tab(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.request_close(
+            PendingClose::Open {
+                vault_root: self
+                    .vault
+                    .as_ref()
+                    .filter(|vault| path.starts_with(&vault.root))
+                    .map(|vault| vault.root.clone()),
+                path,
+                fragment: None,
+            },
+            cx,
+        );
+    }
+
+    /// Close the current note's tab, or the window when it is the last one.
+    fn close_tab(&mut self, cx: &mut Context<Self>) {
+        match (&self.nvim, self.document.as_ref()) {
+            (Some(nvim), Some(document)) if self.open_buffers.len() > 1 => {
+                nvim.close_buffer(document.file.clone());
+            }
+            _ => self.request_close(PendingClose::Quit, cx),
+        }
     }
 
     /// Show the buffer Neovim switched to. Its lines arrive next as a full buffer update.
@@ -2462,6 +2546,94 @@ impl RusidianApp {
             .into_any_element()
     }
 
+    /// The note title, or a tab per note open in Neovim when there are several.
+    fn render_tabs(&self, title: SharedString, cx: &mut Context<Self>) -> AnyElement {
+        if self.open_buffers.len() < 2 {
+            return div()
+                .text_lg()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(title)
+                .into_any_element();
+        }
+        let theme = self.theme;
+        let current = self.current_tab();
+        div()
+            .id("tabs")
+            .flex_1()
+            .min_w_0()
+            .mr_4()
+            .flex()
+            .gap_1()
+            .overflow_x_scroll()
+            .children(
+                self.open_buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (path, modified))| {
+                        let selected = current == Some(index);
+                        let name = path.file_stem().map_or_else(
+                            || display_name(path),
+                            |stem| stem.to_string_lossy().into_owned(),
+                        );
+                        let open = path.clone();
+                        let close = path.clone();
+                        div()
+                            .id(("tab", index))
+                            .flex_none()
+                            .max_w(px(200.0))
+                            .h(px(30.0))
+                            .pl_3()
+                            .pr_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .rounded_md()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(selected, |element| {
+                                element
+                                    .bg(rgb(theme.accent_soft_bg))
+                                    .text_color(rgb(theme.accent_soft_text))
+                            })
+                            .when(!selected, |element| {
+                                element
+                                    .text_color(rgb(theme.muted))
+                                    .hover(|element| element.bg(rgb(theme.hover)))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_tab(open.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .id(("close-tab", index))
+                                    .flex_none()
+                                    .w(px(18.0))
+                                    .text_center()
+                                    .rounded_md()
+                                    .hover(|element| element.bg(rgb(theme.hover)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(nvim) = &this.nvim {
+                                            nvim.close_buffer(close.clone());
+                                        }
+                                    }))
+                                    .child(if *modified { "●" } else { "×" }),
+                            )
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let shortcut = |key: &str| {
@@ -3516,6 +3688,9 @@ impl Render for RusidianApp {
             .on_action(cx.listener(Self::choose_file))
             .on_action(cx.listener(Self::choose_folder))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_tab(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(true, cx)))
+            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(false, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
@@ -3538,7 +3713,7 @@ impl Render for RusidianApp {
                     .px_5()
                     .border_b_1()
                     .border_color(rgb(theme.border))
-                    .child(div().text_lg().child(title))
+                    .child(self.render_tabs(title, cx))
                     .child(
                         div()
                             .max_w(px(620.0))

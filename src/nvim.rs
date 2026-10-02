@@ -54,6 +54,8 @@ pub enum Event {
         text: String,
         error: bool,
     },
+    /// Neovim's listed file buffers in buffer order, with their modified flags.
+    Buffers(Vec<(PathBuf, bool)>),
     Exited,
 }
 
@@ -73,6 +75,8 @@ enum Command {
     FollowCurrentBuffer,
     /// Open a file in the running Neovim (`:edit`).
     Edit(PathBuf),
+    /// `:bdelete` the buffer showing this file.
+    CloseBuffer(PathBuf),
     /// Neovim detached our buffer (reloads such as :edit! or 'autoread' do that).
     Reattach,
     CheckTime,
@@ -109,6 +113,25 @@ impl Handler for EventHandler {
             }
             "rusidian_buf_enter" => {
                 let _ = self.commands.send(Command::FollowCurrentBuffer);
+            }
+            "rusidian_buffers" => {
+                let buffers = args
+                    .first()
+                    .and_then(Value::as_array)
+                    .map(|buffers| {
+                        buffers
+                            .iter()
+                            .filter_map(|buffer| {
+                                let buffer = buffer.as_array()?;
+                                Some((
+                                    PathBuf::from(buffer.first()?.as_str()?),
+                                    buffer.get(1).and_then(Value::as_bool).unwrap_or(false),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ = self.events.try_send(Event::Buffers(buffers));
             }
             "rusidian_modified" => {
                 if let Some(modified) = args.first().and_then(Value::as_bool) {
@@ -311,7 +334,21 @@ impl Client {
                               if args.buf == vim.api.nvim_get_current_buf() then
                                 vim.rpcnotify(channel, 'rusidian_modified', vim.bo[args.buf].modified)
                               end
-                            end })",
+                            end })
+                            local function report_buffers()
+                              local buffers = {}
+                              for _, info in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+                                if info.name ~= '' and vim.bo[info.bufnr].buftype == '' then
+                                  table.insert(buffers, { info.name, info.changed == 1 })
+                                end
+                              end
+                              vim.rpcnotify(channel, 'rusidian_buffers', buffers)
+                            end
+                            -- Deletions fire before the buffer is gone; report once the event settles.
+                            vim.api.nvim_create_autocmd({ 'BufAdd', 'BufDelete', 'BufWipeout', 'BufEnter', 'BufModifiedSet', 'BufFilePost' }, { group = group, callback = function()
+                              vim.schedule(report_buffers)
+                            end })
+                            report_buffers()",
                             vec![Value::from(channel)],
                         )
                         .await;
@@ -431,6 +468,23 @@ impl Client {
                                 let _ = event_sender.send(notice).await;
                             }
                         }
+                        Command::CloseBuffer(path) => {
+                            if let Err(error) = nvim
+                                .exec_lua(
+                                    CLOSE_BUFFER_LUA,
+                                    vec![Value::from(path.to_string_lossy().into_owned())],
+                                )
+                                .await
+                            {
+                                let text = if error.to_string().contains("E89") {
+                                    "这篇笔记有未保存的修改。请先用 :w 保存或 :e! 放弃修改，再关闭标签。"
+                                        .to_owned()
+                                } else {
+                                    format!("无法关闭：{}", vim_message(&error.to_string()))
+                                };
+                                let _ = event_sender.send(Event::Notice { text, error: true }).await;
+                            }
+                        }
                         Command::CheckTime => {
                             let _ = nvim.command("silent! checktime").await;
                         }
@@ -516,6 +570,11 @@ impl Client {
         let _ = self.commands.send(Command::Edit(path));
     }
 
+    /// Close the buffer for `path`; Neovim refuses when it has unsaved changes.
+    pub fn close_buffer(&self, path: PathBuf) {
+        let _ = self.commands.send(Command::CloseBuffer(path));
+    }
+
     pub fn close(&self) -> bool {
         self.commands.send(Command::Close).is_ok()
     }
@@ -559,6 +618,14 @@ local ok, err = pcall(vim.cmd.edit, vim.fn.fnameescape(path))
 pcall(vim.api.nvim_del_autocmd, id)
 if not ok then error(err, 0) end
 return swap";
+
+const CLOSE_BUFFER_LUA: &str = "local path = ...
+for _, info in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+  if info.name == path then
+    vim.cmd('bdelete ' .. info.bufnr)
+    return
+  end
+end";
 
 /// Explain why Neovim could not switch to another file.
 fn edit_refusal(error: &str) -> String {
@@ -1367,7 +1434,8 @@ mod tests {
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
-                            | Event::Notice { .. } => {}
+                            | Event::Notice { .. }
+                            | Event::Buffers(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1395,7 +1463,8 @@ mod tests {
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
-                            | Event::Notice { .. } => {}
+                            | Event::Notice { .. }
+                            | Event::Buffers(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1422,7 +1491,8 @@ mod tests {
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
-                            | Event::Notice { .. } => {}
+                            | Event::Notice { .. }
+                            | Event::Buffers(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1449,7 +1519,8 @@ mod tests {
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
-                            | Event::Notice { .. } => {}
+                            | Event::Notice { .. }
+                            | Event::Buffers(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1474,7 +1545,8 @@ mod tests {
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
                             | Event::Modified(_)
-                            | Event::Notice { .. } => {}
+                            | Event::Notice { .. }
+                            | Event::Buffers(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
