@@ -56,18 +56,7 @@ fn compile_tex(source: &str, template_version: u8, tex: String) -> Result<Vec<u8
         }
 
         let preview = job.join("preview.png");
-        let mut command = Command::new("sips");
-        command.args(["-s", "format", "png"]);
-        let output = command
-            .arg(&pdf)
-            .arg("--out")
-            .arg(&preview)
-            .output()
-            .map_err(|error| format!("无法启动 PDF 预览转换：{error}"))?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-        }
-
+        rasterize(&pdf, &preview)?;
         let image = fs::read(preview).map_err(|error| format!("无法读取 TikZ 预览：{error}"))?;
         let _ = prune_cache(&cache, MAX_CACHE_BYTES);
         Ok(image)
@@ -76,6 +65,50 @@ fn compile_tex(source: &str, template_version: u8, tex: String) -> Result<Vec<u8
     let _ = fs::remove_dir_all(&job);
 
     result
+}
+
+/// Pixels per PDF point in the preview; the reading view draws it at `1 / PREVIEW_SCALE`.
+pub const PREVIEW_SCALE: f32 = if cfg!(target_os = "macos") { 1.0 } else { 2.0 };
+
+#[cfg(target_os = "macos")]
+fn rasterize(pdf: &std::path::Path, png: &std::path::Path) -> Result<(), String> {
+    let output = Command::new("sips")
+        .args(["-s", "format", "png"])
+        .arg(pdf)
+        .arg("--out")
+        .arg(png)
+        .output()
+        .map_err(|error| format!("无法启动 PDF 预览转换：{error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rasterize(pdf: &std::path::Path, png: &std::path::Path) -> Result<(), String> {
+    // Poppler appends ".png" to the output root when writing a single page.
+    let root = png.with_extension("");
+    let output = Command::new("pdftoppm")
+        .args(["-png", "-singlefile", "-r"])
+        .arg((72.0 * PREVIEW_SCALE).to_string())
+        .arg(pdf)
+        .arg(&root)
+        .output()
+        .map_err(|error| format!("无法启动 PDF 预览转换（需要 Poppler 的 pdftoppm）：{error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(())
+}
+
+/// Width and height of a PNG from its IHDR chunk.
+pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    if png.len() < 24 || !png.starts_with(b"\x89PNG\r\n\x1a\n") || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    let read = |offset: usize| u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap());
+    Some((read(16), read(20)))
 }
 
 fn prune_cache(cache: &std::path::Path, max_bytes: u64) -> Result<(), String> {
@@ -139,6 +172,15 @@ mod tests {
             .sum::<u64>();
         assert!(bytes <= 4);
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn reads_png_dimensions() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&300_u32.to_be_bytes());
+        png.extend_from_slice(&120_u32.to_be_bytes());
+        assert_eq!(png_size(&png), Some((300, 120)));
+        assert_eq!(png_size(b"not a png"), None);
     }
 
     #[test]

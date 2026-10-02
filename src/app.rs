@@ -2403,16 +2403,24 @@ fn render_block(
                 .into_any_element()
         }
         BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => match tikz {
-            Some(TikzState::Ready(image)) => div()
-                .mb_4()
-                .p_4()
-                .rounded_md()
-                .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0xf28c45))
-                })
-                .bg(rgb(0xffffff))
-                .child(img(image.clone()).max_w_full())
-                .into_any_element(),
+            Some(TikzState::Ready(image)) => {
+                let width = crate::tikz::png_size(image.bytes())
+                    .map(|(width, _)| px(width as f32 / crate::tikz::PREVIEW_SCALE));
+                div()
+                    .mb_4()
+                    .p_4()
+                    .rounded_md()
+                    .when(object_cursor, |element| {
+                        element.border_2().border_color(rgb(0xf28c45))
+                    })
+                    .bg(rgb(0xffffff))
+                    .child(
+                        img(image.clone())
+                            .max_w_full()
+                            .when_some(width, |element, width| element.w(width)),
+                    )
+                    .into_any_element()
+            }
             Some(TikzState::Failed(error)) => div()
                 .mb_4()
                 .p_4()
