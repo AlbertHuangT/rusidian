@@ -4767,6 +4767,68 @@ impl RusidianApp {
                     .bg(rgb(theme.knob)),
             );
 
+        let (command, shift, reading_only) = if cfg!(target_os = "macos") {
+            ("⌘", "⇧", "")
+        } else {
+            ("Ctrl+", "Shift+", "（阅读视图中）")
+        };
+        let shortcuts = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_sm()
+            .children(
+                [
+                    (format!("{command}P"), "按名称快速打开笔记".to_owned()),
+                    (
+                        format!("{command}{shift}F"),
+                        "在所有笔记中搜索文字".to_owned(),
+                    ),
+                    (
+                        format!("{command}O / {command}{shift}O"),
+                        "打开文件 / 文件夹".to_owned(),
+                    ),
+                    (format!("{command}N"), "新建窗口".to_owned()),
+                    (
+                        format!("{command}W / {command}{shift}W"),
+                        "关闭标签 / 窗口".to_owned(),
+                    ),
+                    (format!("{command}\\"), "显示或隐藏文件列表".to_owned()),
+                    ("Enter".to_owned(), "编辑：进入 Neovim Normal".to_owned()),
+                    (
+                        self.reading_key.label().to_owned(),
+                        "在 Normal 模式返回阅读视图".to_owned(),
+                    ),
+                    (
+                        "j k · gj gk · w b e".to_owned(),
+                        "按行、屏幕行、词移动".to_owned(),
+                    ),
+                    ("/ ? n N · * #".to_owned(), "查找".to_owned()),
+                    ("v V · y".to_owned(), "选择并复制".to_owned()),
+                    (
+                        "gf · gx".to_owned(),
+                        "打开链接、嵌入、标签 / 用系统应用打开".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .map(|(keys, action)| {
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .w(px(170.0))
+                                .flex_none()
+                                .font_family(crate::fonts::mono())
+                                .text_color(rgb(theme.muted))
+                                .child(keys),
+                        )
+                        .child(div().flex_1().min_w_0().child(action))
+                }),
+            )
+            .child(div().text_color(rgb(theme.faint)).child(format!(
+                "{command} 组合键{reading_only}由 Rusidian 处理，其余按键交给 Neovim。"
+            )));
         // Linux builds come from source; the updater only installs the signed macOS app.
         let updates = if cfg!(target_os = "macos") {
             div()
@@ -4980,7 +5042,15 @@ impl RusidianApp {
                                     .text_color(rgb(theme.accent))
                                     .child("软件更新"),
                             )
-                            .child(updates),
+                            .child(updates)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.accent))
+                                    .child("快捷键"),
+                            )
+                            .child(shortcuts),
                     ),
             )
             .into_any_element()
