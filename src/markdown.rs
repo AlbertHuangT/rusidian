@@ -18,6 +18,10 @@ pub struct Block {
     pub links: Vec<LinkSpan>,
     pub list_marker: Option<String>,
     pub list_depth: usize,
+    /// Inside a list item; blocks after the item's first one indent to its text.
+    pub in_list: bool,
+    /// Text of a tight list item (no blank lines between items), which sits close to the next.
+    pub tight: bool,
     pub task: Option<bool>,
     pub quote_depth: usize,
     /// The innermost blockquote containing this block, numbered in document order.
@@ -143,13 +147,16 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph if current.is_none() => {
-                    current = Some(new_block(
+                    let mut block = new_block(
                         footnote.as_ref().map_or(BlockKind::Paragraph, |label| {
                             BlockKind::Footnote(label.clone())
                         }),
                         quote,
                         &mut items,
-                    ));
+                    );
+                    // Loose list items wrap their text in paragraphs; tight ones do not.
+                    block.tight = false;
+                    current = Some(block);
                 }
                 Tag::Heading { level, .. } => {
                     current = Some(new_block(
@@ -430,6 +437,8 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         links: Vec::new(),
         list_marker: None,
         list_depth: 0,
+        in_list: false,
+        tight: false,
         task: None,
         quote_depth: quote.depth,
         quote: quote.id,
@@ -441,12 +450,14 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         table_alignments: Vec::new(),
         source_map: Vec::new(),
     };
-    if let Some(item) = items.last_mut()
-        && !item.used
-    {
-        block.list_marker = Some(item.marker.clone());
+    if let Some(item) = items.last_mut() {
+        block.in_list = true;
         block.list_depth = item.depth;
-        item.used = true;
+        block.tight = block.kind == BlockKind::Paragraph;
+        if !item.used {
+            block.list_marker = Some(item.marker.clone());
+            item.used = true;
+        }
     }
     block
 }
@@ -841,6 +852,26 @@ mod tests {
         assert_eq!(document.blocks[2].task, Some(true));
         let empty_item = parse("-\n");
         assert_eq!(empty_item.blocks[0].list_marker.as_deref(), Some("•"));
+
+        let tight = parse("- a\n  - b\n- c\n\nafter\n");
+        assert!(
+            tight.blocks[..3]
+                .iter()
+                .all(|block| block.tight && block.in_list)
+        );
+        assert_eq!(tight.blocks[1].list_depth, 1);
+        assert!(!tight.blocks[3].in_list && !tight.blocks[3].tight);
+        let loose = parse("1. first\n\n   more\n\n2. second\n");
+        assert_eq!(loose.blocks.len(), 3);
+        assert!(
+            loose
+                .blocks
+                .iter()
+                .all(|block| block.in_list && !block.tight)
+        );
+        // The item's second paragraph has no marker of its own.
+        assert_eq!(loose.blocks[1].list_marker, None);
+        assert_eq!(loose.blocks[2].list_marker.as_deref(), Some("2."));
     }
 
     #[test]
