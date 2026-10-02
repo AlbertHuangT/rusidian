@@ -5872,16 +5872,27 @@ impl Render for RusidianApp {
             // A folded callout shows its title on its first block; the rest of it is hidden.
             // For each block: `Some(true)` for such a title, `Some(false)` when hidden.
             let mut fold = vec![None; blocks.len()];
+            // The block shown after each folded callout.
+            let mut after_fold = HashMap::new();
             for range in fold_ranges(blocks, &self.folded_callouts(blocks)) {
                 fold[range.start] = Some(true);
                 fold[range.start + 1..range.end].fill(Some(false));
+                after_fold.insert(range.start, range.end);
             }
             // Space below each block: outside it, or inside a quote that continues.
             let spacing: Vec<(Pixels, usize)> = blocks
                 .iter()
                 .enumerate()
                 .map(|(index, block)| match fold[index] {
-                    Some(true) => (px(16.0), 0),
+                    Some(true) => {
+                        // A folded callout ends at its title; quotes around it may go on.
+                        let next = after_fold.get(&index).and_then(|&next| blocks.get(next));
+                        (
+                            block_gap(block, next),
+                            shared_quote_depth(block, next)
+                                .min(block.quote_depth.saturating_sub(1)),
+                        )
+                    }
                     Some(false) => (px(0.0), 0),
                     None => {
                         let next = blocks.get(index + 1);
@@ -5923,6 +5934,7 @@ impl Render for RusidianApp {
                                 block,
                                 title,
                                 reading_cursor.block == index,
+                                (gap, shared),
                             ))
                         })
                     }
@@ -7053,12 +7065,12 @@ fn render_folded_callout(
     block: &Block,
     title: &str,
     active: bool,
+    spacing: (Pixels, usize),
 ) -> AnyElement {
     let color = crate::theme::callout_color(block.callout.as_deref().unwrap_or_default());
     let view = context.view.clone();
     let id = block.callout_quote;
-    div()
-        .ml(px(12.0 * block.quote_depth.saturating_sub(1) as f32))
+    let folded = div()
         .px_3()
         .py_2()
         .border_l_2()
@@ -7077,7 +7089,16 @@ fn render_folded_callout(
             }
         })
         .child(format!("▸ {title}"))
-        .into_any_element()
+        .into_any_element();
+    // Inside the quotes and callouts around it, like an open callout.
+    let (gap, shared) = spacing;
+    decorate_levels(
+        context,
+        block,
+        folded,
+        (if shared > 0 { gap } else { px(0.0) }, shared),
+        block.quote_depth.saturating_sub(1),
+    )
 }
 
 /// A note, heading section or block shown with `![[note]]`, in a card titled with its name.
@@ -7218,13 +7239,30 @@ fn decorate_block(
     inner_gap: Pixels,
     continued: usize,
 ) -> AnyElement {
+    decorate_levels(
+        context,
+        block,
+        content,
+        (inner_gap, continued),
+        block.quote_depth,
+    )
+}
+
+/// `decorate_block` drawing only the outermost `levels` quote levels.
+fn decorate_levels(
+    context: RenderContext,
+    block: &Block,
+    content: AnyElement,
+    (inner_gap, continued): (Pixels, usize),
+    levels: usize,
+) -> AnyElement {
     // A quote inside a list item sits in the item; a list inside a quote sits in the quote.
     if block.quote_in_list {
-        let quoted = quote_levels(context, block, content, inner_gap, continued);
+        let quoted = quote_levels(context, block, content, (inner_gap, continued), levels);
         list_item(block, quoted)
     } else {
         let item = list_item(block, content);
-        quote_levels(context, block, item, inner_gap, continued)
+        quote_levels(context, block, item, (inner_gap, continued), levels)
     }
 }
 
@@ -7253,22 +7291,19 @@ fn list_item(block: &Block, content: AnyElement) -> AnyElement {
     }
 }
 
-/// The quotes and callouts around a block, each level in its own style.
+/// The outermost `levels` quotes and callouts around a block, each in its own style.
 fn quote_levels(
     context: RenderContext,
     block: &Block,
     content: AnyElement,
-    inner_gap: Pixels,
-    continued: usize,
+    (inner_gap, continued): (Pixels, usize),
+    levels: usize,
 ) -> AnyElement {
     let theme = context.theme;
-    if block.quote_depth == 0 {
-        return content;
-    }
     // One box per quote level, innermost first: a callout's colored box or a plain quote's
     // border. The space below goes inside the deepest level that continues.
     let mut quoted = content;
-    for level in (1..=block.quote_depth).rev() {
+    for level in (1..=levels.min(block.quote_depth)).rev() {
         let inside_gap = if level == continued {
             inner_gap
         } else {
