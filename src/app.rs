@@ -198,8 +198,9 @@ fn open_window(path: Option<PathBuf>, first: bool, cx: &mut App) -> Option<AnyWi
             app.update(cx, |_, cx| {
                 cx.observe_window_activation(window, |this, window, cx| {
                     if window.is_window_active() {
-                        // Settings may have changed in another window.
+                        // Settings may have changed in another window, and notes elsewhere.
                         this.load_settings();
+                        this.refresh_vault(cx);
                         // Pick up edits made outside Rusidian (sync tools, git).
                         if let Some(nvim) = &this.nvim {
                             nvim.check_time();
@@ -1029,7 +1030,7 @@ impl RusidianApp {
         // First: embedded notes' diagrams and formulas compile with the note's own.
         self.load_embeds();
         self.find_unresolved_links();
-        self.load_backlinks(cx);
+        self.load_backlinks(false, cx);
         self.compile_tikz(cx);
         self.compile_math(cx);
         self.load_allowed_remote_images(cx);
@@ -1085,8 +1086,9 @@ impl RusidianApp {
         }
     }
 
-    /// Find the vault's notes linking to the note shown, in the background, once per note.
-    fn load_backlinks(&mut self, cx: &mut Context<Self>) {
+    /// Find the vault's notes linking to the note shown, in the background: once per note, or
+    /// again when `refresh`, keeping the earlier list until the new one is ready.
+    fn load_backlinks(&mut self, refresh: bool, cx: &mut Context<Self>) {
         let (Some(vault), Some(document)) = (&self.vault, &self.document) else {
             self.backlinks = None;
             return;
@@ -1095,15 +1097,16 @@ impl RusidianApp {
             .file
             .canonicalize()
             .unwrap_or_else(|_| document.file.clone());
-        if !document.is_markdown
-            || self
-                .backlinks
-                .as_ref()
-                .is_some_and(|(path, _)| *path == note)
-        {
+        let known = self
+            .backlinks
+            .as_ref()
+            .is_some_and(|(path, _)| *path == note);
+        if !document.is_markdown || (known && !refresh) {
             return;
         }
-        self.backlinks = Some((note.clone(), None));
+        if !known {
+            self.backlinks = Some((note.clone(), None));
+        }
         let files = vault.files.clone();
         let root = vault.root.clone();
         let executor = cx.background_executor().clone();
@@ -2169,7 +2172,8 @@ impl RusidianApp {
         cx.notify();
     }
 
-    /// Rescan the vault in the background, e.g. after a new note is saved from Neovim.
+    /// Rescan the vault in the background: after a new note is saved from Neovim, or when the
+    /// window comes back (notes may have been added, moved or deleted elsewhere).
     fn refresh_vault(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.vault.as_ref().map(|vault| vault.root.clone()) else {
             return;
@@ -2190,6 +2194,9 @@ impl RusidianApp {
                         .is_some_and(|current| current.root == root)
                     {
                         this.vault = Some(vault);
+                        // Links and backlinks may now resolve differently.
+                        this.find_unresolved_links();
+                        this.load_backlinks(true, cx);
                         cx.notify();
                     }
                 })
