@@ -302,6 +302,8 @@ struct RusidianApp {
     modified: bool,
     /// A heading or block to reveal once the note being opened in Neovim arrives.
     pending_fragment: Option<String>,
+    /// Put the reading cursor at the start of the note once its lines arrive from Neovim.
+    place_initial_cursor: bool,
     /// Notes open in Neovim (its listed buffers), shown as tabs, with unsaved flags.
     open_buffers: Vec<(PathBuf, bool)>,
     auto_update: bool,
@@ -431,6 +433,7 @@ impl RusidianApp {
             applied_title: None,
             modified: false,
             pending_fragment: None,
+            place_initial_cursor: false,
             open_buffers: Vec::new(),
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
@@ -478,6 +481,7 @@ impl RusidianApp {
                 if !document.is_markdown {
                     app.view = View::Source;
                 }
+                app.reading_cursor = initial_cursor(&document.markdown.blocks);
                 app.document = Some(document);
             }
             Err(error) => {
@@ -773,6 +777,11 @@ impl RusidianApp {
                             more,
                         } => {
                             if this.update_buffer(first, last, lines, more) && !more {
+                                if std::mem::take(&mut this.place_initial_cursor)
+                                    && let Some(document) = &this.document
+                                {
+                                    this.reading_cursor = initial_cursor(&document.markdown.blocks);
+                                }
                                 if let Some(fragment) = this.pending_fragment.take()
                                     && !this.reveal_fragment(&fragment)
                                 {
@@ -1104,6 +1113,7 @@ impl RusidianApp {
         });
         self.error = None;
         self.reading_cursor = ReadingCursor::default();
+        self.place_initial_cursor = true;
         self.synced_cursor = None;
         self.reading_column = None;
         self.reading_selection = None;
@@ -4042,6 +4052,40 @@ fn render_block(
             })
             .child(text())
             .into_any_element(),
+        // Front matter reads as a properties card; the cursor or a selection shows the raw YAML.
+        BlockKind::Metadata
+            if cursor.is_none()
+                && selection.is_none()
+                && let Some(properties) = parse_properties(&block.text) =>
+        {
+            div()
+                .mb_4()
+                .px_4()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme.border))
+                .text_sm()
+                .on_mouse_down(MouseButton::Left, context.click_at(0))
+                .children(properties.into_iter().map(|(key, value)| {
+                    div()
+                        .py_1()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .w(px(140.0))
+                                .flex_none()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(rgb(theme.muted))
+                                .child(key),
+                        )
+                        .child(div().flex_1().min_w_0().child(value))
+                }))
+                .into_any_element()
+        }
         BlockKind::Html | BlockKind::Metadata => div()
             .mb_4()
             .p_4()
@@ -4551,6 +4595,74 @@ fn render_inline_paragraph(
         .line_height(px(24.0))
         .children(children)
         .into_any_element()
+}
+
+/// Where reading starts in a newly shown note: the first text after any front matter.
+fn initial_cursor(blocks: &[Block]) -> ReadingCursor {
+    let cursorable = |(_, block): &(usize, &Block)| block_len(block) > 0;
+    blocks
+        .iter()
+        .enumerate()
+        .filter(cursorable)
+        .find(|(_, block)| block.kind != BlockKind::Metadata)
+        .or_else(|| blocks.iter().enumerate().find(cursorable))
+        .map(|(block, _)| ReadingCursor { block, offset: 0 })
+        .unwrap_or_default()
+}
+
+/// Simple YAML front matter (`key: value`, flow lists and `- item` lists) as display rows.
+/// Anything more complex returns `None` and is shown as source.
+fn parse_properties(yaml: &str) -> Option<Vec<(String, String)>> {
+    let clean = |value: &str| {
+        let value = value.trim();
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value)
+            .to_owned()
+    };
+    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    for line in yaml.lines().filter(|line| !line.trim().is_empty()) {
+        let trimmed = line.trim_start();
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or((trimmed == "-").then_some(""))
+        {
+            rows.last_mut()?.1.push(clean(item));
+        } else if line.starts_with(char::is_whitespace) || trimmed.starts_with('#') {
+            return None;
+        } else {
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = value.trim();
+            let values = match value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                Some(list) => list
+                    .split(',')
+                    .map(clean)
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+                None if value.is_empty() => Vec::new(),
+                None => vec![clean(value)],
+            };
+            rows.push((clean(key), values));
+        }
+    }
+    (!rows.is_empty()).then(|| {
+        rows.into_iter()
+            .map(|(key, values)| (key, values.join(", ")))
+            .collect()
+    })
 }
 
 /// Zero-based line and byte column in the source for a reading-view position.
@@ -5368,6 +5480,34 @@ mod tests {
             source_offset(&document.lines, 99, 99),
             source.trim_end().len()
         );
+    }
+
+    #[test]
+    fn reads_simple_front_matter_as_properties() {
+        assert_eq!(
+            parse_properties(
+                "title: \"Edge: cases\"\ntags: [a, 'b']\naliases:\n  - one\n  - two\nempty:"
+            ),
+            Some(vec![
+                ("title".into(), "Edge: cases".into()),
+                ("tags".into(), "a, b".into()),
+                ("aliases".into(), "one, two".into()),
+                ("empty".into(), String::new()),
+            ])
+        );
+        assert_eq!(parse_properties("nested:\n  key: value"), None);
+        let note = crate::markdown::parse("---\ntitle: x\n---\n\n# Body\n");
+        assert_eq!(
+            initial_cursor(&note.blocks),
+            ReadingCursor {
+                block: 1,
+                offset: 0
+            }
+        );
+        let only = crate::markdown::parse("---\ntitle: x\n---\n");
+        assert_eq!(initial_cursor(&only.blocks), ReadingCursor::default());
+        assert_eq!(parse_properties("- orphan"), None);
+        assert_eq!(parse_properties("just text"), None);
     }
 
     #[test]
