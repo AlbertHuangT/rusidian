@@ -10,10 +10,10 @@ use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context, ElementInputHandler,
     EntityInputHandler, FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
     KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
-    SharedString, Size, StrikethroughStyle, StyledText, TextLayout, UTF16Selection, UnderlineStyle,
-    ScrollStrategy, UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
-    actions, canvas, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy,
+    ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText, TextLayout,
+    UTF16Selection, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
+    WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list,
 };
 use gpui_platform::application;
 use std::{
@@ -5259,7 +5259,8 @@ impl Render for RusidianApp {
                 if let Some(index) = self.tree().iter().position(
                     |row| matches!(row, TreeRow::Note { path, .. } if same_file(path, &file)),
                 ) {
-                    self.tree_scroll.scroll_to_item(index, ScrollStrategy::Center);
+                    self.tree_scroll
+                        .scroll_to_item(index, ScrollStrategy::Center);
                 }
             }
             self.revealed_in_tree = Some(file);
