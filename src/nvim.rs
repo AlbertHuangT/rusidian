@@ -47,6 +47,8 @@ pub enum Event {
     BufferEntered(PathBuf),
     /// A buffer was written to this path.
     BufferWritten(PathBuf),
+    /// Whether the followed buffer has unsaved changes.
+    Modified(bool),
     Exited,
 }
 
@@ -100,6 +102,11 @@ impl Handler for EventHandler {
             }
             "rusidian_buf_enter" => {
                 let _ = self.commands.send(Command::FollowCurrentBuffer);
+            }
+            "rusidian_modified" => {
+                if let Some(modified) = args.first().and_then(Value::as_bool) {
+                    let _ = self.events.try_send(Event::Modified(modified));
+                }
             }
             "rusidian_buf_write" => {
                 if let Some(name) = args.first().and_then(Value::as_str) {
@@ -286,6 +293,11 @@ impl Client {
                             end })
                             vim.api.nvim_create_autocmd('BufWritePost', { group = group, callback = function(args)
                               vim.rpcnotify(channel, 'rusidian_buf_write', vim.api.nvim_buf_get_name(args.buf))
+                            end })
+                            vim.api.nvim_create_autocmd({ 'BufModifiedSet', 'BufEnter' }, { group = group, callback = function(args)
+                              if args.buf == vim.api.nvim_get_current_buf() then
+                                vim.rpcnotify(channel, 'rusidian_modified', vim.bo[args.buf].modified)
+                              end
                             end })",
                             vec![Value::from(channel)],
                         )
@@ -1251,7 +1263,8 @@ mod tests {
                             Event::Warning(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
-                            | Event::BufferWritten(_) => {}
+                            | Event::BufferWritten(_)
+                            | Event::Modified(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1277,7 +1290,8 @@ mod tests {
                             Event::Warning(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
-                            | Event::BufferWritten(_) => {}
+                            | Event::BufferWritten(_)
+                            | Event::Modified(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1302,7 +1316,8 @@ mod tests {
                             Event::Warning(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
-                            | Event::BufferWritten(_) => {}
+                            | Event::BufferWritten(_)
+                            | Event::Modified(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1327,7 +1342,8 @@ mod tests {
                             Event::Warning(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
-                            | Event::BufferWritten(_) => {}
+                            | Event::BufferWritten(_)
+                            | Event::Modified(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1350,7 +1366,8 @@ mod tests {
                             Event::Warning(_)
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
-                            | Event::BufferWritten(_) => {}
+                            | Event::BufferWritten(_)
+                            | Event::Modified(_) => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }

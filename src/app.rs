@@ -262,6 +262,8 @@ struct RusidianApp {
     notice: Option<Notice>,
     notice_generation: u64,
     applied_title: Option<String>,
+    /// Neovim's buffer has changes that are not written to disk.
+    modified: bool,
     auto_update: bool,
     update_status: UpdateStatus,
     available_update: Option<Update>,
@@ -384,6 +386,7 @@ impl RusidianApp {
             notice: None,
             notice_generation: 0,
             applied_title: None,
+            modified: false,
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
             available_update: None,
@@ -763,6 +766,12 @@ impl RusidianApp {
                         NvimEvent::BufferEntered(path) => {
                             this.follow_buffer(path, cx);
                         }
+                        NvimEvent::Modified(modified) => {
+                            if this.modified != modified {
+                                this.modified = modified;
+                                cx.notify();
+                            }
+                        }
                         NvimEvent::BufferWritten(path) => {
                             if this.vault.as_ref().is_some_and(|vault| {
                                 path.starts_with(&vault.root)
@@ -774,6 +783,7 @@ impl RusidianApp {
                         }
                         NvimEvent::Exited => {
                             this.nvim = None;
+                            this.modified = false;
                             if let Some(action) = this.pending_close.take() {
                                 this.request_close(action, cx);
                             } else {
@@ -1174,7 +1184,8 @@ impl RusidianApp {
             .and_then(|vault| vault.root.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Rusidian".into());
-        format!("{} — {context}", document.name)
+        let marker = if self.modified { "● " } else { "" };
+        format!("{marker}{} — {context}", document.name)
     }
 
     fn links(&self) -> Links<'_> {
@@ -2266,6 +2277,12 @@ impl RusidianApp {
                 });
             }
         }
+        let unsaved = self.modified.then(|| {
+            div()
+                .flex_none()
+                .text_color(rgb(theme.warning_text))
+                .child("● 未保存")
+        });
         let hint = match self.view {
             View::Reading if self.document.is_some() => "Enter 编辑",
             View::Source if self.nvim.is_none() && self.document.is_some() => "Enter 重新打开",
@@ -2336,6 +2353,7 @@ impl RusidianApp {
                 )
             })
             .child(message)
+            .children(unsaved)
             .child(div().flex_none().child(hint))
             .into_any_element()
     }
@@ -4701,6 +4719,13 @@ mod tests {
         assert!(text.document.as_ref().unwrap().markdown.blocks.is_empty());
         let note = RusidianApp::open(Some(Path::new("examples/tikz.md")));
         assert!(note.view == View::Reading && note.has_reading_view());
+    }
+
+    #[test]
+    fn marks_unsaved_changes_in_the_title() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        app.modified = true;
+        assert_eq!(app.window_title(), "● tikz.md — Rusidian");
     }
 
     #[test]
