@@ -35,6 +35,8 @@ pub struct Block {
     pub callout_title: Option<String>,
     /// For fenced code: whether the closing fence is present (an open fence runs to the end).
     pub fence_closed: bool,
+    /// Obsidian's `^id` that block links point to; hidden from the text like in Obsidian.
+    pub block_id: Option<String>,
     pub cells: Vec<Range<usize>>,
     pub table_alignments: Vec<Alignment>,
     /// Where each piece of `text` came from in the Markdown source, in text order.
@@ -458,7 +460,23 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     push_current(&mut blocks, &mut current);
     apply_callouts(&mut blocks, &alerts);
     number_footnotes(&mut blocks, &mut footnotes);
+    attach_standalone_block_ids(&mut blocks);
     MarkdownDocument { blocks }
+}
+
+/// A paragraph holding only `^id` names the block before it (how Obsidian marks lists, quotes
+/// and tables); it is not shown itself.
+fn attach_standalone_block_ids(blocks: &mut Vec<Block>) {
+    let mut index = 1;
+    while index < blocks.len() {
+        let block = &blocks[index];
+        if block.kind == BlockKind::Paragraph && block.text.is_empty() && block.block_id.is_some() {
+            let id = blocks.remove(index).block_id;
+            blocks[index - 1].block_id = id;
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn footnote_number(footnotes: &mut Vec<String>, label: &str) -> usize {
@@ -513,6 +531,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         callout: None,
         callout_title: None,
         fence_closed: false,
+        block_id: None,
         cells: Vec::new(),
         table_alignments: Vec::new(),
         source_map: Vec::new(),
@@ -684,21 +703,15 @@ impl Block {
             BlockKind::Code(_) | BlockKind::Html | BlockKind::Metadata
         ) && self.text.ends_with('\n')
         {
-            self.text.pop();
-            let end = self.text.len();
-            for span in &mut self.spans {
-                span.range.end = span.range.end.min(end);
-            }
-            self.spans.retain(|span| !span.range.is_empty());
-            for span in &mut self.source_map {
-                if span.text.end > end {
-                    if span.exact {
-                        span.source.end -= span.text.end - end;
-                    }
-                    span.text.end = end;
-                }
-            }
-            self.source_map.retain(|span| !span.text.is_empty());
+            self.truncate(self.text.len() - 1);
+        }
+        if !matches!(
+            self.kind,
+            BlockKind::Code(_) | BlockKind::Html | BlockKind::Metadata | BlockKind::Math
+        ) && let Some((start, id)) = trailing_block_id(&self.text)
+        {
+            self.block_id = Some(id.to_owned());
+            self.truncate(start);
         }
         if self.kind == BlockKind::Paragraph && self.text == "\u{fffc}" && self.images.len() == 1 {
             let image = self.images.pop().unwrap();
@@ -715,6 +728,22 @@ impl Block {
             }];
         }
     }
+}
+
+/// A trailing Obsidian block id: where its leading whitespace starts, and the id.
+fn trailing_block_id(text: &str) -> Option<(usize, &str)> {
+    let caret = text.rfind('^')?;
+    let id = &text[caret + 1..];
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let before = text[..caret].trim_end();
+    // Alone, or after whitespace: `word^id` is not an id.
+    (before.len() < caret || caret == 0).then_some((before.len(), id))
 }
 
 /// Whether a fenced code block's source ends with a closing fence matching its opening one.
@@ -872,6 +901,30 @@ fn capitalize(word: &str) -> String {
 
 impl Block {
     /// Drop the first `count` bytes of text, keeping every range pointing at the same text.
+    /// Drop the text from `end` on, keeping every range pointing at the same text.
+    fn truncate(&mut self, end: usize) {
+        self.text.truncate(end);
+        for span in &mut self.spans {
+            span.range.end = span.range.end.min(end);
+        }
+        self.spans.retain(|span| span.range.start < span.range.end);
+        for link in &mut self.links {
+            link.range.end = link.range.end.min(end);
+        }
+        self.links.retain(|link| link.range.start < link.range.end);
+        self.images.retain(|image| image.range.end <= end);
+        self.maths.retain(|math| math.range.end <= end);
+        for span in &mut self.source_map {
+            if span.text.end > end {
+                if span.exact {
+                    span.source.end -= span.text.end - end.max(span.text.start);
+                }
+                span.text.end = end.max(span.text.start);
+            }
+        }
+        self.source_map.retain(|span| !span.text.is_empty());
+    }
+
     fn remove_prefix(&mut self, count: usize) {
         self.text.replace_range(..count, "");
         let shift = |range: &mut Range<usize>| {
@@ -1028,6 +1081,25 @@ mod tests {
         // The item's second paragraph has no marker of its own.
         assert_eq!(loose.blocks[1].list_marker, None);
         assert_eq!(loose.blocks[2].list_marker.as_deref(), Some("2."));
+    }
+
+    #[test]
+    fn hides_obsidian_block_ids() {
+        let document = parse(
+            "Para text ^abc-1\n\n- item ^li\n\n| a |\n| - |\n| b |\n\n^table\n\nx^2 and caret ^ end\n",
+        );
+        let paragraph = &document.blocks[0];
+        assert_eq!(paragraph.text, "Para text");
+        assert_eq!(paragraph.block_id.as_deref(), Some("abc-1"));
+        assert_eq!(paragraph.source_lines("Para text ^abc-1"), Some(0..1));
+        assert_eq!(document.blocks[1].text, "item");
+        assert_eq!(document.blocks[1].block_id.as_deref(), Some("li"));
+        // A standalone id names the table (its last row) and is not shown.
+        assert_eq!(document.blocks[3].block_id.as_deref(), Some("table"));
+        assert_eq!(document.blocks[4].text, "x^2 and caret ^ end");
+        assert_eq!(document.blocks.len(), 5);
+        assert_eq!(trailing_block_id("^solo"), Some((0, "solo")));
+        assert_eq!(trailing_block_id("word^id"), None);
     }
 
     #[test]

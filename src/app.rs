@@ -5088,17 +5088,12 @@ fn embedded_blocks<'a>(blocks: &'a [Block], fragment: Option<&str>) -> Option<&'
     Some(&blocks[start..end])
 }
 
-/// The block a link fragment points to: a heading, or a block ending in `^id`.
+/// The block a link fragment points to: a heading, or the block marked `^id`.
 fn fragment_block(blocks: &[Block], fragment: &str) -> Option<usize> {
     if let Some(id) = fragment.strip_prefix('^') {
-        let marker = format!("^{id}");
-        return blocks.iter().position(|block| {
-            block
-                .text
-                .split_whitespace()
-                .last()
-                .is_some_and(|word| word == marker)
-        });
+        return blocks
+            .iter()
+            .position(|block| block.block_id.as_deref() == Some(id));
     }
     let wanted = heading_key(&crate::vault::percent_decode(fragment));
     blocks.iter().position(|block| {
@@ -6407,7 +6402,7 @@ mod tests {
         );
         assert_eq!(
             texts(embedded_blocks(&blocks, Some("^id1")).unwrap()),
-            ["marked ^id1"]
+            ["marked"]
         );
         assert!(embedded_blocks(&blocks, Some("Missing")).is_none());
 
