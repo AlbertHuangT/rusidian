@@ -206,6 +206,7 @@ struct RusidianApp {
     /// A transient message for the status bar, such as a failed link or a completed copy.
     notice: Option<Notice>,
     notice_generation: u64,
+    applied_title: Option<String>,
     auto_update: bool,
     update_status: UpdateStatus,
     available_update: Option<Update>,
@@ -317,6 +318,7 @@ impl RusidianApp {
             settings_open: false,
             notice: None,
             notice_generation: 0,
+            applied_title: None,
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
             available_update: None,
@@ -911,6 +913,20 @@ impl RusidianApp {
             self.reading_cursor = cursor;
             self.reading_column = None;
         }
+    }
+
+    /// `note.md — vault` inside a vault, `note.md — Rusidian` otherwise.
+    fn window_title(&self) -> String {
+        let Some(document) = &self.document else {
+            return "Rusidian".into();
+        };
+        let context = self
+            .vault
+            .as_ref()
+            .and_then(|vault| vault.root.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Rusidian".into());
+        format!("{} — {context}", document.name)
     }
 
     fn links(&self) -> Links<'_> {
@@ -2285,6 +2301,11 @@ impl Render for RusidianApp {
             .as_ref()
             .map(|document| document.name.clone())
             .unwrap_or_else(|| "Rusidian".into());
+        let window_title = self.window_title();
+        if self.applied_title.as_deref() != Some(window_title.as_str()) {
+            window.set_window_title(&window_title);
+            self.applied_title = Some(window_title);
+        }
         let reading_cursor = self.reading_cursor;
         let input_view = cx.entity();
         let reading_focus = self.focus_handle.clone();
@@ -3853,6 +3874,17 @@ mod tests {
         assert!(is_text_file(Path::new("README.md")));
         assert!(!is_text_file(Path::new("assets/app-icon.png")));
         assert!(is_external_link("https://example.com") && !is_external_link("note.md"));
+    }
+
+    #[test]
+    fn titles_the_window_with_note_and_vault() {
+        assert_eq!(RusidianApp::open(None).window_title(), "Rusidian");
+        assert_eq!(
+            RusidianApp::open(Some(Path::new("examples/tikz.md"))).window_title(),
+            "tikz.md — Rusidian"
+        );
+        let vault = RusidianApp::open(Some(Path::new("examples")));
+        assert!(vault.window_title().ends_with(" — examples"));
     }
 
     #[test]
