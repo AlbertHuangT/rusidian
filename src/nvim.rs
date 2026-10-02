@@ -682,6 +682,8 @@ pub struct Grid {
     mode_index: usize,
     cursor_shapes: Vec<CursorShape>,
     busy: bool,
+    /// The buffer line (zero-based) of the cursor, from the latest `win_viewport` event.
+    pub buffer_cursor_line: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -775,6 +777,11 @@ impl Grid {
                     "default_colors_set" => self.set_default_colors(args),
                     "hl_attr_define" => self.define_highlight(args),
                     "busy_start" => self.busy = true,
+                    "win_viewport" => {
+                        if let Some(line) = args.get(4).and_then(Value::as_u64) {
+                            self.buffer_cursor_line = Some(line as usize);
+                        }
+                    }
                     "busy_stop" => self.busy = false,
                     "flush" => flush = true,
                     _ => {}

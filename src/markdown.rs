@@ -26,6 +26,8 @@ pub struct Block {
     pub callout: Option<String>,
     /// The callout's title, on the first block of the callout only.
     pub callout_title: Option<String>,
+    /// For fenced code: whether the closing fence is present (an open fence runs to the end).
+    pub fence_closed: bool,
     pub cells: Vec<Range<usize>>,
     pub table_alignments: Vec<Alignment>,
     /// Where each piece of `text` came from in the Markdown source, in text order.
@@ -236,9 +238,14 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         block.push_image(image);
                     }
                 }
+                TagEnd::CodeBlock => {
+                    if let Some(block) = &mut current {
+                        block.fence_closed = closes_fence(source.get(range.clone()).unwrap_or(""));
+                    }
+                    push_current(&mut blocks, &mut current);
+                }
                 TagEnd::Paragraph
                 | TagEnd::Heading(_)
-                | TagEnd::CodeBlock
                 | TagEnd::HtmlBlock
                 | TagEnd::MetadataBlock(_) => push_current(&mut blocks, &mut current),
                 TagEnd::BlockQuote(_) => {
@@ -423,6 +430,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         quote: quote.id,
         callout: None,
         callout_title: None,
+        fence_closed: false,
         cells: Vec::new(),
         table_alignments: Vec::new(),
         source_map: Vec::new(),
@@ -537,6 +545,39 @@ impl Block {
                 exact: false,
             }];
         }
+    }
+}
+
+/// Whether a fenced code block's source ends with a closing fence matching its opening one.
+fn closes_fence(block: &str) -> bool {
+    let mut lines = block.trim_end_matches('\n').lines();
+    let Some(open) = lines.next().map(str::trim_start) else {
+        return false;
+    };
+    let marker = open
+        .chars()
+        .next()
+        .filter(|marker| matches!(marker, '`' | '~'));
+    let Some(marker) = marker else {
+        return false;
+    };
+    let length = open
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    lines.next_back().is_some_and(|close| {
+        let close = close.trim();
+        close.len() >= length && close.chars().all(|character| character == marker)
+    })
+}
+
+impl Block {
+    /// The zero-based source lines this block's text came from.
+    pub fn source_lines(&self, source: &str) -> Option<Range<usize>> {
+        let start = self.source_map.first()?.source.start;
+        let end = self.source_map.last()?.source.end;
+        let line = |offset: usize| source[..offset.min(source.len())].matches('\n').count();
+        Some(line(start)..line(end.saturating_sub(1).max(start)) + 1)
     }
 }
 
@@ -911,6 +952,12 @@ mod tests {
             [(0..11, Inline::Plain)],
             "spaced pairs are comparisons, not highlights"
         );
+
+        let fences = parse("```tikz\na\n```\n\n~~~~\nb\n~~~~\n\n```tikz\nopen\n");
+        assert!(fences.blocks[0].fence_closed && fences.blocks[1].fence_closed);
+        assert!(!fences.blocks[2].fence_closed);
+        let source = "# T\n\n```tikz\none\ntwo\n```\n";
+        assert_eq!(parse(source).blocks[1].source_lines(source), Some(3..5));
 
         let wiki = parse("[[目标笔记|显示名称]]");
         assert_eq!(wiki.blocks[0].text, "显示名称");

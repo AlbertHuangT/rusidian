@@ -249,6 +249,8 @@ struct RusidianApp {
     error: Option<SharedString>,
     /// Rendered TikZ keyed by block source, so unchanged diagrams survive edits elsewhere.
     tikz: HashMap<String, TikzState>,
+    /// TikZ blocks of the last parse while editing, to tell new fences from edits.
+    tikz_lines: Vec<TikzBlock>,
     math: HashMap<(String, bool), MathState>,
     view: View,
     nvim: Option<NvimClient>,
@@ -397,6 +399,7 @@ impl RusidianApp {
             vault: None,
             error: None,
             tikz: HashMap::new(),
+            tikz_lines: Vec::new(),
             math: HashMap::new(),
             view: View::Reading,
             nvim: None,
@@ -530,7 +533,38 @@ impl RusidianApp {
     }
 
     fn compile_tikz(&mut self, cx: &mut Context<Self>) {
-        for source in self.pending_tikz() {
+        let sources = self.pending_tikz();
+        self.compile_tikz_sources(sources, cx);
+    }
+
+    /// While editing: compile diagrams whose fence was just closed, and edited diagrams once
+    /// the cursor has left them (PRODUCT.md's TikZ timing).
+    fn compile_finished_tikz(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        // Runs on every cursor move while editing; most notes have no diagrams.
+        if !document.markdown.blocks.iter().any(is_tikz) {
+            self.tikz_lines.clear();
+            return;
+        }
+        let source = document.lines.join("\n");
+        let current = tikz_blocks(&document.markdown.blocks, &source);
+        let ready = tikz_ready_to_compile(
+            &self.tikz_lines,
+            &current,
+            self.grid.buffer_cursor_line,
+            |source| self.tikz.contains_key(source),
+        );
+        self.tikz_lines = current;
+        for source in &ready {
+            self.tikz.insert(source.clone(), TikzState::Loading);
+        }
+        self.compile_tikz_sources(ready, cx);
+    }
+
+    fn compile_tikz_sources(&mut self, sources: Vec<String>, cx: &mut Context<Self>) {
+        for source in sources {
             let executor = cx.background_executor().clone();
             cx.spawn(async move |this, cx| {
                 let input = source.clone();
@@ -855,8 +889,12 @@ impl RusidianApp {
                     }
                     match event {
                         NvimEvent::Redraw(events) => {
+                            let line = this.grid.buffer_cursor_line;
                             if this.grid.apply_redraw(&events) {
                                 cx.notify();
+                            }
+                            if this.view == View::Source && this.grid.buffer_cursor_line != line {
+                                this.compile_finished_tikz(cx);
                             }
                         }
                         NvimEvent::BufferLines {
@@ -882,6 +920,8 @@ impl RusidianApp {
                                 }
                                 if this.view == View::Reading {
                                     this.compile_visuals(cx);
+                                } else {
+                                    this.compile_finished_tikz(cx);
                                 }
                                 cx.notify();
                             }
@@ -1205,6 +1245,7 @@ impl RusidianApp {
         self.error = None;
         self.reading_cursor = ReadingCursor::default();
         self.place_initial_cursor = true;
+        self.tikz_lines.clear();
         self.synced_cursor = None;
         self.reading_column = None;
         self.reading_selection = None;
@@ -5040,6 +5081,49 @@ fn is_object(block: &Block) -> bool {
     matches!(&block.kind, BlockKind::Image(_)) || block.kind == BlockKind::Math || is_tikz(block)
 }
 
+/// A TikZ block's source lines, text and whether its fence is closed.
+#[derive(Clone, Debug, PartialEq)]
+struct TikzBlock {
+    lines: std::ops::Range<usize>,
+    source: String,
+    closed: bool,
+}
+
+fn tikz_blocks(blocks: &[Block], source: &str) -> Vec<TikzBlock> {
+    blocks
+        .iter()
+        .filter(|block| is_tikz(block))
+        .filter_map(|block| {
+            Some(TikzBlock {
+                lines: block.source_lines(source)?,
+                source: block.text.clone(),
+                closed: block.fence_closed,
+            })
+        })
+        .collect()
+}
+
+/// Diagrams to compile now: a block whose fence was just closed compiles at once; an edited
+/// block (closed before, same first line) waits until the cursor is outside it.
+fn tikz_ready_to_compile(
+    previous: &[TikzBlock],
+    current: &[TikzBlock],
+    cursor_line: Option<usize>,
+    known: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|block| block.closed && !known(&block.source))
+        .filter(|block| {
+            let was_closed = previous
+                .iter()
+                .any(|old| old.closed && old.lines.start == block.lines.start);
+            !was_closed || cursor_line.is_none_or(|line| !block.lines.contains(&line))
+        })
+        .map(|block| block.source.clone())
+        .collect()
+}
+
 fn is_tikz(block: &Block) -> bool {
     matches!(&block.kind, BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz"))
 }
@@ -5742,6 +5826,41 @@ mod tests {
         assert_eq!(initial_cursor(&only.blocks), ReadingCursor::default());
         assert_eq!(parse_properties("- orphan"), None);
         assert_eq!(parse_properties("just text"), None);
+    }
+
+    #[test]
+    fn compiles_tikz_when_the_fence_closes_or_the_cursor_leaves() {
+        let block = |start: usize, source: &str, closed: bool| TikzBlock {
+            lines: start..start + 3,
+            source: source.into(),
+            closed,
+        };
+        let never_compiled = |_: &str| false;
+        // An open fence never compiles; closing it compiles at once, even with the cursor inside.
+        assert!(
+            tikz_ready_to_compile(&[], &[block(2, "a", false)], Some(3), never_compiled).is_empty()
+        );
+        assert_eq!(
+            tikz_ready_to_compile(
+                &[block(2, "a", false)],
+                &[block(2, "ab", true)],
+                Some(3),
+                never_compiled
+            ),
+            ["ab"]
+        );
+        // Editing a closed block waits for the cursor to leave it.
+        let edited = [block(2, "abc", true)];
+        assert!(
+            tikz_ready_to_compile(&[block(2, "ab", true)], &edited, Some(3), never_compiled)
+                .is_empty()
+        );
+        assert_eq!(
+            tikz_ready_to_compile(&edited, &edited, Some(9), never_compiled),
+            ["abc"]
+        );
+        // Diagrams already compiled or compiling are left alone.
+        assert!(tikz_ready_to_compile(&edited, &edited, Some(9), |_| true).is_empty());
     }
 
     #[test]
