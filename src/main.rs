@@ -3,6 +3,8 @@ mod fonts;
 mod markdown;
 mod math;
 mod nvim;
+mod settings;
+mod theme;
 mod tikz;
 mod update;
 mod vault;

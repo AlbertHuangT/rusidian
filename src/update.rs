@@ -1,7 +1,5 @@
 use cargo_packager_updater::{Config, Update, UpdaterBuilder, semver::Version, url::Url};
-use serde::{Deserialize, Serialize};
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,28 +10,12 @@ const ENDPOINTS: [&str; 2] = [
 ];
 const PUBLIC_KEY: &str = include_str!("../assets/update.pubkey");
 
-#[derive(Default, Deserialize, Serialize)]
-struct Settings {
-    auto_update: bool,
-}
-
 pub fn auto_update_enabled() -> bool {
-    load_settings()
-        .map(|settings| settings.auto_update)
-        .unwrap_or(false)
+    crate::settings::load().auto_update
 }
 
 pub fn set_auto_update(enabled: bool) -> Result<(), String> {
-    let path = settings_path()?;
-    let parent = path.parent().ok_or("无法确定设置目录")?;
-    fs::create_dir_all(parent).map_err(|error| format!("无法创建设置目录：{error}"))?;
-    let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(&Settings {
-        auto_update: enabled,
-    })
-    .map_err(|error| format!("无法编码更新设置：{error}"))?;
-    fs::write(&temporary, bytes).map_err(|error| format!("无法保存更新设置：{error}"))?;
-    fs::rename(&temporary, &path).map_err(|error| format!("无法替换更新设置：{error}"))
+    crate::settings::update(|settings| settings.auto_update = enabled).map(|_| ())
 }
 
 pub fn is_packaged_app() -> bool {
@@ -69,23 +51,6 @@ pub fn install(update: Update) -> Result<(), String> {
     update
         .download_and_install()
         .map_err(|error| format!("安装更新失败：{error}"))
-}
-
-fn load_settings() -> Result<Settings, String> {
-    let path = settings_path()?;
-    match fs::read(path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|error| format!("无法读取更新设置：{error}"))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(error) => Err(format!("无法读取更新设置：{error}")),
-    }
-}
-
-fn settings_path() -> Result<PathBuf, String> {
-    dirs::config_dir()
-        .map(|directory| directory.join("rusidian/settings.json"))
-        .ok_or_else(|| "无法确定系统设置目录".into())
 }
 
 fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {

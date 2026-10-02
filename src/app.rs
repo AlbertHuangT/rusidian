@@ -1,6 +1,7 @@
 use crate::markdown::{Block, BlockKind, MarkdownDocument};
 use crate::math::{FONT_SIZE, Formula};
 use crate::nvim::{Client as NvimClient, CursorShape, Event as NvimEvent, Grid as NvimGrid};
+use crate::theme::{Appearance, Theme};
 use crate::update;
 use crate::vault::Vault;
 use cargo_packager_updater::Update;
@@ -25,6 +26,10 @@ const WINDOW_HEIGHT: f32 = 640.0;
 const SOURCE_FONT_SIZE: f32 = 14.0;
 const SOURCE_LINE_HEIGHT: f32 = 20.0;
 const GRID_PADDING: f32 = 12.0;
+/// IME composition in the source view, drawn over Neovim's own colors.
+const IME_MARKED_BACKGROUND: u32 = 0x7a3b20;
+/// TikZ diagrams sit on a white card in every theme.
+const WHITE: u32 = 0xffffff;
 
 actions!(
     rusidian,
@@ -111,6 +116,9 @@ pub fn run(initial_path: Option<PathBuf>) {
                     }
                     app
                 });
+                window
+                    .observe_window_appearance(|window, _| window.refresh())
+                    .detach();
                 let focus = app.read(cx).focus_handle.clone();
                 if let Some(focus) = focus {
                     window.focus(&focus, cx);
@@ -218,6 +226,9 @@ struct RusidianApp {
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
+    appearance: Appearance,
+    /// Resolved at the start of every render from `appearance` and the window's appearance.
+    theme: Theme,
     /// A transient message for the status bar, such as a failed link or a completed copy.
     notice: Option<Notice>,
     notice_generation: u64,
@@ -332,6 +343,8 @@ impl RusidianApp {
             marked_text: String::new(),
             marked_selection: 0..0,
             settings_open: false,
+            appearance: crate::settings::load().appearance,
+            theme: Theme::DARK,
             notice: None,
             notice_generation: 0,
             applied_title: None,
@@ -605,6 +618,14 @@ impl RusidianApp {
         .detach();
     }
 
+    fn set_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+        self.appearance = appearance;
+        if let Err(error) = crate::settings::update(|settings| settings.appearance = appearance) {
+            self.show_notice(error, true, cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.auto_update;
         match update::set_auto_update(enabled) {
@@ -806,6 +827,8 @@ impl RusidianApp {
         next.nvim_size = self.nvim_size.clone();
         next.cell_size = self.cell_size;
         next.settings_open = self.settings_open;
+        next.appearance = self.appearance;
+        next.theme = self.theme;
         next.auto_update = self.auto_update;
         next.update_status = std::mem::replace(&mut self.update_status, UpdateStatus::Idle);
         next.available_update = self.available_update.take();
@@ -1740,11 +1763,12 @@ impl RusidianApp {
     }
 
     fn render_source(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
         if let Some(error) = &self.nvim_error {
             return div()
                 .flex_1()
                 .p_8()
-                .text_color(rgb(0xffa7b2))
+                .text_color(rgb(theme.error_text))
                 .when_some(self.focus_handle.clone(), |element, focus| {
                     element.track_focus(&focus)
                 })
@@ -1818,8 +1842,8 @@ impl RusidianApp {
                     .top(top)
                     .h(line_height)
                     .whitespace_nowrap()
-                    .bg(rgb(0x7a3b20))
-                    .text_color(rgb(0xffffff))
+                    .bg(rgb(IME_MARKED_BACKGROUND))
+                    .text_color(rgb(WHITE))
                     .underline()
                     .child(self.marked_text.clone())
             } else {
@@ -1870,8 +1894,8 @@ impl RusidianApp {
                 .mb_0()
                 .p_3()
                 .rounded_md()
-                .bg(rgb(0x4a3518))
-                .text_color(rgb(0xffd38a))
+                .bg(rgb(theme.warning_bg))
+                .text_color(rgb(theme.warning_text))
                 .text_sm()
                 .child(div().flex_1().child(warning))
                 .child(
@@ -1880,7 +1904,7 @@ impl RusidianApp {
                         .px_2()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|element| element.bg(rgb(0x5c4420)))
+                        .hover(|element| element.bg(rgb(theme.warning_hover)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.nvim_warning = None;
                             cx.notify();
@@ -1943,6 +1967,7 @@ impl RusidianApp {
     }
 
     fn render_status_bar(&self, search_prompt: Option<String>) -> AnyElement {
+        let theme = self.theme;
         let mode: SharedString = match self.view {
             View::Reading => match self.reading_selection {
                 Some(selection) if selection.linewise => "V-LINE".into(),
@@ -1980,7 +2005,7 @@ impl RusidianApp {
                 .flex_1()
                 .min_w_0()
                 .font_family(crate::fonts::mono())
-                .text_color(rgb(0xe6e9ed))
+                .text_color(rgb(theme.text))
                 .child(prompt)
         } else {
             div()
@@ -1991,7 +2016,11 @@ impl RusidianApp {
                 .text_ellipsis()
                 .when_some(self.notice.as_ref(), |element, notice| {
                     element
-                        .text_color(rgb(if notice.error { 0xffa7b2 } else { 0xa4e4c7 }))
+                        .text_color(rgb(if notice.error {
+                            theme.error_text
+                        } else {
+                            theme.success_text
+                        }))
                         .child(notice.text.clone())
                 })
         };
@@ -2003,24 +2032,24 @@ impl RusidianApp {
             .items_center()
             .gap_3()
             .border_t_1()
-            .border_color(rgb(0x2a3038))
-            .bg(rgb(0x0c0f12))
+            .border_color(rgb(theme.border))
+            .bg(rgb(theme.surface))
             .text_xs()
-            .text_color(rgb(0x98a2ad))
+            .text_color(rgb(theme.muted))
             .child(
                 div()
                     .flex_none()
                     .px_2()
                     .rounded_md()
                     .bg(rgb(if self.view == View::Source {
-                        0x2b3a4a
+                        theme.source_chip_bg
                     } else {
-                        0x3a2a20
+                        theme.accent_soft_bg
                     }))
                     .text_color(rgb(if self.view == View::Source {
-                        0x9ecbff
+                        theme.source_chip_text
                     } else {
-                        0xffb07a
+                        theme.accent_soft_text
                     }))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(mode),
@@ -2030,7 +2059,7 @@ impl RusidianApp {
                     div()
                         .flex_none()
                         .font_family(crate::fonts::mono())
-                        .text_color(rgb(0xe6e9ed))
+                        .text_color(rgb(theme.text))
                         .child(pending),
                 )
             })
@@ -2040,6 +2069,7 @@ impl RusidianApp {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
         let busy = matches!(
             self.update_status,
             UpdateStatus::Checking | UpdateStatus::Installing(_)
@@ -2055,7 +2085,11 @@ impl RusidianApp {
         };
         let packaged = update::is_packaged_app();
         let failed = matches!(self.update_status, UpdateStatus::Failed(_));
-        let status_color = if failed { 0xffa7a7 } else { 0xc7cbd1 };
+        let status_color = if failed {
+            theme.error_text
+        } else {
+            theme.muted
+        };
         let check_label = if busy {
             "处理中…"
         } else if failed {
@@ -2075,13 +2109,21 @@ impl RusidianApp {
                 .px_4()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(if busy { 0x34383e } else { 0xf06a24 }))
-                .text_color(rgb(if busy { 0x8b929a } else { 0x1a0d07 }))
+                .bg(rgb(if busy {
+                    theme.disabled_bg
+                } else {
+                    theme.button
+                }))
+                .text_color(rgb(if busy {
+                    theme.disabled_text
+                } else {
+                    theme.button_text
+                }))
                 .font_weight(FontWeight::SEMIBOLD)
                 .when(!busy, |element| {
                     element
                         .cursor_pointer()
-                        .hover(|element| element.bg(rgb(0xff7a32)))
+                        .hover(|element| element.bg(rgb(theme.button_hover)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.check_for_updates(false, cx);
                         }))
@@ -2099,13 +2141,21 @@ impl RusidianApp {
                 .px_4()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(if packaged { 0xf06a24 } else { 0x34383e }))
-                .text_color(rgb(if packaged { 0x1a0d07 } else { 0x8b929a }))
+                .bg(rgb(if packaged {
+                    theme.button
+                } else {
+                    theme.disabled_bg
+                }))
+                .text_color(rgb(if packaged {
+                    theme.button_text
+                } else {
+                    theme.disabled_text
+                }))
                 .font_weight(FontWeight::SEMIBOLD)
                 .when(packaged, |element| {
                     element
                         .cursor_pointer()
-                        .hover(|element| element.bg(rgb(0xff7a32)))
+                        .hover(|element| element.bg(rgb(theme.button_hover)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.install_available_update(cx);
                         }))
@@ -2120,15 +2170,55 @@ impl RusidianApp {
                 .py_2()
                 .rounded_md()
                 .cursor_pointer()
-                .bg(rgb(0xf06a24))
-                .text_color(rgb(0x1a0d07))
+                .bg(rgb(theme.button))
+                .text_color(rgb(theme.button_text))
                 .font_weight(FontWeight::SEMIBOLD)
-                .hover(|element| element.bg(rgb(0xff7a32)))
+                .hover(|element| element.bg(rgb(theme.button_hover)))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.request_close(PendingClose::Restart, cx);
                 }))
                 .child("重启应用")
         });
+        let appearance_picker = div()
+            .flex()
+            .p_1()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme.card_border))
+            .bg(rgb(theme.card))
+            .children(
+                [
+                    (Appearance::System, "跟随系统"),
+                    (Appearance::Light, "亮色"),
+                    (Appearance::Dark, "暗色"),
+                ]
+                .into_iter()
+                .map(|(appearance, label)| {
+                    let selected = self.appearance == appearance;
+                    div()
+                        .id(label)
+                        .flex_1()
+                        .py_2()
+                        .rounded_md()
+                        .text_center()
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(selected, |element| {
+                            element
+                                .bg(rgb(theme.button))
+                                .text_color(rgb(theme.button_text))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(!selected, |element| {
+                            element.hover(|element| element.bg(rgb(theme.hover)))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_appearance(appearance, cx);
+                        }))
+                        .child(label)
+                }),
+            );
         let auto_toggle = div()
             .w(px(44.0))
             .h(px(24.0))
@@ -2137,13 +2227,17 @@ impl RusidianApp {
             .flex()
             .items_center()
             .when(self.auto_update, |element| element.justify_end())
-            .bg(rgb(if self.auto_update { 0xf06a24 } else { 0x3a4047 }))
+            .bg(rgb(if self.auto_update {
+                theme.button
+            } else {
+                theme.toggle_off
+            }))
             .child(
                 div()
                     .w(px(16.0))
                     .h(px(16.0))
                     .rounded_full()
-                    .bg(rgb(0xf4f1e8)),
+                    .bg(rgb(theme.knob)),
             );
 
         div()
@@ -2152,14 +2246,14 @@ impl RusidianApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(0x080a0c).opacity(0.94))
+            .bg(rgb(theme.overlay).opacity(theme.overlay_opacity))
             .child(
                 div()
                     .w(px(620.0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x343a41))
-                    .bg(rgb(0x15191e))
+                    .border_color(rgb(theme.card_border))
+                    .bg(rgb(theme.panel))
                     .flex()
                     .flex_col()
                     .child(
@@ -2179,7 +2273,7 @@ impl RusidianApp {
                                             .w(px(10.0))
                                             .h(px(32.0))
                                             .rounded_md()
-                                            .bg(rgb(0xf06a24)),
+                                            .bg(rgb(theme.button)),
                                     )
                                     .child(
                                         div()
@@ -2192,7 +2286,7 @@ impl RusidianApp {
                                                     .child("设置"),
                                             )
                                             .child(
-                                                div().text_sm().text_color(rgb(0x8f969f)).child(
+                                                div().text_sm().text_color(rgb(theme.muted)).child(
                                                     format!(
                                                         "Rusidian {}",
                                                         env!("CARGO_PKG_VERSION")
@@ -2208,8 +2302,8 @@ impl RusidianApp {
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .text_color(rgb(0x98a2ad))
-                                    .hover(|element| element.bg(rgb(0x252a30)))
+                                    .text_color(rgb(theme.muted))
+                                    .hover(|element| element.bg(rgb(theme.hover)))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.settings_open = false;
                                         cx.notify();
@@ -2220,7 +2314,7 @@ impl RusidianApp {
                     .child(
                         div()
                             .border_t_1()
-                            .border_color(rgb(0x30363d))
+                            .border_color(rgb(theme.border))
                             .p_6()
                             .flex()
                             .flex_col()
@@ -2229,15 +2323,23 @@ impl RusidianApp {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xf28c45))
+                                    .text_color(rgb(theme.accent))
+                                    .child("外观"),
+                            )
+                            .child(appearance_picker)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.accent))
                                     .child("软件更新"),
                             )
                             .child(
                                 div()
                                     .rounded_md()
                                     .border_1()
-                                    .border_color(rgb(0x343a41))
-                                    .bg(rgb(0x1b2026))
+                                    .border_color(rgb(theme.card_border))
+                                    .bg(rgb(theme.card))
                                     .child(
                                         div()
                                             .p_4()
@@ -2270,7 +2372,7 @@ impl RusidianApp {
                                                     .children(restart_button),
                                             ),
                                     )
-                                    .child(div().h(px(1.0)).bg(rgb(0x30363d)))
+                                    .child(div().h(px(1.0)).bg(rgb(theme.border)))
                                     .child(
                                         div()
                                             .id("toggle-auto-update")
@@ -2279,7 +2381,7 @@ impl RusidianApp {
                                             .items_center()
                                             .justify_between()
                                             .cursor_pointer()
-                                            .hover(|element| element.bg(rgb(0x20262d)))
+                                            .hover(|element| element.bg(rgb(theme.hover)))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_auto_update(cx)
                                             }))
@@ -2296,7 +2398,7 @@ impl RusidianApp {
                                                     .child(
                                                         div()
                                                             .text_sm()
-                                                            .text_color(rgb(0x8f969f))
+                                                            .text_color(rgb(theme.muted))
                                                             .child(
                                                                 "启动时检查，验证签名后自动安装",
                                                             ),
@@ -2308,7 +2410,7 @@ impl RusidianApp {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(0x717983))
+                                    .text_color(rgb(theme.faint))
                                     .child("更新仅访问 GitHub Release；笔记内容不会离开本机。"),
                             ),
                     ),
@@ -2446,6 +2548,8 @@ impl EntityInputHandler for RusidianApp {
 
 impl Render for RusidianApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.theme = Theme::resolve(self.appearance, window.appearance());
+        let theme = self.theme;
         let title = self
             .document
             .as_ref()
@@ -2519,6 +2623,7 @@ impl Render for RusidianApp {
                                 .max_w(px(820.0))
                                 .when(table_end, |element| element.mb_4())
                                 .child(render_block(
+                                    &theme,
                                     block,
                                     self.tikz.get(&block.text),
                                     &self.math,
@@ -2543,7 +2648,7 @@ impl Render for RusidianApp {
                 .gap_3()
                 .child(div().text_2xl().child("本地 Markdown，真实 Neovim"))
                 .child(
-                    div().text_sm().text_color(rgb(0x98a2ad)).child(
+                    div().text_sm().text_color(rgb(theme.muted)).child(
                         self.error
                             .clone()
                             .unwrap_or_else(|| "运行 rusidian path/to/note.md".into()),
@@ -2589,8 +2694,8 @@ impl Render for RusidianApp {
                         .flex()
                         .flex_col()
                         .border_r_1()
-                        .border_color(rgb(0x2a3038))
-                        .bg(rgb(0x0c0f12))
+                        .border_color(rgb(theme.border))
+                        .bg(rgb(theme.surface))
                         .child(
                             div()
                                 .h(px(40.0))
@@ -2622,7 +2727,9 @@ impl Render for RusidianApp {
                                         .text_sm()
                                         .cursor_pointer()
                                         .when(selected, |element| {
-                                            element.bg(rgb(0x452519)).text_color(rgb(0xffb07a))
+                                            element
+                                                .bg(rgb(theme.accent_soft_bg))
+                                                .text_color(rgb(theme.accent_soft_text))
                                         })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.request_close(
@@ -2662,8 +2769,8 @@ impl Render for RusidianApp {
             .relative()
             .size_full()
             .font_family(crate::fonts::ui())
-            .bg(rgb(0x111418))
-            .text_color(rgb(0xe6e9ed))
+            .bg(rgb(theme.background))
+            .text_color(rgb(theme.text))
             .child(
                 div()
                     .flex()
@@ -2672,14 +2779,14 @@ impl Render for RusidianApp {
                     .h(px(52.0))
                     .px_5()
                     .border_b_1()
-                    .border_color(rgb(0x2a3038))
+                    .border_color(rgb(theme.border))
                     .child(div().text_lg().child(title))
                     .child(
                         div()
                             .max_w(px(620.0))
                             .text_ellipsis()
                             .text_sm()
-                            .text_color(rgb(0x98a2ad))
+                            .text_color(rgb(theme.muted))
                             .child(
                                 self.document
                                     .as_ref()
@@ -2840,6 +2947,7 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
 }
 
 fn render_block(
+    theme: &Theme,
     block: &Block,
     tikz: Option<&TikzState>,
     math: &HashMap<(String, bool), MathState>,
@@ -2849,7 +2957,7 @@ fn render_block(
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
     let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
-    let text = styled_fragment(block, 0..block.text.len(), cursor, selection);
+    let text = styled_fragment(theme, block, 0..block.text.len(), cursor, selection);
 
     let content = match &block.kind {
         BlockKind::Heading(level) => div()
@@ -2864,10 +2972,10 @@ fn render_block(
             .child(text)
             .into_any_element(),
         BlockKind::Paragraph if !block.images.is_empty() => {
-            render_inline_paragraph(block, math, text_baseline, links, cursor, selection)
+            render_inline_paragraph(theme, block, math, text_baseline, links, cursor, selection)
         }
         BlockKind::Paragraph if !block.maths.is_empty() => {
-            render_inline_paragraph(block, math, text_baseline, links, cursor, selection)
+            render_inline_paragraph(theme, block, math, text_baseline, links, cursor, selection)
         }
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
         BlockKind::Image(source) => {
@@ -2875,15 +2983,16 @@ fn render_block(
             let alt = block.text.clone();
             let Some(path) = links.image(source) else {
                 return decorate_block(
+                    theme,
                     block,
                     div()
                         .mb_4()
                         .p_4()
                         .rounded_md()
                         .when(object_cursor, |element| {
-                            element.border_2().border_color(rgb(0xf28c45))
+                            element.border_2().border_color(rgb(theme.accent))
                         })
-                        .bg(rgb(0x1c2229))
+                        .bg(rgb(theme.block))
                         .child(format!("![{alt}]({source_label})"))
                         .into_any_element(),
                 );
@@ -2891,16 +3000,19 @@ fn render_block(
             div()
                 .mb_4()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0xf28c45))
+                    element.border_2().border_color(rgb(theme.accent))
                 })
-                .child(img(path).max_w_full().with_fallback(move || {
-                    div()
-                        .p_4()
-                        .rounded_md()
-                        .bg(rgb(0x3a1f24))
-                        .text_color(rgb(0xffa7b2))
-                        .child(format!("无法加载图片：{source_label}"))
-                        .into_any_element()
+                .child(img(path).max_w_full().with_fallback({
+                    let theme = *theme;
+                    move || {
+                        div()
+                            .p_4()
+                            .rounded_md()
+                            .bg(rgb(theme.error_bg))
+                            .text_color(rgb(theme.error_text))
+                            .child(format!("无法加载图片：{source_label}"))
+                            .into_any_element()
+                    }
                 }))
                 .into_any_element()
         }
@@ -2913,9 +3025,9 @@ fn render_block(
                     .p_4()
                     .rounded_md()
                     .when(object_cursor, |element| {
-                        element.border_2().border_color(rgb(0xf28c45))
+                        element.border_2().border_color(rgb(theme.accent))
                     })
-                    .bg(rgb(0xffffff))
+                    .bg(rgb(WHITE))
                     .child(
                         img(image.clone())
                             .max_w_full()
@@ -2928,10 +3040,10 @@ fn render_block(
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0xf28c45))
+                    element.border_2().border_color(rgb(theme.accent))
                 })
-                .bg(rgb(0x3a1f24))
-                .text_color(rgb(0xffa7b2))
+                .bg(rgb(theme.error_bg))
+                .text_color(rgb(theme.error_text))
                 .child(error.clone())
                 .into_any_element(),
             _ => div()
@@ -2939,10 +3051,10 @@ fn render_block(
                 .p_4()
                 .rounded_md()
                 .when(object_cursor, |element| {
-                    element.border_2().border_color(rgb(0xf28c45))
+                    element.border_2().border_color(rgb(theme.accent))
                 })
-                .bg(rgb(0x1c2229))
-                .text_color(rgb(0x98a2ad))
+                .bg(rgb(theme.block))
+                .text_color(rgb(theme.muted))
                 .child("正在编译 TikZ…")
                 .into_any_element(),
         },
@@ -2950,14 +3062,14 @@ fn render_block(
             .mb_4()
             .p_4()
             .rounded_md()
-            .bg(rgb(0x1c2229))
+            .bg(rgb(theme.block))
             .font_family(crate::fonts::mono())
             .when_some(language.as_ref(), |element, language| {
                 element.child(
                     div()
                         .mb_2()
                         .text_sm()
-                        .text_color(rgb(0x98a2ad))
+                        .text_color(rgb(theme.muted))
                         .child(language.clone()),
                 )
             })
@@ -2967,7 +3079,7 @@ fn render_block(
             .mb_4()
             .p_4()
             .rounded_md()
-            .bg(rgb(0x1c2229))
+            .bg(rgb(theme.block))
             .font_family(crate::fonts::mono())
             .child(text)
             .into_any_element(),
@@ -2975,19 +3087,19 @@ fn render_block(
             .my_4()
             .h(px(1.0))
             .w_full()
-            .bg(rgb(0x3a424d))
+            .bg(rgb(theme.border_strong))
             .into_any_element(),
         BlockKind::Table { header } => div()
             .flex()
             .w_full()
-            .when(*header, |element| element.bg(rgb(0x1a1f25)))
+            .when(*header, |element| element.bg(rgb(theme.table_header)))
             .children(block.cells.iter().enumerate().map(|(index, range)| {
                 div()
                     .flex_1()
                     .min_w_0()
                     .p_2()
                     .border_1()
-                    .border_color(rgb(0x3a424d))
+                    .border_color(rgb(theme.border_strong))
                     .when(*header, |element| element.font_weight(FontWeight::BOLD))
                     .when(
                         block.table_alignments.get(index)
@@ -2999,7 +3111,13 @@ fn render_block(
                             == Some(&pulldown_cmark::Alignment::Right),
                         |element| element.text_right(),
                     )
-                    .child(styled_fragment(block, range.clone(), cursor, selection))
+                    .child(styled_fragment(
+                        theme,
+                        block,
+                        range.clone(),
+                        cursor,
+                        selection,
+                    ))
             }))
             .into_any_element(),
         BlockKind::Math => match math.get(&(block.text.clone(), true)) {
@@ -3007,7 +3125,7 @@ fn render_block(
                 .mb_4()
                 .p_4()
                 .rounded_md()
-                .bg(rgb(0x1c2229))
+                .bg(rgb(theme.block))
                 .id("display-math")
                 .overflow_x_scroll()
                 .child(formula.element(FONT_SIZE))
@@ -3016,16 +3134,16 @@ fn render_block(
                 .mb_4()
                 .p_4()
                 .rounded_md()
-                .bg(rgb(0x3a1f24))
-                .text_color(rgb(0xffa7b2))
+                .bg(rgb(theme.error_bg))
+                .text_color(rgb(theme.error_text))
                 .child(format!("$${}$$：{}", block.text, error))
                 .into_any_element(),
             _ => div()
                 .mb_4()
                 .p_4()
                 .rounded_md()
-                .bg(rgb(0x1c2229))
-                .text_color(rgb(0x98a2ad))
+                .bg(rgb(theme.block))
+                .text_color(rgb(theme.muted))
                 .child("正在排版公式…")
                 .into_any_element(),
         },
@@ -3036,7 +3154,7 @@ fn render_block(
             .child(
                 div()
                     .mr_2()
-                    .text_color(rgb(0xf28c45))
+                    .text_color(rgb(theme.accent))
                     .child(format!("[^{label}]")),
             )
             .child(text)
@@ -3048,10 +3166,10 @@ fn render_block(
             .into_any_element(),
         BlockKind::Definition => div().mb_3().ml_6().child(text).into_any_element(),
     };
-    decorate_block(block, content)
+    decorate_block(theme, block, content)
 }
 
-fn decorate_block(block: &Block, content: AnyElement) -> AnyElement {
+fn decorate_block(theme: &Theme, block: &Block, content: AnyElement) -> AnyElement {
     let marker: Option<SharedString> = if let Some(checked) = block.task {
         Some(if checked { "☑" } else { "☐" }.into())
     } else {
@@ -3071,8 +3189,8 @@ fn decorate_block(block: &Block, content: AnyElement) -> AnyElement {
         div()
             .pl(px(12.0 * block.quote_depth as f32))
             .border_l_2()
-            .border_color(rgb(0x56606d))
-            .text_color(rgb(0xb8c0cc))
+            .border_color(rgb(theme.quote_border))
+            .text_color(rgb(theme.quote_text))
             .child(content)
             .into_any_element()
     } else {
@@ -3081,16 +3199,18 @@ fn decorate_block(block: &Block, content: AnyElement) -> AnyElement {
 }
 
 fn styled_fragment(
+    theme: &Theme,
     block: &Block,
     range: std::ops::Range<usize>,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> StyledText {
-    let highlights = fragment_highlights(block, &range, cursor, selection);
+    let highlights = fragment_highlights(theme, block, &range, cursor, selection);
     StyledText::new(block.text[range].to_owned()).with_highlights(highlights)
 }
 
 fn fragment_highlights(
+    theme: &Theme,
     block: &Block,
     range: &std::ops::Range<usize>,
     cursor: Option<usize>,
@@ -3106,7 +3226,7 @@ fn fragment_highlights(
                     HighlightStyle {
                         font_weight: span.bold.then_some(FontWeight::BOLD),
                         font_style: span.italic.then_some(FontStyle::Italic),
-                        background_color: span.code.then_some(rgb(0x242a32).into()),
+                        background_color: span.code.then_some(rgb(theme.inline_code).into()),
                         strikethrough: span.strike.then_some(StrikethroughStyle {
                             thickness: px(1.0),
                             color: None,
@@ -3122,7 +3242,7 @@ fn fragment_highlights(
             (
                 range,
                 HighlightStyle {
-                    color: Some(rgb(0xf28c45).into()),
+                    color: Some(rgb(theme.accent).into()),
                     underline: Some(UnderlineStyle {
                         thickness: px(1.0),
                         color: None,
@@ -3141,7 +3261,7 @@ fn fragment_highlights(
         highlights.push((
             selection_range,
             HighlightStyle {
-                background_color: Some(rgb(0x8a3b1c).into()),
+                background_color: Some(rgb(theme.selection).into()),
                 ..Default::default()
             },
         ));
@@ -3153,8 +3273,8 @@ fn fragment_highlights(
         highlights.push((
             cursor_range,
             HighlightStyle {
-                color: Some(rgb(0x111418).into()),
-                background_color: Some(rgb(0xe6e9ed).into()),
+                color: Some(rgb(theme.cursor_fg).into()),
+                background_color: Some(rgb(theme.cursor_bg).into()),
                 ..Default::default()
             },
         ));
@@ -3230,6 +3350,7 @@ fn inline_extents(
 }
 
 fn push_inline_text(
+    theme: &Theme,
     children: &mut Vec<AnyElement>,
     block: &Block,
     range: std::ops::Range<usize>,
@@ -3254,6 +3375,7 @@ fn push_inline_text(
                     .pt(px(top))
                     .h(px(height))
                     .child(styled_fragment(
+                        theme,
                         block,
                         range.start + start..range.start + content_end,
                         cursor,
@@ -3270,6 +3392,7 @@ fn push_inline_text(
 }
 
 fn render_inline_paragraph(
+    theme: &Theme,
     block: &Block,
     math: &HashMap<(String, bool), MathState>,
     text_baseline: f32,
@@ -3297,6 +3420,7 @@ fn render_inline_paragraph(
     for (range, atom) in atoms {
         if start < range.start {
             push_inline_text(
+                theme,
                 &mut children,
                 block,
                 start..range.start,
@@ -3329,7 +3453,7 @@ fn render_inline_paragraph(
                 } else {
                     div()
                         .px_1()
-                        .bg(rgb(0x242a32))
+                        .bg(rgb(theme.inline_code))
                         .child(format!("![{alt}]({source})"))
                         .into_any_element()
                 }
@@ -3341,13 +3465,13 @@ fn render_inline_paragraph(
                     .into_any_element(),
                 Some(MathState::Failed(error)) => div()
                     .px_1()
-                    .bg(rgb(0x3a1f24))
-                    .text_color(rgb(0xffa7b2))
+                    .bg(rgb(theme.error_bg))
+                    .text_color(rgb(theme.error_text))
                     .child(format!("${}$：{}", formula.source, error))
                     .into_any_element(),
                 _ => div()
                     .px_1()
-                    .bg(rgb(0x242a32))
+                    .bg(rgb(theme.inline_code))
                     .child(format!("${}$", formula.source))
                     .into_any_element(),
             },
@@ -3356,7 +3480,7 @@ fn render_inline_paragraph(
             div()
                 .flex_none()
                 .h(px(row_height))
-                .when(active, |element| element.bg(rgb(0x3c2a22)))
+                .when(active, |element| element.bg(rgb(theme.atom_active)))
                 .child(child)
                 .into_any_element(),
         );
@@ -3364,6 +3488,7 @@ fn render_inline_paragraph(
     }
     if start < block.text.len() {
         push_inline_text(
+            theme,
             &mut children,
             block,
             start..block.text.len(),
@@ -4511,13 +4636,19 @@ mod tests {
         let document = crate::markdown::parse("a **[bold](x.md)** c");
         let block = &document.blocks[0];
         assert_eq!(block.text, "a bold c");
-        let highlights = fragment_highlights(block, &(0..block.text.len()), Some(3), Some((2, 4)));
+        let highlights = fragment_highlights(
+            &Theme::DARK,
+            block,
+            &(0..block.text.len()),
+            Some(3),
+            Some((2, 4)),
+        );
         for pair in highlights.windows(2) {
             assert!(pair[0].0.end <= pair[1].0.start, "{highlights:?}");
         }
         let cursor = highlights
             .iter()
-            .find(|(_, style)| style.color == Some(rgb(0x111418).into()))
+            .find(|(_, style)| style.color == Some(rgb(Theme::DARK.cursor_fg).into()))
             .unwrap();
         assert_eq!(cursor.0, 3..4);
         assert_eq!(cursor.1.font_weight, Some(FontWeight::BOLD));
@@ -4545,9 +4676,13 @@ mod tests {
                 let range = pair[0]..pair[1];
                 let fragment = &block.text[range.clone()];
                 for cursor in 0..block_len(block) {
-                    for (highlight, _) in
-                        fragment_highlights(block, &range, Some(cursor), Some((0, cursor)))
-                    {
+                    for (highlight, _) in fragment_highlights(
+                        &Theme::DARK,
+                        block,
+                        &range,
+                        Some(cursor),
+                        Some((0, cursor)),
+                    ) {
                         assert!(fragment.is_char_boundary(highlight.start));
                         assert!(fragment.is_char_boundary(highlight.end));
                     }
