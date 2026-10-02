@@ -5555,6 +5555,16 @@ impl Render for RusidianApp {
                         .absolute()
                         .size_0()
                 })
+                .when(blocks.is_empty(), |element| {
+                    element.child(
+                        div()
+                            .mx_auto()
+                            .w_full()
+                            .max_w(px(820.0))
+                            .text_color(rgb(theme.muted))
+                            .child("空笔记：按 Enter 在 Neovim 中开始写作。"),
+                    )
+                })
                 .children(self.render_backlinks(cx))
                 .into_any_element()
         } else {
