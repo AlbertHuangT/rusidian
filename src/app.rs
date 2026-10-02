@@ -4529,11 +4529,15 @@ fn render_block(
             .w_full()
             .when(*header, |element| element.bg(rgb(theme.table_header)))
             .children(block.cells.iter().enumerate().map(|(index, range)| {
+                // Rows are separate blocks; share edges so inner lines are not doubled.
                 div()
                     .flex_1()
                     .min_w_0()
                     .p_2()
-                    .border_1()
+                    .border_r_1()
+                    .border_b_1()
+                    .when(index == 0, |element| element.border_l_1())
+                    .when(*header, |element| element.border_t_1())
                     .border_color(rgb(theme.border_strong))
                     .when(*header, |element| element.font_weight(FontWeight::BOLD))
                     .when(
