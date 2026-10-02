@@ -824,7 +824,13 @@ impl RusidianApp {
         if path.is_dir() {
             match Vault::open(path) {
                 Ok(vault) => {
-                    let first = vault.files.first().cloned();
+                    // Continue with the vault's most recently opened note, like Obsidian.
+                    let first = app
+                        .recent
+                        .iter()
+                        .find(|recent| vault.files.contains(recent))
+                        .or_else(|| vault.files.first())
+                        .cloned();
                     app = Self::open(first.as_deref());
                     app.attach_vault(vault);
                 }
