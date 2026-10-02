@@ -17,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 const WINDOW_WIDTH: f32 = 960.0;
@@ -25,26 +25,6 @@ const WINDOW_HEIGHT: f32 = 640.0;
 const SOURCE_FONT_SIZE: f32 = 14.0;
 const SOURCE_LINE_HEIGHT: f32 = 20.0;
 const GRID_PADDING: f32 = 12.0;
-/// Monospace families in preference order; the Neovim grid needs a real fixed-width font.
-const MONO_FAMILIES: &[&str] = if cfg!(target_os = "macos") {
-    &["Menlo", "SF Mono", "Monaco", "Courier New"]
-} else {
-    &[
-        "DejaVu Sans Mono",
-        "Noto Sans Mono",
-        "Liberation Mono",
-        "Ubuntu Mono",
-        "FreeMono",
-    ]
-};
-static MONO_FAMILY: OnceLock<SharedString> = OnceLock::new();
-
-fn mono_family() -> SharedString {
-    MONO_FAMILY
-        .get()
-        .cloned()
-        .unwrap_or_else(|| MONO_FAMILIES[0].into())
-}
 
 actions!(
     rusidian,
@@ -53,12 +33,7 @@ actions!(
 
 pub fn run(initial_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
-        let installed = cx.text_system().all_font_names();
-        let family = MONO_FAMILIES
-            .iter()
-            .find(|family| installed.iter().any(|name| name == *family))
-            .unwrap_or(&MONO_FAMILIES[0]);
-        MONO_FAMILY.get_or_init(|| (*family).into());
+        crate::fonts::init(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-shift-o", OpenFolder, None),
@@ -1382,7 +1357,7 @@ impl RusidianApp {
                 .into_any_element();
         }
 
-        let family = mono_family();
+        let family = crate::fonts::mono();
         let font_size = px(SOURCE_FONT_SIZE);
         let line_height = px(SOURCE_LINE_HEIGHT);
         let font_id = window
@@ -1997,11 +1972,14 @@ impl Render for RusidianApp {
         });
         let settings = self.settings_open.then(|| self.render_settings(cx));
 
-        let text_baseline = f32::from(cx.text_system().baseline_offset(
-            cx.text_system().resolve_font(&gpui::font(".SystemUIFont")),
-            px(FONT_SIZE),
-            px(24.0),
-        ));
+        let text_baseline = f32::from(
+            cx.text_system().baseline_offset(
+                cx.text_system()
+                    .resolve_font(&gpui::font(crate::fonts::ui())),
+                px(FONT_SIZE),
+                px(24.0),
+            ),
+        );
         let reading = if let Some(document) = &self.document {
             let selection = self.reading_selection.and_then(|selection| {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
@@ -2170,6 +2148,7 @@ impl Render for RusidianApp {
             .flex_col()
             .relative()
             .size_full()
+            .font_family(crate::fonts::ui())
             .bg(rgb(0x111418))
             .text_color(rgb(0xe6e9ed))
             .child(
@@ -2205,7 +2184,7 @@ impl Render for RusidianApp {
                         .flex()
                         .items_center()
                         .bg(rgb(0x1c2229))
-                        .font_family(mono_family())
+                        .font_family(crate::fonts::mono())
                         .child(prompt),
                 )
             })
@@ -2449,7 +2428,7 @@ fn render_block(
             .p_4()
             .rounded_md()
             .bg(rgb(0x1c2229))
-            .font_family(mono_family())
+            .font_family(crate::fonts::mono())
             .when_some(language.as_ref(), |element, language| {
                 element.child(
                     div()
@@ -2466,7 +2445,7 @@ fn render_block(
             .p_4()
             .rounded_md()
             .bg(rgb(0x1c2229))
-            .font_family(mono_family())
+            .font_family(crate::fonts::mono())
             .child(text)
             .into_any_element(),
         BlockKind::Rule => div()

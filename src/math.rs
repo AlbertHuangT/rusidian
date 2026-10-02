@@ -337,7 +337,7 @@ fn paint_item(
                 font_size,
                 &[TextRun {
                     len: text.len(),
-                    font: font(".SystemUIFont"),
+                    font: font(crate::fonts::ui()),
                     color: color(c),
                     ..Default::default()
                 }],

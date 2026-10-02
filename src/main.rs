@@ -1,4 +1,5 @@
 mod app;
+mod fonts;
 mod markdown;
 mod math;
 mod nvim;
