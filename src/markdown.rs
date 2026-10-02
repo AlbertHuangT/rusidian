@@ -502,6 +502,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     apply_callouts(&mut blocks, &alerts);
     number_footnotes(&mut blocks, &mut footnotes);
     attach_standalone_block_ids(&mut blocks);
+    custom_tasks(&mut blocks);
     MarkdownDocument { blocks }
 }
 
@@ -564,6 +565,25 @@ fn uncommented(comments: &[Range<usize>], range: Range<usize>) -> Vec<Range<usiz
         parts.push(start..range.end);
     }
     parts
+}
+
+/// Obsidian's custom task statuses (`- [/] doing`, `- [-] dropped`) show as done, as in its
+/// default theme; only `[ ]` and `[x]` are tasks to Markdown itself.
+fn custom_tasks(blocks: &mut [Block]) {
+    for block in blocks
+        .iter_mut()
+        .filter(|block| block.list_marker.is_some() && block.task.is_none())
+    {
+        let mut characters = block.text.chars();
+        if characters.next() == Some('[')
+            && let Some(mark) = characters.next().filter(|mark| !mark.is_whitespace())
+            && characters.next() == Some(']')
+            && characters.next() == Some(' ')
+        {
+            block.task = Some(true);
+            block.remove_prefix(mark.len_utf8() + 3);
+        }
+    }
 }
 
 /// A paragraph holding only `^id` names the block before it (how Obsidian marks lists, quotes
@@ -1531,5 +1551,24 @@ mod tests {
         assert_eq!(uncommented(&[2..4, 6..8], 0..10), [0..2, 4..6, 8..10]);
         let comments = [2..8, 10..12];
         assert!(inside(&comments, &(3..5)) && !inside(&comments, &(1..5)));
+    }
+
+    #[test]
+    fn shows_custom_task_statuses_as_done() {
+        let blocks = parse("- [/] doing\n- [-] dropped\n- [ ] open\n- [link] text\n").blocks;
+        let tasks: Vec<_> = blocks
+            .iter()
+            .map(|block| (block.task, block.text.as_str()))
+            .collect();
+        assert_eq!(
+            tasks,
+            [
+                (Some(true), "doing"),
+                (Some(true), "dropped"),
+                (Some(false), "open"),
+                (None, "[link] text"),
+            ]
+        );
+        assert_eq!(blocks[0].source_offset(0), Some(6));
     }
 }
