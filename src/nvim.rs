@@ -91,7 +91,14 @@ impl Handler for EventHandler {
 }
 
 impl Client {
-    pub fn start(path: PathBuf, clean: bool, (width, height): (i64, i64)) -> Self {
+    /// Start `nvim --embed` on `path`, in `directory` so relative `:edit` paths resolve there.
+    pub fn start(
+        path: PathBuf,
+        directory: Option<PathBuf>,
+        clean: bool,
+        (width, height): (i64, i64),
+    ) -> Self {
+        let path = path.canonicalize().unwrap_or(path);
         let (event_sender, events) = async_channel::unbounded();
         let (commands, mut command_receiver) = mpsc::unbounded_channel();
 
@@ -111,6 +118,9 @@ impl Client {
                 let handler = EventHandler(event_sender.clone());
                 let mut command = tokio::process::Command::new("nvim");
                 command.kill_on_drop(true);
+                if let Some(directory) = directory.filter(|directory| directory.is_dir()) {
+                    command.current_dir(directory);
+                }
                 command.arg("--embed");
                 if clean {
                     command.arg("--clean");
@@ -1058,7 +1068,7 @@ mod tests {
     #[test]
     #[ignore = "requires the external Neovim installation"]
     fn starts_neovim_and_receives_redraw() {
-        let client = Client::start(PathBuf::from("examples/tikz.md"), true, (120, 40));
+        let client = Client::start(PathBuf::from("examples/tikz.md"), None, true, (120, 40));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1239,7 +1249,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::write(&path, "original\n").unwrap();
-        let owner = Client::start(path.clone(), true, (120, 40));
+        let owner = Client::start(path.clone(), None, true, (120, 40));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1284,7 +1294,7 @@ mod tests {
         owner.input(":preserve<CR>");
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(100)).await });
 
-        let contender = Client::start(path.clone(), true, (120, 40));
+        let contender = Client::start(path.clone(), None, true, (120, 40));
         let error = runtime
             .block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {

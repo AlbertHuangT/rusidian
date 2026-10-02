@@ -623,7 +623,13 @@ impl RusidianApp {
         let Some(path) = self.document.as_ref().map(|document| document.file.clone()) else {
             return;
         };
-        let client = NvimClient::start(path, false, self.nvim_size.get());
+        // Relative :edit paths resolve from the vault root, or the note's folder without one.
+        let directory = self
+            .vault
+            .as_ref()
+            .map(|vault| vault.root.clone())
+            .or_else(|| path.canonicalize().ok()?.parent().map(Path::to_path_buf));
+        let client = NvimClient::start(path, directory, false, self.nvim_size.get());
         let events = client.events.clone();
         self.nvim = Some(client);
 
