@@ -36,6 +36,9 @@ pub struct Block {
     pub callout_title: Option<String>,
     /// The blockquote id of the callout this block is in, nested quotes included.
     pub callout_quote: Option<usize>,
+    /// For each blockquote around this block, outermost first: the callout kind when that
+    /// quote is a callout. Shorter than `quote_depth` when the deeper quotes are plain.
+    pub quote_callouts: Vec<Option<String>>,
     /// On a callout's first block: whether it can fold (`[!tip]-` or `[!tip]+`), and whether it
     /// starts folded (`-`).
     pub callout_fold: Option<bool>,
@@ -653,6 +656,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         callout: None,
         callout_title: None,
         callout_quote: None,
+        quote_callouts: Vec::new(),
         callout_fold: None,
         fence_closed: false,
         block_id: None,
@@ -1048,6 +1052,10 @@ fn apply_callouts(blocks: &mut [Block], alerts: &[Option<BlockQuoteKind>]) {
                 block.callout = Some(kind.clone());
             }
             block.callout_quote = Some(id);
+            if block.quote_callouts.len() < depth {
+                block.quote_callouts.resize(depth, None);
+            }
+            block.quote_callouts[depth - 1] = Some(kind.clone());
         }
     }
 }

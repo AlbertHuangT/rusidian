@@ -7240,84 +7240,89 @@ fn decorate_block(
     } else {
         content
     };
-    if let Some(kind) = &block.callout {
-        let color = crate::theme::callout_color(kind);
-        // The callout continues, or only a quote around it does: then its box ends here.
-        let continues = continued >= block.quote_depth;
-        let callout = div()
-            .flex()
-            .flex_col()
-            .ml(px(12.0 * block.quote_depth.saturating_sub(1) as f32))
-            .pl_3()
-            .pr_3()
-            // The callout's own bottom padding where it ends.
-            .pb(if continues { inner_gap } else { px(0.0) }.max(px(10.0)))
-            .border_l_2()
-            .border_color(rgb(color))
-            .bg(rgba((color << 8) | 0x14))
-            .when_some(block.callout_title.clone(), |element, title| {
-                // A foldable callout's title folds it.
-                let foldable = block.callout_fold.is_some();
-                let view = context.view.clone();
-                let id = block.callout_quote;
-                element.pt_2().child(
-                    div()
-                        .mb_2()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(color))
-                        .when(foldable, |element| {
-                            element.cursor_pointer().on_mouse_down(
-                                MouseButton::Left,
-                                move |_, _, cx| {
-                                    if let Some(id) = id
-                                        && view
-                                            .update(cx, |this, cx| this.toggle_callout(id, cx))
-                                            .is_ok()
-                                    {
-                                        cx.stop_propagation();
-                                    }
-                                },
-                            )
-                        })
-                        .child(if foldable {
-                            format!("▾ {title}")
-                        } else {
-                            title
-                        }),
-                )
-            })
-            .child(content);
-        if continues {
-            callout.into_any_element()
+    if block.quote_depth == 0 {
+        return content;
+    }
+    // One box per quote level, innermost first: a callout's colored box or a plain quote's
+    // border. The space below goes inside the deepest level that continues.
+    let mut quoted = content;
+    for level in (1..=block.quote_depth).rev() {
+        let inside_gap = if level == continued {
+            inner_gap
         } else {
-            div()
-                .flex()
-                .flex_col()
-                .pb(inner_gap)
-                .child(callout)
-                .into_any_element()
-        }
-    } else if block.quote_depth > 0 {
-        // One border per level; the space below stays inside the levels that continue.
-        let mut quoted = content;
-        for level in (1..=block.quote_depth).rev() {
-            quoted = div()
+            px(0.0)
+        };
+        quoted = match block.quote_callouts.get(level - 1).cloned().flatten() {
+            Some(kind) => {
+                let color = crate::theme::callout_color(&kind);
+                // The title is on the callout's first block, which is directly in it.
+                let title = block
+                    .callout_title
+                    .clone()
+                    .filter(|_| level == block.quote_depth);
+                div()
+                    .flex()
+                    .flex_col()
+                    .pl_3()
+                    .pr_3()
+                    .pb(match level.cmp(&continued) {
+                        // Where the callout ends, its own bottom padding.
+                        std::cmp::Ordering::Greater => px(10.0),
+                        std::cmp::Ordering::Equal => inside_gap.max(px(10.0)),
+                        std::cmp::Ordering::Less => px(0.0),
+                    })
+                    .border_l_2()
+                    .border_color(rgb(color))
+                    .bg(rgba((color << 8) | 0x14))
+                    .text_color(rgb(theme.text))
+                    .when_some(title, |element, title| {
+                        // A foldable callout's title folds it.
+                        let foldable = block.callout_fold.is_some();
+                        let view = context.view.clone();
+                        let id = block.callout_quote;
+                        element.pt_2().child(
+                            div()
+                                .mb_2()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(color))
+                                .when(foldable, |element| {
+                                    element.cursor_pointer().on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_, _, cx| {
+                                            if let Some(id) = id
+                                                && view
+                                                    .update(cx, |this, cx| {
+                                                        this.toggle_callout(id, cx)
+                                                    })
+                                                    .is_ok()
+                                            {
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    )
+                                })
+                                .child(if foldable {
+                                    format!("▾ {title}")
+                                } else {
+                                    title
+                                }),
+                        )
+                    })
+                    .child(quoted)
+            }
+            None => div()
                 .flex()
                 .flex_col()
                 .pl_3()
                 .border_l_2()
                 .border_color(rgb(theme.quote_border))
-                .when(level == continued, |element| element.pb(inner_gap))
-                .child(quoted)
-                .into_any_element();
+                .text_color(rgb(theme.quote_text))
+                .pb(inside_gap)
+                .child(quoted),
         }
-        div()
-            .text_color(rgb(theme.quote_text))
-            .child(quoted)
-            .into_any_element()
-    } else {
-        content
+        .into_any_element();
     }
+    quoted
 }
 
 /// Styled text for `range` of a block; clicking it places the reading cursor on the character.
