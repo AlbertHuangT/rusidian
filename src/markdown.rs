@@ -18,8 +18,9 @@ pub struct Block {
     pub links: Vec<LinkSpan>,
     pub list_marker: Option<String>,
     pub list_depth: usize,
-    /// Inside a list item; blocks after the item's first one indent to its text.
-    pub in_list: bool,
+    /// The outermost list containing this block, numbered in document order. Blocks after an
+    /// item's first one indent to its text.
+    pub list: Option<usize>,
     /// Text of a tight list item (no blank lines between items), which sits close to the next.
     pub tight: bool,
     pub task: Option<bool>,
@@ -116,12 +117,15 @@ struct Quote {
 
 struct ListState {
     next: Option<u64>,
+    id: usize,
 }
 
 struct ItemState {
     marker: String,
     depth: usize,
     used: bool,
+    /// The outermost open list.
+    list: usize,
 }
 
 #[cfg(test)]
@@ -142,6 +146,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     let mut quotes: Vec<usize> = Vec::new();
     let mut alerts: Vec<Option<BlockQuoteKind>> = Vec::new();
     let mut lists: Vec<ListState> = Vec::new();
+    let mut list_count = 0;
     let mut items: Vec<ItemState> = Vec::new();
     let mut cell_start = None;
     let mut table_alignments = Vec::new();
@@ -202,7 +207,11 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 }
                 Tag::List(start) => {
                     push_current(&mut blocks, &mut current);
-                    lists.push(ListState { next: start });
+                    lists.push(ListState {
+                        next: start,
+                        id: list_count,
+                    });
+                    list_count += 1;
                 }
                 Tag::Item => {
                     let marker = lists
@@ -213,6 +222,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         marker,
                         depth: lists.len().saturating_sub(1),
                         used: false,
+                        list: lists.first().map_or(0, |list| list.id),
                     });
                 }
                 Tag::TableHead => {
@@ -492,7 +502,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         links: Vec::new(),
         list_marker: None,
         list_depth: 0,
-        in_list: false,
+        list: None,
         tight: false,
         task: None,
         quote_depth: quote.depth,
@@ -506,7 +516,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         source_map: Vec::new(),
     };
     if let Some(item) = items.last_mut() {
-        block.in_list = true;
+        block.list = Some(item.list);
         block.list_depth = item.depth;
         block.tight = block.kind == BlockKind::Paragraph;
         if !item.used {
@@ -912,18 +922,22 @@ mod tests {
         assert!(
             tight.blocks[..3]
                 .iter()
-                .all(|block| block.tight && block.in_list)
+                .all(|block| block.tight && block.list == Some(0))
         );
         assert_eq!(tight.blocks[1].list_depth, 1);
-        assert!(!tight.blocks[3].in_list && !tight.blocks[3].tight);
+        assert!(tight.blocks[3].list.is_none() && !tight.blocks[3].tight);
         let loose = parse("1. first\n\n   more\n\n2. second\n");
         assert_eq!(loose.blocks.len(), 3);
         assert!(
             loose
                 .blocks
                 .iter()
-                .all(|block| block.in_list && !block.tight)
+                .all(|block| block.list.is_some() && !block.tight)
         );
+        // A list in a quote and the list after it are different lists.
+        let separate = parse("> - quoted\n\n- outside\n");
+        assert_eq!(separate.blocks[0].list, Some(0));
+        assert_eq!(separate.blocks[1].list, Some(1));
         // The item's second paragraph has no marker of its own.
         assert_eq!(loose.blocks[1].list_marker, None);
         assert_eq!(loose.blocks[2].list_marker.as_deref(), Some("2."));

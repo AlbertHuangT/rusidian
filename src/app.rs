@@ -4456,7 +4456,10 @@ fn block_gap(block: &Block, next: Option<&Block>) -> Pixels {
         {
             px(0.0)
         }
-        BlockKind::Paragraph if block.tight && next.is_some_and(|next| next.in_list) => px(4.0),
+        // Up to the end of a tight list (nested lists included), items sit close together.
+        BlockKind::Paragraph if block.tight && next.is_some_and(|next| next.list == block.list) => {
+            px(4.0)
+        }
         BlockKind::Rule | BlockKind::DefinitionTitle => px(0.0),
         BlockKind::Footnote { .. } | BlockKind::Definition => px(12.0),
         _ => px(16.0),
@@ -4755,7 +4758,7 @@ fn decorate_block(
             .child(div().w(px(30.0)).flex_none().child(marker))
             .child(div().flex_1().min_w_0().child(content))
             .into_any_element()
-    } else if block.in_list {
+    } else if block.list.is_some() {
         // A later paragraph, code block or quote of the item lines up with its text.
         div()
             .ml(px(block.list_depth as f32 * 24.0 + 30.0))
