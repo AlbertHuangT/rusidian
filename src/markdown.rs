@@ -948,7 +948,13 @@ impl Block {
     pub fn source_lines(&self, source: &str) -> Option<Range<usize>> {
         let start = self.source_map.first()?.source.start;
         let end = self.source_map.last()?.source.end;
-        let line = |offset: usize| source[..offset.min(source.len())].matches('\n').count();
+        // Bytes, not text: an offset may fall inside a character.
+        let line = |offset: usize| {
+            source.as_bytes()[..offset.min(source.len())]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+        };
         Some(line(start)..line(end.saturating_sub(1).max(start)) + 1)
     }
 }
@@ -1570,5 +1576,95 @@ mod tests {
             ]
         );
         assert_eq!(blocks[0].source_offset(0), Some(6));
+    }
+
+    /// Random mixes of Markdown and Obsidian syntax: parsing and source mapping never panic.
+    #[test]
+    #[ignore = "slow: random inputs"]
+    fn parses_random_text_without_panicking() {
+        let pieces = [
+            "%%",
+            "[[",
+            "]]",
+            "![[",
+            "|",
+            "#",
+            "^id",
+            "> ",
+            "> [!note]- ",
+            "[!tip]+",
+            "- ",
+            "- [ ] ",
+            "- [/] ",
+            "1. ",
+            "$",
+            "$$",
+            "==",
+            "**",
+            "*",
+            "_",
+            "~~",
+            "`",
+            "```",
+            "~~~",
+            "\n",
+            "\n\n",
+            "\r\n",
+            "\t",
+            "    ",
+            "中文",
+            "😀",
+            "é",
+            "a",
+            "b c",
+            "http://x.y/z",
+            "#tag",
+            "[^1]",
+            "[^1]: ",
+            "<span>",
+            "<!--",
+            "-->",
+            "---\n",
+            "|a|b|\n|-|-|\n",
+            "\\",
+            "[x](y.md)",
+            "![i](p.png)",
+            "%",
+            "]",
+            "[",
+            "(",
+            ")",
+            "\u{200b}",
+            "^",
+            "> > ",
+            "* * *",
+        ];
+        let mut seed: u64 = 0x2545F4914F6CDD1D;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20000 {
+            let count = (next() % 80) as usize;
+            let mut source = String::new();
+            for _ in 0..count {
+                source.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            for strict in [false, true] {
+                let document = parse_with_options(&source, strict);
+                for block in &document.blocks {
+                    let length = block.text.chars().count();
+                    for offset in 0..=length {
+                        let _ = block.source_offset(offset);
+                    }
+                    for byte in 0..=source.len() {
+                        let _ = block.text_offset(byte);
+                    }
+                    let _ = block.source_lines(&source);
+                }
+            }
+        }
     }
 }
