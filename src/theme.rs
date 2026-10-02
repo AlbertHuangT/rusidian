@@ -158,6 +158,20 @@ impl Theme {
     }
 }
 
+/// Accent color for an Obsidian or GitHub callout kind, readable on light and dark themes.
+pub fn callout_color(kind: &str) -> u32 {
+    match kind {
+        "abstract" | "summary" | "tldr" | "tip" | "hint" | "important" => 0x1fa8a0,
+        "success" | "check" | "done" => 0x3fa95b,
+        "question" | "help" | "faq" => 0xd19a1e,
+        "warning" | "caution" | "attention" => 0xe0782f,
+        "failure" | "fail" | "missing" | "danger" | "error" | "bug" => 0xe0484a,
+        "example" => 0x9b6cf0,
+        "quote" | "cite" => 0x8b949e,
+        _ => 0x3f88e0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

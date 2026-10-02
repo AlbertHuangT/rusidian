@@ -12,7 +12,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
     SharedString, Size, StrikethroughStyle, StyledText, TextLayout, UTF16Selection, UnderlineStyle,
     WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*,
-    px, rgb, size,
+    px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use std::{
@@ -4160,7 +4160,27 @@ fn decorate_block(theme: &Theme, block: &Block, content: AnyElement) -> AnyEleme
     } else {
         content
     };
-    if block.quote_depth > 0 {
+    if let Some(kind) = &block.callout {
+        let color = crate::theme::callout_color(kind);
+        div()
+            .ml(px(12.0 * block.quote_depth.saturating_sub(1) as f32))
+            .pl_3()
+            .pr_3()
+            .border_l_2()
+            .border_color(rgb(color))
+            .bg(rgba((color << 8) | 0x14))
+            .when_some(block.callout_title.clone(), |element, title| {
+                element.pt_2().child(
+                    div()
+                        .mb_2()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(color))
+                        .child(title),
+                )
+            })
+            .child(content)
+            .into_any_element()
+    } else if block.quote_depth > 0 {
         div()
             .pl(px(12.0 * block.quote_depth as f32))
             .border_l_2()

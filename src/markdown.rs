@@ -1,4 +1,6 @@
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use std::ops::Range;
 
 #[derive(Debug)]
@@ -18,6 +20,12 @@ pub struct Block {
     pub list_depth: usize,
     pub task: Option<bool>,
     pub quote_depth: usize,
+    /// The innermost blockquote containing this block, numbered in document order.
+    pub quote: Option<usize>,
+    /// The callout kind (`note`, `tip`, ...) of the innermost blockquote, if it is a callout.
+    pub callout: Option<String>,
+    /// The callout's title, on the first block of the callout only.
+    pub callout_title: Option<String>,
     pub cells: Vec<Range<usize>>,
     pub table_alignments: Vec<Alignment>,
     /// Where each piece of `text` came from in the Markdown source, in text order.
@@ -82,6 +90,12 @@ struct PendingImage {
     alt: String,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Quote {
+    depth: usize,
+    id: Option<usize>,
+}
+
 struct ListState {
     next: Option<u64>,
 }
@@ -105,7 +119,10 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     let mut strike = 0;
     let mut image = None;
     let mut link = None;
-    let mut quote_depth = 0;
+    let mut quote = Quote::default();
+    // Open blockquotes (innermost last) and the GFM alert kind of every quote by id.
+    let mut quotes: Vec<usize> = Vec::new();
+    let mut alerts: Vec<Option<BlockQuoteKind>> = Vec::new();
     let mut lists: Vec<ListState> = Vec::new();
     let mut items: Vec<ItemState> = Vec::new();
     let mut cell_start = None;
@@ -121,14 +138,14 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         footnote.as_ref().map_or(BlockKind::Paragraph, |label| {
                             BlockKind::Footnote(label.clone())
                         }),
-                        quote_depth,
+                        quote,
                         &mut items,
                     ));
                 }
                 Tag::Heading { level, .. } => {
                     current = Some(new_block(
                         BlockKind::Heading(heading_level(level)),
-                        quote_depth,
+                        quote,
                         &mut items,
                     ));
                 }
@@ -137,19 +154,23 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         CodeBlockKind::Fenced(language) => Some(language.into_string()),
                         CodeBlockKind::Indented => None,
                     };
-                    current = Some(new_block(
-                        BlockKind::Code(language),
-                        quote_depth,
-                        &mut items,
-                    ));
+                    current = Some(new_block(BlockKind::Code(language), quote, &mut items));
                 }
                 Tag::HtmlBlock => {
-                    current = Some(new_block(BlockKind::Html, quote_depth, &mut items));
+                    current = Some(new_block(BlockKind::Html, quote, &mut items));
                 }
                 Tag::MetadataBlock(_) => {
-                    current = Some(new_block(BlockKind::Metadata, quote_depth, &mut items));
+                    current = Some(new_block(BlockKind::Metadata, quote, &mut items));
                 }
-                Tag::BlockQuote(_) => quote_depth += 1,
+                Tag::BlockQuote(kind) => {
+                    push_current(&mut blocks, &mut current);
+                    quotes.push(alerts.len());
+                    alerts.push(kind);
+                    quote = Quote {
+                        depth: quotes.len(),
+                        id: quotes.last().copied(),
+                    };
+                }
                 Tag::List(start) => {
                     push_current(&mut blocks, &mut current);
                     lists.push(ListState { next: start });
@@ -166,14 +187,13 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     });
                 }
                 Tag::TableHead => {
-                    let mut block =
-                        new_block(BlockKind::Table { header: true }, quote_depth, &mut items);
+                    let mut block = new_block(BlockKind::Table { header: true }, quote, &mut items);
                     block.table_alignments.clone_from(&table_alignments);
                     current = Some(block);
                 }
                 Tag::TableRow => {
                     let mut block =
-                        new_block(BlockKind::Table { header: false }, quote_depth, &mut items);
+                        new_block(BlockKind::Table { header: false }, quote, &mut items);
                     block.table_alignments.clone_from(&table_alignments);
                     current = Some(block);
                 }
@@ -183,23 +203,18 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 Tag::Table(alignments) => table_alignments = alignments,
                 Tag::FootnoteDefinition(label) => footnote = Some(label.into_string()),
                 Tag::DefinitionListTitle => {
-                    current = Some(new_block(
-                        BlockKind::DefinitionTitle,
-                        quote_depth,
-                        &mut items,
-                    ));
+                    current = Some(new_block(BlockKind::DefinitionTitle, quote, &mut items));
                 }
                 Tag::DefinitionListDefinition => {
-                    current = Some(new_block(BlockKind::Definition, quote_depth, &mut items));
+                    current = Some(new_block(BlockKind::Definition, quote, &mut items));
                 }
                 Tag::Strong => bold += 1,
                 Tag::Emphasis => italic += 1,
                 Tag::Strikethrough => strike += 1,
                 Tag::Link { dest_url, .. } => link = Some(dest_url.into_string()),
                 Tag::Image { dest_url, .. } => {
-                    current.get_or_insert_with(|| {
-                        new_block(BlockKind::Paragraph, quote_depth, &mut items)
-                    });
+                    current
+                        .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items));
                     image = Some(PendingImage {
                         source: dest_url.into_string(),
                         alt: String::new(),
@@ -224,14 +239,18 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 | TagEnd::MetadataBlock(_) => push_current(&mut blocks, &mut current),
                 TagEnd::BlockQuote(_) => {
                     push_current(&mut blocks, &mut current);
-                    quote_depth = quote_depth.saturating_sub(1);
+                    quotes.pop();
+                    quote = Quote {
+                        depth: quotes.len(),
+                        id: quotes.last().copied(),
+                    };
                 }
                 TagEnd::List(_) => {
                     lists.pop();
                 }
                 TagEnd::Item => {
                     if current.is_none() && items.last().is_some_and(|item| !item.used) {
-                        current = Some(new_block(BlockKind::Paragraph, quote_depth, &mut items));
+                        current = Some(new_block(BlockKind::Paragraph, quote, &mut items));
                     }
                     push_current(&mut blocks, &mut current);
                     items.pop();
@@ -260,9 +279,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     image.alt.push_str(&text);
                 } else {
                     current
-                        .get_or_insert_with(|| {
-                            new_block(BlockKind::Paragraph, quote_depth, &mut items)
-                        })
+                        .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                         .push(
                             &text,
                             bold > 0,
@@ -278,9 +295,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     image.alt.push_str(&text);
                 } else {
                     current
-                        .get_or_insert_with(|| {
-                            new_block(BlockKind::Paragraph, quote_depth, &mut items)
-                        })
+                        .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                         .push(
                             &text,
                             bold > 0,
@@ -293,19 +308,19 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
             }
             Event::InlineMath(text) => {
                 current
-                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                     .push_math(text.into_string());
             }
             Event::DisplayMath(text) => {
                 push_current(&mut blocks, &mut current);
-                let mut block = new_block(BlockKind::Math, quote_depth, &mut items);
+                let mut block = new_block(BlockKind::Math, quote, &mut items);
                 block.push(&text, false, false, false, false, None);
                 block.map_source(0..block.text.len(), source, range.clone());
                 blocks.push(block);
             }
             Event::SoftBreak => {
                 current
-                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                     .push(
                         if strict_line_breaks { " " } else { "\n" },
                         bold > 0,
@@ -317,7 +332,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
             }
             Event::HardBreak => {
                 current
-                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                     .push(
                         "\n",
                         bold > 0,
@@ -327,15 +342,15 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         link.as_deref(),
                     );
             }
-            Event::Rule => blocks.push(new_block(BlockKind::Rule, quote_depth, &mut items)),
+            Event::Rule => blocks.push(new_block(BlockKind::Rule, quote, &mut items)),
             Event::TaskListMarker(checked) => {
                 current
-                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                     .task = Some(checked);
             }
             Event::FootnoteReference(label) => {
                 current
-                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote_depth, &mut items))
+                    .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
                     .push(&format!("[^{label}]"), false, false, false, false, None);
             }
         }
@@ -348,10 +363,11 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     }
 
     push_current(&mut blocks, &mut current);
+    apply_callouts(&mut blocks, &alerts);
     MarkdownDocument { blocks }
 }
 
-fn new_block(kind: BlockKind, quote_depth: usize, items: &mut [ItemState]) -> Block {
+fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
     let mut block = Block {
         kind,
         text: String::new(),
@@ -362,7 +378,10 @@ fn new_block(kind: BlockKind, quote_depth: usize, items: &mut [ItemState]) -> Bl
         list_marker: None,
         list_depth: 0,
         task: None,
-        quote_depth,
+        quote_depth: quote.depth,
+        quote: quote.id,
+        callout: None,
+        callout_title: None,
         cells: Vec::new(),
         table_alignments: Vec::new(),
         source_map: Vec::new(),
@@ -479,7 +498,106 @@ impl Block {
     }
 }
 
+/// Turn blockquotes into callouts: GitHub alerts (`> [!NOTE]`, already parsed by pulldown-cmark)
+/// and Obsidian callouts (`> [!tip]- Optional title` as the quote's first line).
+fn apply_callouts(blocks: &mut [Block], alerts: &[Option<BlockQuoteKind>]) {
+    for (id, alert) in alerts.iter().enumerate() {
+        let Some(first) = blocks.iter().position(|block| block.quote == Some(id)) else {
+            continue;
+        };
+        let callout = if let Some(kind) = alert {
+            let kind = format!("{kind:?}").to_lowercase();
+            Some((kind, None))
+        } else if blocks[first].kind == BlockKind::Paragraph {
+            parse_callout_header(&blocks[first].text).map(|(kind, title, header)| {
+                blocks[first].remove_prefix(header);
+                (kind, title)
+            })
+        } else {
+            None
+        };
+        let Some((kind, title)) = callout else {
+            continue;
+        };
+        blocks[first].callout_title = Some(title.unwrap_or_else(|| capitalize(&kind)));
+        for block in blocks.iter_mut().filter(|block| block.quote == Some(id)) {
+            block.callout = Some(kind.clone());
+        }
+    }
+}
+
+/// `[!kind]`, an optional fold marker and an optional title on the first line. Returns the kind,
+/// the title and how many bytes of text the header line takes (including its newline).
+fn parse_callout_header(text: &str) -> Option<(String, Option<String>, usize)> {
+    let line_end = text.find('\n').unwrap_or(text.len());
+    let line = &text[..line_end];
+    let rest = line.strip_prefix("[!")?;
+    let close = rest.find(']')?;
+    let kind = &rest[..close];
+    if kind.is_empty()
+        || !kind
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return None;
+    }
+    let title = rest[close + 1..].trim_start_matches(['+', '-']).trim();
+    let header = if line_end < text.len() {
+        line_end + 1
+    } else {
+        line_end
+    };
+    Some((
+        kind.to_lowercase(),
+        (!title.is_empty()).then(|| title.to_owned()),
+        header,
+    ))
+}
+
+fn capitalize(word: &str) -> String {
+    let mut characters = word.chars();
+    characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default()
+}
+
 impl Block {
+    /// Drop the first `count` bytes of text, keeping every range pointing at the same text.
+    fn remove_prefix(&mut self, count: usize) {
+        self.text.replace_range(..count, "");
+        let shift = |range: &mut Range<usize>| {
+            range.start = range.start.saturating_sub(count);
+            range.end = range.end.saturating_sub(count);
+        };
+        for span in &mut self.spans {
+            shift(&mut span.range);
+        }
+        self.spans.retain(|span| !span.range.is_empty());
+        for link in &mut self.links {
+            shift(&mut link.range);
+        }
+        self.links.retain(|link| !link.range.is_empty());
+        self.images.retain(|image| image.range.start >= count);
+        for image in &mut self.images {
+            shift(&mut image.range);
+        }
+        self.maths.retain(|math| math.range.start >= count);
+        for math in &mut self.maths {
+            shift(&mut math.range);
+        }
+        self.source_map.retain(|span| span.text.end > count);
+        for span in &mut self.source_map {
+            if span.text.start < count {
+                if span.exact {
+                    span.source.start += count - span.text.start;
+                }
+                span.text.start = count;
+            }
+            shift(&mut span.text);
+        }
+    }
+
     fn map_source(&mut self, text: Range<usize>, source: &str, range: Range<usize>) {
         let shown = &self.text[text.clone()];
         let raw = source.get(range.clone()).unwrap_or_default();
@@ -659,6 +777,29 @@ mod tests {
         );
         assert_eq!(mapped.blocks[0].text_offset(0), Some(0));
         assert_eq!(mapped.blocks[0].source_offset(0), Some(2));
+
+        let callouts = parse(
+            "> [!NOTE]\n> GitHub alert.\n\n> [!tip]- Custom **title**\n> Body *text*.\n> > nested\n\n> plain quote\n",
+        );
+        let alert = &callouts.blocks[0];
+        assert_eq!(alert.callout.as_deref(), Some("note"));
+        assert_eq!(alert.callout_title.as_deref(), Some("Note"));
+        assert_eq!(alert.text, "GitHub alert.");
+        let tip = &callouts.blocks[1];
+        assert_eq!(tip.callout.as_deref(), Some("tip"));
+        assert_eq!(tip.callout_title.as_deref(), Some("Custom title"));
+        assert_eq!(tip.text, "Body text.");
+        assert_eq!(tip.spans[0].range, 5..9);
+        let source = "> [!NOTE]\n> GitHub alert.\n\n> [!tip]- Custom **title**\n> Body *text*.\n> > nested\n\n> plain quote\n";
+        assert_eq!(tip.source_offset(0), source.find("Body"));
+        let nested = &callouts.blocks[2];
+        assert_eq!((nested.callout.as_deref(), nested.quote_depth), (None, 2));
+        assert_eq!(callouts.blocks[3].callout, None);
+        assert_eq!(
+            parse_callout_header("[!warning]"),
+            Some(("warning".into(), None, 10))
+        );
+        assert_eq!(parse_callout_header("[not callout]"), None);
 
         let wiki = parse("[[目标笔记|显示名称]]");
         assert_eq!(wiki.blocks[0].text, "显示名称");
