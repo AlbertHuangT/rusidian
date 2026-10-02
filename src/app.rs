@@ -270,6 +270,8 @@ struct RusidianApp {
     applied_title: Option<String>,
     /// Neovim's buffer has changes that are not written to disk.
     modified: bool,
+    /// A heading or block to reveal once the note being opened in Neovim arrives.
+    pending_fragment: Option<String>,
     auto_update: bool,
     update_status: UpdateStatus,
     available_update: Option<Update>,
@@ -396,6 +398,7 @@ impl RusidianApp {
             notice_generation: 0,
             applied_title: None,
             modified: false,
+            pending_fragment: None,
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
             available_update: None,
@@ -737,6 +740,15 @@ impl RusidianApp {
                             more,
                         } => {
                             if this.update_buffer(first, last, lines, more) && !more {
+                                if let Some(fragment) = this.pending_fragment.take()
+                                    && !this.reveal_fragment(&fragment)
+                                {
+                                    this.show_notice(
+                                        format!("找不到标题或块：{fragment}"),
+                                        true,
+                                        cx,
+                                    );
+                                }
                                 if this.view == View::Reading {
                                     this.compile_visuals(cx);
                                 }
@@ -774,6 +786,12 @@ impl RusidianApp {
                         }
                         NvimEvent::BufferEntered(path) => {
                             this.follow_buffer(path, cx);
+                        }
+                        NvimEvent::Notice { text, error } => {
+                            if error {
+                                this.pending_fragment = None;
+                            }
+                            this.show_notice(text, error, cx);
                         }
                         NvimEvent::Modified(modified) => {
                             if this.modified != modified {
@@ -828,6 +846,33 @@ impl RusidianApp {
     }
 
     fn request_close(&mut self, action: PendingClose, cx: &mut Context<Self>) {
+        // Notes open in the running Neovim, which keeps other (even unsaved) notes as hidden
+        // buffers. Folders, or a Neovim that is not running, take the restart path below.
+        if let PendingClose::Open { path, fragment, .. } = &action
+            && !path.is_dir()
+            && self.pending_close.is_none()
+            && self.nvim_error.is_none()
+            && let Some(nvim) = &self.nvim
+        {
+            if self
+                .document
+                .as_ref()
+                .is_some_and(|document| same_file(&document.file, path))
+            {
+                if let Some(fragment) = fragment
+                    && !self.reveal_fragment(fragment)
+                {
+                    self.show_notice(format!("找不到标题或块：{fragment}"), true, cx);
+                }
+                cx.notify();
+                return;
+            }
+            nvim.edit(path.clone());
+            self.pending_fragment = fragment.clone();
+            let path = path.clone();
+            self.remember_recent(&path);
+            return;
+        }
         if let Some(nvim) = &self.nvim {
             if self.pending_close.is_some() {
                 return;

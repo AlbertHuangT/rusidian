@@ -49,6 +49,11 @@ pub enum Event {
     BufferWritten(PathBuf),
     /// Whether the followed buffer has unsaved changes.
     Modified(bool),
+    /// A short message for the status bar.
+    Notice {
+        text: String,
+        error: bool,
+    },
     Exited,
 }
 
@@ -66,6 +71,8 @@ enum Command {
         column: usize,
     },
     FollowCurrentBuffer,
+    /// Open a file in the running Neovim (`:edit`).
+    Edit(PathBuf),
     /// Neovim detached our buffer (reloads such as :edit! or 'autoread' do that).
     Reattach,
     CheckTime,
@@ -398,6 +405,32 @@ impl Client {
                             // unloaded one cannot be attached; BufEnter will follow its successor.
                             let _ = buffer.attach(true, Vec::new()).await;
                         }
+                        Command::Edit(path) => {
+                            let notice = match nvim
+                                .exec_lua(
+                                    EDIT_LUA,
+                                    vec![Value::from(path.to_string_lossy().into_owned())],
+                                )
+                                .await
+                            {
+                                Ok(swap) => swap.as_str().map(|swap| Event::Notice {
+                                    text: format!(
+                                        "已只读打开：另有 Neovim 正在编辑或留下了 swap 文件（{}）",
+                                        std::path::Path::new(swap)
+                                            .file_name()
+                                            .map_or(swap.into(), |name| name.to_string_lossy())
+                                    ),
+                                    error: true,
+                                }),
+                                Err(error) => Some(Event::Notice {
+                                    text: edit_refusal(&error.to_string()),
+                                    error: true,
+                                }),
+                            };
+                            if let Some(notice) = notice {
+                                let _ = event_sender.send(notice).await;
+                            }
+                        }
                         Command::CheckTime => {
                             let _ = nvim.command("silent! checktime").await;
                         }
@@ -478,6 +511,11 @@ impl Client {
         let _ = self.commands.send(Command::CheckTime);
     }
 
+    /// Open `path` in this Neovim; the preview follows through `BufferEntered`.
+    pub fn edit(&self, path: PathBuf) {
+        let _ = self.commands.send(Command::Edit(path));
+    }
+
     pub fn close(&self) -> bool {
         self.commands.send(Command::Close).is_ok()
     }
@@ -509,16 +547,42 @@ async fn send_input(nvim: &Neovim<Compat<ChildStdin>>, mut keys: &str) -> Result
     .map_err(|_| "Neovim 输入超时，部分文字可能未送达".to_owned())?
 }
 
+/// `:edit` a path; a swap file opens it read-only instead of prompting, which would stall the
+/// reading view. Returns the swap file name when that happened.
+const EDIT_LUA: &str = "local path = ...
+local swap = vim.NIL
+local id = vim.api.nvim_create_autocmd('SwapExists', { callback = function()
+  swap = vim.v.swapname
+  vim.v.swapchoice = 'o'
+end })
+local ok, err = pcall(vim.cmd.edit, vim.fn.fnameescape(path))
+pcall(vim.api.nvim_del_autocmd, id)
+if not ok then error(err, 0) end
+return swap";
+
+/// Explain why Neovim could not switch to another file.
+fn edit_refusal(error: &str) -> String {
+    if error.contains("E37") {
+        "当前笔记有未保存的修改，而 Neovim 关闭了 'hidden'。请先用 :w 保存再切换。".to_owned()
+    } else {
+        format!("无法打开：{}", vim_message(error))
+    }
+}
+
+/// The `E123: ...` part of an RPC error, without the request wrapper.
+fn vim_message(error: &str) -> &str {
+    error
+        .split_once("Vim(")
+        .and_then(|(_, rest)| rest.split_once("):"))
+        .map_or(error, |(_, message)| message.trim_end_matches(['\'', ')']))
+}
+
 /// Explain why Neovim kept running; unsaved changes (E37/E162) are the usual reason.
 fn close_refusal(error: &str) -> String {
     if error.contains("E37") || error.contains("E162") {
-        "当前笔记有未保存的修改。请用 :w 保存，或用 :e! 放弃修改，然后再切换笔记或退出。".to_owned()
+        "有笔记包含未保存的修改（可能是已打开的其他笔记）。请用 :wa 全部保存，或用 :e! 放弃当前修改后再退出。".to_owned()
     } else {
-        let detail = error
-            .split_once("Vim(")
-            .and_then(|(_, rest)| rest.split_once("):"))
-            .map_or(error, |(_, message)| message.trim_end_matches(['\'', ')']));
-        format!("Neovim 未能关闭：{detail}")
+        format!("Neovim 未能关闭：{}", vim_message(error))
     }
 }
 
@@ -1247,6 +1311,11 @@ mod tests {
             )
             .contains("未保存的修改")
         );
+        assert!(edit_refusal("Vim(edit):E37: No write since last change").contains("'hidden'"));
+        assert_eq!(
+            edit_refusal("Error processing request: 0 - 'Vim(edit):E484: Can't open file'"),
+            "无法打开：E484: Can't open file"
+        );
         assert_eq!(
             close_refusal("Error processing request: 0 - 'Vim(qall):E999: Other'"),
             "Neovim 未能关闭：E999: Other"
@@ -1297,7 +1366,8 @@ mod tests {
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
-                            | Event::Modified(_) => {}
+                            | Event::Modified(_)
+                            | Event::Notice { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1324,7 +1394,8 @@ mod tests {
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
-                            | Event::Modified(_) => {}
+                            | Event::Modified(_)
+                            | Event::Notice { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1350,7 +1421,8 @@ mod tests {
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
-                            | Event::Modified(_) => {}
+                            | Event::Modified(_)
+                            | Event::Notice { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1376,7 +1448,8 @@ mod tests {
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
-                            | Event::Modified(_) => {}
+                            | Event::Modified(_)
+                            | Event::Notice { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
@@ -1400,7 +1473,8 @@ mod tests {
                             | Event::Cursor { .. }
                             | Event::BufferEntered(_)
                             | Event::BufferWritten(_)
-                            | Event::Modified(_) => {}
+                            | Event::Modified(_)
+                            | Event::Notice { .. } => {}
                             Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
                             Event::Exited => panic!("Neovim exited unexpectedly"),
                         }
