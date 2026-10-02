@@ -435,6 +435,8 @@ struct RusidianApp {
     remote_images: HashMap<String, RemoteImage>,
     /// Notes shown with `![[note]]`, read from disk by path.
     embeds: HashMap<PathBuf, EmbeddedNote>,
+    /// Link destinations in the note that name no existing file, shown dimmed like Obsidian.
+    unresolved_links: HashSet<String>,
     /// Vaults whose remote images load automatically.
     remote_image_vaults: Vec<PathBuf>,
     auto_update: bool,
@@ -579,6 +581,7 @@ impl RusidianApp {
             open_buffers: Vec::new(),
             remote_images: HashMap::new(),
             embeds: HashMap::new(),
+            unresolved_links: HashSet::new(),
             remote_image_vaults: settings.remote_image_vaults,
             auto_update: settings.auto_update,
             update_status: UpdateStatus::Idle,
@@ -789,6 +792,7 @@ impl RusidianApp {
     fn compile_visuals(&mut self, cx: &mut Context<Self>) {
         // First: embedded notes' diagrams and formulas compile with the note's own.
         self.load_embeds();
+        self.find_unresolved_links();
         self.compile_tikz(cx);
         self.compile_math(cx);
         self.load_allowed_remote_images(cx);
@@ -841,6 +845,29 @@ impl RusidianApp {
             self.embeds
                 .insert(path, EmbeddedNote { modified, markdown });
             self.invalidate_block_heights();
+        }
+    }
+
+    fn find_unresolved_links(&mut self) {
+        self.unresolved_links.clear();
+        let Some(document) = &self.document else {
+            return;
+        };
+        for link in document
+            .markdown
+            .blocks
+            .iter()
+            .flat_map(|block| &block.links)
+        {
+            let (target, _) = crate::vault::split_fragment(&link.destination);
+            if !target.is_empty()
+                && !is_external_link(&link.destination)
+                && !self.unresolved_links.contains(&link.destination)
+                && crate::vault::resolve_target(&document.file, self.vault.as_ref(), target)
+                    .is_none()
+            {
+                self.unresolved_links.insert(link.destination.clone());
+            }
         }
     }
 
@@ -1037,7 +1064,10 @@ impl RusidianApp {
         if self.document.is_none() && self.vault.is_none() {
             return;
         }
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // A new note that was never saved does not exist yet; it is not worth recalling.
+        let Ok(path) = path.canonicalize() else {
+            return;
+        };
         if let Ok(settings) = crate::settings::update(|settings| settings.remember(path)) {
             self.recent = settings.recent;
         }
@@ -2238,7 +2268,24 @@ impl RusidianApp {
         }
         let Some(path) = crate::vault::resolve_target(&document.file, self.vault.as_ref(), target)
         else {
-            self.show_notice(format!("找不到或无法唯一确定链接：{target}"), true, cx);
+            // Like Obsidian, a link to a missing note creates it: Neovim opens a new buffer,
+            // and the file exists once saved.
+            let create = crate::vault::new_note_path(&document.file, self.vault.as_ref(), target)
+                .filter(|path| path.parent().is_some_and(Path::is_dir) && !path.exists());
+            let Some(path) = create else {
+                self.show_notice(format!("找不到或无法唯一确定链接：{target}"), true, cx);
+                return;
+            };
+            let name = display_name(&path);
+            self.request_close(
+                PendingClose::Open {
+                    vault_root: self.vault.as_ref().map(|vault| vault.root.clone()),
+                    path,
+                    fragment: None,
+                },
+                cx,
+            );
+            self.show_notice(format!("新笔记 {name}：用 :w 保存后创建"), false, cx);
             return;
         };
         if same_file(&path, &document.file) {
@@ -4223,6 +4270,7 @@ impl Render for RusidianApp {
                     }),
                 tikz: &self.tikz,
                 embeds: &self.embeds,
+                unresolved: &self.unresolved_links,
                 embedded: false,
                 block_index: 0,
             };
@@ -4843,6 +4891,7 @@ struct RenderContext<'a> {
     remote_vault: Option<&'a Path>,
     tikz: &'a HashMap<String, TikzState>,
     embeds: &'a HashMap<PathBuf, EmbeddedNote>,
+    unresolved: &'a HashSet<String>,
     /// Rendering inside an embed: further embeds show as links, not content.
     embedded: bool,
     /// The block being rendered.
@@ -5373,7 +5422,14 @@ fn styled_fragment(
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
-    let highlights = fragment_highlights(context.theme, block, &range, cursor, selection);
+    let highlights = fragment_highlights(
+        context.theme,
+        block,
+        &range,
+        cursor,
+        selection,
+        context.unresolved,
+    );
     let fragment: SharedString = block.text[range.clone()].to_owned().into();
     let text = StyledText::new(fragment.clone()).with_highlights(highlights);
     let layout = text.layout().clone();
@@ -5427,12 +5483,14 @@ fn visible_offset(text: &str, byte: usize) -> usize {
         .count()
 }
 
+/// Text styles of `range`; links in `unresolved` (missing notes) are dimmed.
 fn fragment_highlights(
     theme: &Theme,
     block: &Block,
     range: &std::ops::Range<usize>,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
+    unresolved: &HashSet<String>,
 ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
     let mut highlights = block
         .spans
@@ -5466,10 +5524,12 @@ fn fragment_highlights(
         .collect::<Vec<_>>();
     highlights.extend(block.links.iter().filter_map(|link| {
         clipped_range(&link.range, range).map(|range| {
+            let missing = unresolved.contains(&link.destination);
             (
                 range,
                 HighlightStyle {
                     color: Some(rgb(theme.accent).into()),
+                    fade_out: missing.then_some(0.45),
                     underline: Some(UnderlineStyle {
                         thickness: px(1.0),
                         color: None,
@@ -7214,6 +7274,7 @@ mod tests {
             &(0..block.text.len()),
             Some(3),
             Some((2, 4)),
+            &HashSet::new(),
         );
         for pair in highlights.windows(2) {
             assert!(pair[0].0.end <= pair[1].0.start, "{highlights:?}");
@@ -7254,6 +7315,7 @@ mod tests {
                         &range,
                         Some(cursor),
                         Some((0, cursor)),
+                        &HashSet::new(),
                     ) {
                         assert!(fragment.is_char_boundary(highlight.start));
                         assert!(fragment.is_char_boundary(highlight.end));

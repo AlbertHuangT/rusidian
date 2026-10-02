@@ -24,6 +24,9 @@ pub struct ObsidianSettings {
     pub attachment_folder_path: Option<String>,
     pub always_update_links: Option<bool>,
     pub user_ignore_filters: Vec<String>,
+    /// Where new notes go: `root` (the default), `current` (beside the open note) or `folder`.
+    pub new_file_location: Option<String>,
+    pub new_file_folder_path: Option<String>,
 }
 
 impl Vault {
@@ -220,6 +223,44 @@ pub fn resolve_target(note: &Path, vault: Option<&Vault>, target: &str) -> Optio
         .find_by_name(name)
         .or_else(|| vault.find_by_name(&format!("{name}.md")))
         .or_else(|| vault.resolve_note(target))
+}
+
+/// Where following a link to a missing note creates it, as Obsidian would: a link with a folder
+/// is relative to the vault root, a bare name goes to the vault's new-note location (beside the
+/// open note without a vault). `None` for targets that are not note names.
+pub fn new_note_path(note: &Path, vault: Option<&Vault>, target: &str) -> Option<PathBuf> {
+    let target = percent_decode(target);
+    let target = target.trim().trim_end_matches(".md");
+    let path = Path::new(target);
+    let plain_name = path
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    // `image.png` names an attachment; `v1.2 release` is still a note.
+    let attachment = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.len() <= 5 && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    if target.is_empty() || !plain_name || attachment || target.contains("://") {
+        return None;
+    }
+    let file = format!("{target}.md");
+    let beside = || note.parent().unwrap_or_else(|| Path::new(".")).join(&file);
+    let Some(vault) = vault else {
+        return Some(beside());
+    };
+    if target.contains('/') {
+        return Some(vault.root.join(&file));
+    }
+    Some(match vault.settings.new_file_location.as_deref() {
+        Some("current") => beside(),
+        Some("folder") => vault
+            .root
+            .join(vault.settings.new_file_folder_path.as_deref().unwrap_or(""))
+            .join(&file),
+        _ => vault.root.join(&file),
+    })
 }
 
 /// Split `path#heading` (or `path#^block`) into its file and fragment parts.
@@ -437,6 +478,49 @@ mod tests {
         assert!(Vault::open(&root).unwrap().is_obsidian);
         fs::remove_dir_all(root.join(".obsidian")).unwrap();
         assert!(!Vault::open(&root).unwrap().is_obsidian);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn places_new_notes_like_obsidian() {
+        let root = std::env::temp_dir().join(format!("rusidian-new-note-{}", std::process::id()));
+        fs::create_dir_all(root.join(".obsidian")).unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let note = root.join("sub/current.md");
+        fs::write(&note, "x").unwrap();
+        let mut vault = Vault::open(&root).unwrap();
+        let root = vault.root.clone();
+        let note = root.join("sub/current.md");
+        assert_eq!(
+            new_note_path(&note, Some(&vault), "New idea"),
+            Some(root.join("New idea.md"))
+        );
+        assert_eq!(
+            new_note_path(&note, Some(&vault), "Projects/plan.md"),
+            Some(root.join("Projects/plan.md"))
+        );
+        vault.settings.new_file_location = Some("current".into());
+        assert_eq!(
+            new_note_path(&note, Some(&vault), "Idea"),
+            Some(root.join("sub/Idea.md"))
+        );
+        vault.settings.new_file_location = Some("folder".into());
+        vault.settings.new_file_folder_path = Some("Inbox".into());
+        assert_eq!(
+            new_note_path(&note, Some(&vault), "Idea"),
+            Some(root.join("Inbox/Idea.md"))
+        );
+        assert_eq!(
+            new_note_path(&note, None, "Idea"),
+            Some(root.join("sub/Idea.md"))
+        );
+        assert_eq!(new_note_path(&note, Some(&vault), "image.png"), None);
+        assert_eq!(
+            new_note_path(&note, Some(&vault), "v1.2 release"),
+            Some(root.join("Inbox/v1.2 release.md"))
+        );
+        assert_eq!(new_note_path(&note, Some(&vault), "../outside"), None);
+        assert_eq!(new_note_path(&note, Some(&vault), "https://x.org"), None);
         fs::remove_dir_all(root).unwrap();
     }
 
