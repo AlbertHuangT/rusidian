@@ -3442,14 +3442,14 @@ mod tests {
     #[test]
     fn keeps_rendered_tikz_until_its_source_changes() {
         let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
-        let source = "\\begin{tikzpicture}\\end{tikzpicture}\n";
+        let source = "\\begin{tikzpicture}\\end{tikzpicture}";
         app.document.as_mut().unwrap().markdown =
-            crate::markdown::parse(&format!("a\n\n```tikz\n{source}```\n"));
+            crate::markdown::parse(&format!("a\n\n```tikz\n{source}\n```\n"));
         assert_eq!(app.pending_tikz(), vec![source.to_owned()]);
         app.tikz
             .insert(source.into(), TikzState::Failed("cached".into()));
         app.document.as_mut().unwrap().markdown =
-            crate::markdown::parse(&format!("changed\n\n```tikz\n{source}```\n"));
+            crate::markdown::parse(&format!("changed\n\n```tikz\n{source}\n```\n"));
         assert!(app.pending_tikz().is_empty());
         assert!(matches!(app.tikz.get(source), Some(TikzState::Failed(_))));
         app.document.as_mut().unwrap().markdown = crate::markdown::parse("no diagrams");

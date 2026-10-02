@@ -419,6 +419,19 @@ impl Block {
     }
 
     fn finish(&mut self) {
+        // Fenced code, HTML and front matter end with the newline before their closing line.
+        if matches!(
+            self.kind,
+            BlockKind::Code(_) | BlockKind::Html | BlockKind::Metadata
+        ) && self.text.ends_with('\n')
+        {
+            self.text.pop();
+            let end = self.text.len();
+            for span in &mut self.spans {
+                span.range.end = span.range.end.min(end);
+            }
+            self.spans.retain(|span| !span.range.is_empty());
+        }
         if self.kind == BlockKind::Paragraph && self.text == "\u{fffc}" && self.images.len() == 1 {
             let image = self.images.pop().unwrap();
             self.kind = BlockKind::Image(image.source);
@@ -491,6 +504,10 @@ mod tests {
         );
         assert_eq!(images.blocks[1].text, "前 \u{fffc} 后");
         assert_eq!(images.blocks[1].images[0].source, "inline.png");
+
+        let code = parse("```rust\nfn main() {}\n```\n\n<div>\nraw\n</div>\n");
+        assert_eq!(code.blocks[0].text, "fn main() {}");
+        assert_eq!(code.blocks[1].text, "<div>\nraw\n</div>");
 
         let raw = parse("`code` <span>raw</span> <!-- comment -->");
         assert!(raw.blocks[0].spans.iter().all(|span| span.code));
