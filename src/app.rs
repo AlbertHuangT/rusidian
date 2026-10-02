@@ -28,18 +28,38 @@ const GRID_PADDING: f32 = 12.0;
 
 actions!(
     rusidian,
-    [OpenFile, OpenFolder, OpenSettings, Quit, EnterSourceNormal]
+    [
+        OpenFile,
+        OpenFolder,
+        OpenSettings,
+        Quit,
+        CloseWindow,
+        EnterSourceNormal
+    ]
 );
+
+/// App shortcuts. macOS uses Command everywhere; on Linux Control belongs to Neovim in source
+/// view, so the shortcuts only apply while reading.
+fn key_bindings() -> Vec<KeyBinding> {
+    let (modifier, context) = if cfg!(target_os = "macos") {
+        ("cmd", None)
+    } else {
+        ("ctrl", Some("Reading"))
+    };
+    vec![
+        KeyBinding::new(&format!("{modifier}-o"), OpenFile, context),
+        KeyBinding::new(&format!("{modifier}-shift-o"), OpenFolder, context),
+        KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
+        KeyBinding::new(&format!("{modifier}-q"), Quit, context),
+        KeyBinding::new(&format!("{modifier}-w"), CloseWindow, context),
+        KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
+    ]
+}
 
 pub fn run(initial_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
         crate::fonts::init(cx);
-        cx.bind_keys([
-            KeyBinding::new("cmd-o", OpenFile, None),
-            KeyBinding::new("cmd-shift-o", OpenFolder, None),
-            KeyBinding::new("cmd-,", OpenSettings, None),
-            KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
-        ]);
+        cx.bind_keys(key_bindings());
         cx.set_menus([
             Menu::new("Rusidian").items([
                 MenuItem::action("设置…", OpenSettings),
@@ -49,6 +69,8 @@ pub fn run(initial_path: Option<PathBuf>) {
             Menu::new("文件").items([
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
+                MenuItem::separator(),
+                MenuItem::action("关闭窗口", CloseWindow),
             ]),
         ]);
 
@@ -80,12 +102,12 @@ pub fn run(initial_path: Option<PathBuf>) {
                         .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
                         .ok();
                 });
-                let close_app = app.downgrade();
-                window.on_window_should_close(cx, move |_, cx| {
-                    close_app
+                // The app has a single window, so closing it quits after Neovim agrees.
+                let close_window_app = app.downgrade();
+                cx.on_action(move |_: &CloseWindow, cx| {
+                    close_window_app
                         .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
                         .ok();
-                    false
                 });
                 app
             },
