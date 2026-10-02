@@ -196,9 +196,17 @@ struct RusidianApp {
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
+    /// A transient message for the status bar, such as a failed link or a completed copy.
+    notice: Option<Notice>,
+    notice_generation: u64,
     auto_update: bool,
     update_status: UpdateStatus,
     available_update: Option<Update>,
+}
+
+struct Notice {
+    text: SharedString,
+    error: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -298,6 +306,8 @@ impl RusidianApp {
             marked_text: String::new(),
             marked_selection: 0..0,
             settings_open: false,
+            notice: None,
+            notice_generation: 0,
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
             available_update: None,
@@ -472,6 +482,28 @@ impl RusidianApp {
     fn compile_visuals(&mut self, cx: &mut Context<Self>) {
         self.compile_tikz(cx);
         self.compile_math(cx);
+    }
+
+    fn show_notice(&mut self, text: impl Into<SharedString>, error: bool, cx: &mut Context<Self>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            error,
+        });
+        self.notice_generation += 1;
+        let generation = self.notice_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(6))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.notice_generation == generation && this.notice.take().is_some() {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
@@ -972,7 +1004,7 @@ impl RusidianApp {
                 .and_then(|vault| vault.resolve_note(destination))
         };
         let Some(path) = path else {
-            self.nvim_warning = Some(format!("找不到或无法唯一确定链接：{destination}").into());
+            self.show_notice(format!("找不到或无法唯一确定链接：{destination}"), true, cx);
             return;
         };
         self.request_close(
@@ -1152,6 +1184,9 @@ impl RusidianApp {
             return;
         }
         if self.view == View::Reading {
+            if self.notice.take().is_some() {
+                cx.notify();
+            }
             let key = event.keystroke.key_char.as_deref();
             if event.keystroke.key == "escape" {
                 self.reading_find = None;
@@ -1237,8 +1272,12 @@ impl RusidianApp {
                 if let Some(selection) = self.reading_selection.take()
                     && let Some(item) = self.selected_clipboard(selection)
                 {
+                    let message = match item.text() {
+                        Some(text) => format!("已复制 {} 个字符", text.chars().count()),
+                        None => "已复制图片".to_owned(),
+                    };
                     cx.write_to_clipboard(item);
-                    cx.notify();
+                    self.show_notice(message, false, cx);
                 }
                 self.reading_count = None;
                 return;
@@ -1607,6 +1646,102 @@ impl RusidianApp {
                         )
                     }),
             )
+            .into_any_element()
+    }
+
+    fn render_status_bar(&self, search_prompt: Option<String>) -> AnyElement {
+        let mode: SharedString = match self.view {
+            View::Reading => match self.reading_selection {
+                Some(selection) if selection.linewise => "V-LINE".into(),
+                Some(_) => "VISUAL".into(),
+                None => "阅读".into(),
+            },
+            View::Source if self.nvim.is_none() || self.nvim_error.is_some() => "源码".into(),
+            View::Source => source_mode_label(self.grid.mode()).into(),
+        };
+        let mut pending = String::new();
+        if self.view == View::Reading {
+            if let Some(count) = self.reading_count {
+                pending.push_str(&count.to_string());
+            }
+            if self.reading_pending_g {
+                pending.push('g');
+            }
+            if let Some(find) = self.reading_find {
+                pending.push(match (find.forward, find.till) {
+                    (true, false) => 'f',
+                    (false, false) => 'F',
+                    (true, true) => 't',
+                    (false, true) => 'T',
+                });
+            }
+        }
+        let hint = match self.view {
+            View::Reading if self.document.is_some() => "Enter 编辑",
+            View::Source if self.grid.is_normal() || self.nvim.is_none() => "Esc 返回阅读",
+            _ => "",
+        };
+        let message = if let Some(prompt) = search_prompt {
+            div()
+                .flex_1()
+                .min_w_0()
+                .font_family(crate::fonts::mono())
+                .text_color(rgb(0xe6e9ed))
+                .child(prompt)
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .when_some(self.notice.as_ref(), |element, notice| {
+                    element
+                        .text_color(rgb(if notice.error { 0xffa7b2 } else { 0xa4e4c7 }))
+                        .child(notice.text.clone())
+                })
+        };
+        div()
+            .flex_none()
+            .h(px(28.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_t_1()
+            .border_color(rgb(0x2a3038))
+            .bg(rgb(0x0c0f12))
+            .text_xs()
+            .text_color(rgb(0x98a2ad))
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .rounded_md()
+                    .bg(rgb(if self.view == View::Source {
+                        0x2b3a4a
+                    } else {
+                        0x3a2a20
+                    }))
+                    .text_color(rgb(if self.view == View::Source {
+                        0x9ecbff
+                    } else {
+                        0xffb07a
+                    }))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(mode),
+            )
+            .when(!pending.is_empty(), |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .font_family(crate::fonts::mono())
+                        .text_color(rgb(0xe6e9ed))
+                        .child(pending),
+                )
+            })
+            .child(message)
+            .child(div().flex_none().child(hint))
             .into_any_element()
     }
 
@@ -2250,18 +2385,7 @@ impl Render for RusidianApp {
                     ),
             )
             .child(body)
-            .when_some(search_prompt, |element, prompt| {
-                element.child(
-                    div()
-                        .h(px(32.0))
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .bg(rgb(0x1c2229))
-                        .font_family(crate::fonts::mono())
-                        .child(prompt),
-                )
-            })
+            .child(self.render_status_bar(search_prompt))
             .when_some(
                 (self.view == View::Reading)
                     .then_some(reading_focus)
@@ -2934,6 +3058,18 @@ fn render_inline_paragraph(
         .into_any_element()
 }
 
+/// A short label for Neovim's current mode, as shown in the status bar.
+fn source_mode_label(mode: &str) -> String {
+    match mode {
+        "" => "NORMAL".into(),
+        "operator" => "NORMAL".into(),
+        "visual_select" => "SELECT".into(),
+        mode if mode.starts_with("cmdline") => "COMMAND".into(),
+        mode if mode.ends_with("_hover") => "NORMAL".into(),
+        mode => mode.split('_').next().unwrap_or(mode).to_uppercase(),
+    }
+}
+
 fn is_object(block: &Block) -> bool {
     matches!(&block.kind, BlockKind::Image(_)) || block.kind == BlockKind::Math || is_tikz(block)
 }
@@ -3496,6 +3632,16 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn labels_neovim_modes() {
+        assert_eq!(source_mode_label("normal"), "NORMAL");
+        assert_eq!(source_mode_label("insert"), "INSERT");
+        assert_eq!(source_mode_label("visual"), "VISUAL");
+        assert_eq!(source_mode_label("cmdline_normal"), "COMMAND");
+        assert_eq!(source_mode_label("operator"), "NORMAL");
+        assert_eq!(source_mode_label("replace"), "REPLACE");
     }
 
     #[test]

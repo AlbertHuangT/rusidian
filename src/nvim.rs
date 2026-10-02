@@ -572,6 +572,10 @@ impl Grid {
         )
     }
 
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
     pub fn is_normal(&self) -> bool {
         self.mode.starts_with("normal")
     }
