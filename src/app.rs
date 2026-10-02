@@ -102,7 +102,7 @@ pub fn run(initial_path: Option<PathBuf>) {
             },
             |window, cx| {
                 let app = cx.new(|cx| {
-                    let mut app = RusidianApp::open(initial_path.as_deref());
+                    let mut app = RusidianApp::open_with_vault(initial_path.as_deref());
                     app.focus_handle = Some(cx.focus_handle());
                     app.compile_visuals(cx);
                     app.start_nvim(cx);
@@ -135,7 +135,14 @@ pub fn run(initial_path: Option<PathBuf>) {
                             let vault_root = app.vault.as_ref().and_then(|vault| {
                                 path.starts_with(&vault.root).then(|| vault.root.clone())
                             });
-                            app.request_close(PendingClose::Open { path, vault_root }, cx);
+                            app.request_close(
+                                PendingClose::Open {
+                                    path,
+                                    vault_root,
+                                    fragment: None,
+                                },
+                                cx,
+                            );
                         });
                         if opened.is_err() {
                             break;
@@ -229,6 +236,8 @@ enum PendingClose {
     Open {
         path: PathBuf,
         vault_root: Option<PathBuf>,
+        /// A heading or `^block` to reveal after opening.
+        fragment: Option<String>,
     },
     Quit,
     Restart,
@@ -686,16 +695,17 @@ impl RusidianApp {
             self.nvim = None;
         }
         match action {
-            PendingClose::Open { path, vault_root } => {
-                let focus = self.focus_handle.clone();
-                *self = Self::open(Some(&path));
-                if let Some(root) = vault_root
-                    && !path.is_dir()
-                    && let Ok(vault) = Vault::open(&root)
+            PendingClose::Open {
+                path,
+                vault_root,
+                fragment,
+            } => {
+                self.replace_document(&path, vault_root);
+                if let Some(fragment) = fragment
+                    && !self.reveal_fragment(&fragment)
                 {
-                    self.attach_vault(vault);
+                    self.show_notice(format!("找不到标题或块：{fragment}"), true, cx);
                 }
-                self.focus_handle = focus;
                 self.compile_visuals(cx);
                 self.start_nvim(cx);
                 cx.notify();
@@ -703,6 +713,76 @@ impl RusidianApp {
             PendingClose::Quit => cx.quit(),
             PendingClose::Restart => cx.restart(),
         }
+    }
+
+    /// Open a path; a note inside an Obsidian vault also loads that vault for links and embeds.
+    fn open_with_vault(path: Option<&Path>) -> Self {
+        let mut app = Self::open(path);
+        if app.vault.is_none()
+            && let Some(path) = path
+            && let Some(root) = crate::vault::enclosing_vault_root(path)
+            && let Ok(vault) = Vault::open(&root)
+        {
+            app.attach_vault(vault);
+        }
+        app
+    }
+
+    /// Load another document, keeping app-level state and the vault when it stays the same.
+    fn replace_document(&mut self, path: &Path, vault_root: Option<PathBuf>) {
+        let vault_root = vault_root.or_else(|| {
+            (!path.is_dir())
+                .then(|| crate::vault::enclosing_vault_root(path))
+                .flatten()
+        });
+        let vault = self
+            .vault
+            .take()
+            .filter(|vault| vault_root.as_ref() == Some(&vault.root));
+        let mut next = Self::open(Some(path));
+        if !path.is_dir()
+            && let Some(vault) =
+                vault.or_else(|| vault_root.and_then(|root| Vault::open(&root).ok()))
+        {
+            next.attach_vault(vault);
+        }
+        next.focus_handle = self.focus_handle.take();
+        next.nvim_size = self.nvim_size.clone();
+        next.cell_size = self.cell_size;
+        next.settings_open = self.settings_open;
+        next.auto_update = self.auto_update;
+        next.update_status = std::mem::replace(&mut self.update_status, UpdateStatus::Idle);
+        next.available_update = self.available_update.take();
+        *self = next;
+    }
+
+    /// Move the reading cursor to a heading (`#Heading`) or block reference (`#^id`).
+    fn reveal_fragment(&mut self, fragment: &str) -> bool {
+        let Some(document) = &self.document else {
+            return false;
+        };
+        let target = if let Some(id) = fragment.strip_prefix('^') {
+            let marker = format!("^{id}");
+            document.markdown.blocks.iter().position(|block| {
+                block
+                    .text
+                    .split_whitespace()
+                    .last()
+                    .is_some_and(|word| word == marker)
+            })
+        } else {
+            let wanted = heading_key(&crate::vault::percent_decode(fragment));
+            document.markdown.blocks.iter().position(|block| {
+                matches!(block.kind, BlockKind::Heading(_)) && heading_key(&block.text) == wanted
+            })
+        };
+        let Some(block) = target else {
+            return false;
+        };
+        self.reading_cursor = ReadingCursor { block, offset: 0 };
+        self.reading_column = None;
+        self.reveal_reading_cursor();
+        true
     }
 
     fn choose_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -741,6 +821,7 @@ impl RusidianApp {
                     PendingClose::Open {
                         path,
                         vault_root: None,
+                        fragment: None,
                     },
                     cx,
                 );
@@ -987,50 +1068,84 @@ impl RusidianApp {
 
     fn open_internal_link(&mut self, cx: &mut Context<Self>) {
         let Some(destination) = self.current_link() else {
+            self.show_notice("光标处没有链接", false, cx);
             return;
         };
-        if destination.contains("://") || destination.starts_with("mailto:") {
+        if is_external_link(&destination) {
+            self.show_notice("外部链接请用 gx 打开", false, cx);
             return;
         }
-        let destination = destination.split('#').next().unwrap_or_default();
-        if destination.is_empty() {
-            return;
-        }
+        let (target, fragment) = crate::vault::split_fragment(&destination);
         let Some(document) = &self.document else {
             return;
         };
-        let direct = document
-            .file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(destination);
-        let path = if direct.is_file() {
-            Some(direct)
-        } else if direct.extension().is_none() && direct.with_extension("md").is_file() {
-            Some(direct.with_extension("md"))
-        } else {
-            self.vault
-                .as_ref()
-                .and_then(|vault| vault.resolve_note(destination))
-        };
-        let Some(path) = path else {
-            self.show_notice(format!("找不到或无法唯一确定链接：{destination}"), true, cx);
+        if target.is_empty() {
+            if let Some(fragment) = fragment
+                && !self.reveal_fragment(fragment)
+            {
+                self.show_notice(format!("找不到标题或块：{fragment}"), true, cx);
+            }
+            return;
+        }
+        let Some(path) = crate::vault::resolve_target(&document.file, self.vault.as_ref(), target)
+        else {
+            self.show_notice(format!("找不到或无法唯一确定链接：{target}"), true, cx);
             return;
         };
+        if same_file(&path, &document.file) {
+            if let Some(fragment) = fragment
+                && !self.reveal_fragment(fragment)
+            {
+                self.show_notice(format!("找不到标题或块：{fragment}"), true, cx);
+            }
+            return;
+        }
+        if !crate::vault::is_markdown(&path) && !is_text_file(&path) {
+            cx.open_with_system(&path);
+            self.show_notice(
+                format!("已用系统应用打开 {}", display_name(&path)),
+                false,
+                cx,
+            );
+            return;
+        }
         self.request_close(
             PendingClose::Open {
+                vault_root: self
+                    .vault
+                    .as_ref()
+                    .filter(|vault| path.starts_with(&vault.root))
+                    .map(|vault| vault.root.clone()),
                 path,
-                vault_root: self.vault.as_ref().map(|vault| vault.root.clone()),
+                fragment: fragment.map(str::to_owned),
             },
             cx,
         );
     }
 
-    fn open_external_link(&self, cx: &mut Context<Self>) {
-        if let Some(destination) = self.current_link()
-            && (destination.contains("://") || destination.starts_with("mailto:"))
-        {
+    /// Vim's `gx`: open the link under the cursor with the system handler.
+    fn open_external_link(&mut self, cx: &mut Context<Self>) {
+        let Some(destination) = self.current_link() else {
+            self.show_notice("光标处没有链接", false, cx);
+            return;
+        };
+        if is_external_link(&destination) {
             cx.open_url(&destination);
+            return;
+        }
+        let (target, _) = crate::vault::split_fragment(&destination);
+        match self.document.as_ref().and_then(|document| {
+            crate::vault::resolve_target(&document.file, self.vault.as_ref(), target)
+        }) {
+            Some(path) => {
+                cx.open_with_system(&path);
+                self.show_notice(
+                    format!("已用系统应用打开 {}", display_name(&path)),
+                    false,
+                    cx,
+                );
+            }
+            None => self.show_notice(format!("找不到或无法唯一确定链接：{target}"), true, cx),
         }
     }
 
@@ -1337,7 +1452,10 @@ impl RusidianApp {
                         self.open_internal_link(cx);
                         cx.notify();
                     }
-                    Some("x") => self.open_external_link(cx),
+                    Some("x") => {
+                        self.open_external_link(cx);
+                        cx.notify();
+                    }
                     _ => self.reading_count = None,
                 }
                 return;
@@ -2340,6 +2458,7 @@ impl Render for RusidianApp {
                                                 PendingClose::Open {
                                                     path: file.clone(),
                                                     vault_root: Some(vault_root.clone()),
+                                                    fragment: None,
                                                 },
                                                 cx,
                                             );
@@ -3093,6 +3212,50 @@ fn render_inline_paragraph(
         .into_any_element()
 }
 
+fn is_external_link(destination: &str) -> bool {
+    destination.contains("://") || destination.starts_with("mailto:")
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether a linked file can be edited as text: valid UTF-8 without NUL bytes near the start.
+fn is_text_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if file.take(8192).read_to_end(&mut head).is_err() || head.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(&head) {
+        Ok(_) => true,
+        // A multi-byte character may be cut at the 8 KiB boundary.
+        Err(error) => error.error_len().is_none(),
+    }
+}
+
+/// Normalize headings the way link fragments refer to them: case-insensitive, with spaces,
+/// hyphens and punctuation ignored.
+fn heading_key(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// A short label for Neovim's current mode, as shown in the status bar.
 fn source_mode_label(mode: &str) -> String {
     match mode {
@@ -3667,6 +3830,29 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn reveals_heading_and_block_fragments() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        app.document.as_mut().unwrap().markdown =
+            crate::markdown::parse("# Intro\n\ntext\n\n## Second Part\n\nquoted line ^abc123\n");
+        assert!(app.reveal_fragment("Second%20Part"));
+        assert_eq!(
+            app.reading_cursor,
+            ReadingCursor {
+                block: 2,
+                offset: 0
+            }
+        );
+        assert!(app.reveal_fragment("second-part"));
+        assert!(app.reveal_fragment("^abc123"));
+        assert_eq!(app.reading_cursor.block, 3);
+        assert!(!app.reveal_fragment("Missing"));
+        assert_eq!(heading_key("Hello, World!"), heading_key("hello-world"));
+        assert!(is_text_file(Path::new("README.md")));
+        assert!(!is_text_file(Path::new("assets/app-icon.png")));
+        assert!(is_external_link("https://example.com") && !is_external_link("note.md"));
     }
 
     #[test]
