@@ -1530,8 +1530,33 @@ impl RusidianApp {
 
     /// A click in the reading view: move the cursor there and follow a link under it.
     fn click_reading(&mut self, block: usize, offset: usize, cx: &mut Context<Self>) {
-        if self.view != View::Reading || self.settings_open {
+        if !self.place_reading_cursor(block, offset) {
             return;
+        }
+        if let Some(destination) = self.current_link() {
+            if is_external_link(&destination) {
+                cx.open_url(&destination);
+            } else {
+                self.open_internal_link(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A click beside the text (between blocks, in margins, on list markers): the cursor goes
+    /// to the nearest position, without following a link there.
+    fn click_nearest(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(cursor) = self.reading_position_at(position.x, position.y, true)
+            && self.place_reading_cursor(cursor.block, cursor.offset)
+        {
+            cx.notify();
+        }
+    }
+
+    /// Put the reading cursor where the user clicked, ending a selection, search or count.
+    fn place_reading_cursor(&mut self, block: usize, offset: usize) -> bool {
+        if self.view != View::Reading || self.settings_open {
+            return false;
         }
         let Some(length) = self
             .document
@@ -1540,7 +1565,7 @@ impl RusidianApp {
             .map(block_len)
             .filter(|length| *length > 0)
         else {
-            return;
+            return false;
         };
         self.reading_cursor = ReadingCursor {
             block,
@@ -1553,14 +1578,7 @@ impl RusidianApp {
         self.reading_count = None;
         self.reading_find = None;
         self.notice = None;
-        if let Some(destination) = self.current_link() {
-            if is_external_link(&destination) {
-                cx.open_url(&destination);
-            } else {
-                self.open_internal_link(cx);
-            }
-        }
-        cx.notify();
+        true
     }
 
     fn current_tab(&self) -> Option<usize> {
@@ -4277,6 +4295,12 @@ impl Render for RusidianApp {
                 .p_8()
                 .text_base()
                 .track_scroll(&self.reading_scroll)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.click_nearest(event.position, cx);
+                    }),
+                )
                 .children(children)
                 .child({
                     // Prepainted after every block: from here on this frame's text layouts can be
@@ -4831,8 +4855,14 @@ impl RenderContext<'_> {
         let view = self.view.clone();
         let block = self.block_index;
         move |_, _, cx| {
-            view.update(cx, |this, cx| this.click_reading(block, offset, cx))
-                .ok();
+            // Handled here, not by the view's nearest-position fallback; embeds' inert views
+            // fail and leave the click to the embed itself.
+            if view
+                .update(cx, |this, cx| this.click_reading(block, offset, cx))
+                .is_ok()
+            {
+                cx.stop_propagation();
+            }
         }
     }
 }
@@ -5378,8 +5408,12 @@ fn styled_fragment(
                     .map_or(0, |(index, _)| index);
             }
             let offset = before + visible_offset(&fragment, byte);
-            view.update(cx, |this, cx| this.click_reading(index, offset, cx))
-                .ok();
+            if view
+                .update(cx, |this, cx| this.click_reading(index, offset, cx))
+                .is_ok()
+            {
+                cx.stop_propagation();
+            }
         })
         .child(text)
         .into_any_element()
