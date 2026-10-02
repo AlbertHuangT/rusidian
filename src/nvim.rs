@@ -236,7 +236,14 @@ impl Client {
                     Err(error) => {
                         let _ = event_sender
                             .send(Event::Error(if error.kind() == std::io::ErrorKind::NotFound {
-                                "找不到 Neovim（nvim）。请先安装 Neovim，例如在终端运行 brew install neovim，然后按 Enter 重试。".to_owned()
+                                format!(
+                                    "找不到 Neovim（nvim）。请先安装 Neovim，例如在终端运行 {}，然后按 Enter 重试。",
+                                    if cfg!(target_os = "macos") {
+                                        "brew install neovim"
+                                    } else {
+                                        "sudo apt install neovim（或用系统的包管理器）"
+                                    }
+                                )
                             } else {
                                 format!("无法启动 Neovim：{error}")
                             }))
