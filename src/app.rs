@@ -7,9 +7,9 @@ use crate::update;
 use crate::vault::{TreeRow, Vault};
 use cargo_packager_updater::Update;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, KeyBinding,
-    KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
+    AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context, ElementInputHandler,
+    EntityInputHandler, FocusHandle, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
+    KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent,
     SharedString, Size, StrikethroughStyle, StyledText, TextLayout, UTF16Selection, UnderlineStyle,
     WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*,
@@ -43,6 +43,7 @@ actions!(
         OpenFolder,
         OpenSettings,
         Quit,
+        NewWindow,
         CloseWindow,
         CloseTab,
         NextTab,
@@ -65,6 +66,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&format!("{modifier}-shift-o"), OpenFolder, context),
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
         KeyBinding::new(&format!("{modifier}-q"), Quit, context),
+        KeyBinding::new(&format!("{modifier}-n"), NewWindow, context),
         KeyBinding::new(&format!("{modifier}-w"), CloseTab, context),
         KeyBinding::new(&format!("{modifier}-shift-w"), CloseWindow, context),
         KeyBinding::new("ctrl-tab", NextTab, context),
@@ -122,6 +124,7 @@ pub fn run(initial_path: Option<PathBuf>) {
                 MenuItem::action("退出 Rusidian", Quit),
             ]),
             Menu::new("文件").items([
+                MenuItem::action("新建窗口", NewWindow),
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
                 MenuItem::separator(),
@@ -135,95 +138,153 @@ pub fn run(initial_path: Option<PathBuf>) {
                 MenuItem::action("上一个标签", PreviousTab),
             ]),
         ]);
+        cx.on_action(|_: &NewWindow, cx| {
+            open_window(None, false, cx);
+        });
+        // Quitting asks every window's Neovim in turn; one refusal keeps the rest open.
+        cx.on_action(|_: &Quit, cx| close_next_window(Some(PendingClose::Quit), cx));
 
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+        if open_window(initial_path, true, cx).is_none() {
+            eprintln!("failed to open Rusidian window");
+            cx.quit();
+            return;
+        }
+        cx.spawn(async move |cx| {
+            while let Ok(path) = opened.recv().await {
+                cx.update(|cx| open_in_window(path, cx));
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
+}
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| {
-                let app = cx.new(|cx| {
-                    let mut app = RusidianApp::open_with_vault(initial_path.as_deref());
-                    if let Some(path) = &initial_path {
-                        app.remember_recent(path);
-                    }
-                    app.focus_handle = Some(cx.focus_handle());
-                    app.compile_visuals(cx);
-                    app.start_nvim(cx);
-                    if app.auto_update && update::is_packaged_app() {
-                        app.check_for_updates(true, cx);
-                    }
-                    app
-                });
-                window
-                    .observe_window_appearance(|window, _| window.refresh())
-                    .detach();
-                // Pick up edits made outside Rusidian (sync tools, git) when the window returns.
-                app.update(cx, |_, cx| {
-                    cx.observe_window_activation(window, |this, window, _| {
-                        if window.is_window_active()
-                            && let Some(nvim) = &this.nvim
-                        {
+/// Open a window showing `path`, or the welcome screen. Each window runs its own Neovim.
+fn open_window(path: Option<PathBuf>, first: bool, cx: &mut App) -> Option<AnyWindowHandle> {
+    // Cascade new windows so they do not hide the ones already open.
+    let shift = px(28.0 * cx.windows().len() as f32);
+    let mut bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+    bounds.origin = point(bounds.origin.x + shift, bounds.origin.y + shift);
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            ..Default::default()
+        },
+        |window, cx| {
+            let handle = window.window_handle();
+            let app = cx.new(|cx| {
+                let mut app = RusidianApp::open_with_vault(path.as_deref());
+                if let Some(path) = &path {
+                    app.remember_recent(path);
+                }
+                app.window = Some(handle);
+                app.focus_handle = Some(cx.focus_handle());
+                app.compile_visuals(cx);
+                app.start_nvim(cx);
+                if first && app.auto_update && update::is_packaged_app() {
+                    app.check_for_updates(true, cx);
+                }
+                app
+            });
+            window
+                .observe_window_appearance(|window, _| window.refresh())
+                .detach();
+            app.update(cx, |_, cx| {
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active() {
+                        // Settings may have changed in another window.
+                        this.load_settings();
+                        // Pick up edits made outside Rusidian (sync tools, git).
+                        if let Some(nvim) = &this.nvim {
                             nvim.check_time();
                         }
-                    })
-                    .detach();
-                });
-                let focus = app.read(cx).focus_handle.clone();
-                if let Some(focus) = focus {
-                    window.focus(&focus, cx);
-                }
-                let quit_app = app.downgrade();
-                cx.on_action(move |_: &Quit, cx| {
-                    quit_app
-                        .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
-                        .ok();
-                });
-                // The app has a single window, so closing it quits after Neovim agrees.
-                let close_window_app = app.downgrade();
-                cx.on_action(move |_: &CloseWindow, cx| {
-                    close_window_app
-                        .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
-                        .ok();
-                });
-                let open_app = app.downgrade();
-                cx.spawn(async move |cx| {
-                    while let Ok(path) = opened.recv().await {
-                        let opened = open_app.update(cx, |app, cx| {
-                            let vault_root = app.vault.as_ref().and_then(|vault| {
-                                path.starts_with(&vault.root).then(|| vault.root.clone())
-                            });
-                            app.request_close(
-                                PendingClose::Open {
-                                    path,
-                                    vault_root,
-                                    fragment: None,
-                                },
-                                cx,
-                            );
-                        });
-                        if opened.is_err() {
-                            break;
-                        }
+                        cx.notify();
                     }
                 })
                 .detach();
-                let close_app = app.downgrade();
-                window.on_window_should_close(cx, move |_, cx| {
-                    close_app
-                        .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
-                        .ok();
-                    false
-                });
-                app
-            },
-        )
-        .expect("failed to open Rusidian window");
+            });
+            let focus = app.read(cx).focus_handle.clone();
+            if let Some(focus) = focus {
+                window.focus(&focus, cx);
+            }
+            let close_app = app.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                close_app
+                    .update(cx, |app, cx| {
+                        app.request_close(PendingClose::CloseWindow, cx)
+                    })
+                    .ok();
+                false
+            });
+            app
+        },
+    );
+    handle.ok().map(Into::into)
+}
 
-        cx.activate(true);
-    });
+/// The window an opened file goes to: the active one, else any, else a new one.
+fn open_in_window(path: PathBuf, cx: &mut App) {
+    let target = cx
+        .active_window()
+        .and_then(|window| window.downcast::<RusidianApp>())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<RusidianApp>())
+        });
+    let Some(target) = target else {
+        open_window(Some(path), false, cx);
+        return;
+    };
+    target
+        .update(cx, |app, window, cx| {
+            window.activate_window();
+            let vault_root = app
+                .vault
+                .as_ref()
+                .and_then(|vault| path.starts_with(&vault.root).then(|| vault.root.clone()));
+            app.request_close(
+                PendingClose::Open {
+                    path,
+                    vault_root,
+                    fragment: None,
+                },
+                cx,
+            );
+        })
+        .ok();
+}
+
+/// Continue closing windows after one closed: `then` (quit or restart) goes on to the next
+/// window; with none left the app quits, or restarts.
+fn close_next_window(then: Option<PendingClose>, cx: &mut App) {
+    let next = cx
+        .windows()
+        .into_iter()
+        .find_map(|window| window.downcast::<RusidianApp>());
+    match (next, then) {
+        (Some(next), Some(action)) => {
+            next.update(cx, |app, _, cx| app.request_close(action, cx))
+                .ok();
+        }
+        (Some(_), None) => {}
+        (None, Some(PendingClose::Restart)) => cx.restart(),
+        (None, _) => cx.quit(),
+    }
+}
+
+/// Bring every window's copy of the settings up to date after one window changed them.
+fn sync_settings(cx: &mut App) {
+    for window in cx.windows() {
+        if let Some(window) = window.downcast::<RusidianApp>() {
+            window
+                .update(cx, |app, _, cx| {
+                    app.load_settings();
+                    cx.notify();
+                })
+                .ok();
+        }
+    }
 }
 
 struct Document {
@@ -293,6 +354,8 @@ struct RusidianApp {
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
+    /// The window showing this app, to close it once Neovim agrees.
+    window: Option<AnyWindowHandle>,
     appearance: Appearance,
     reading_key: ReadingKey,
     /// Neovim's Normal-mode `<Esc>` mapping, which the reading key may shadow.
@@ -353,7 +416,11 @@ enum PendingClose {
         /// A heading or `^block` to reveal after opening.
         fragment: Option<String>,
     },
+    /// Close this window; the app quits when it was the last one.
+    CloseWindow,
+    /// Close every window, then quit.
     Quit,
+    /// Close every window, then restart (after installing an update).
     Restart,
 }
 
@@ -439,6 +506,7 @@ impl RusidianApp {
             marked_text: String::new(),
             marked_selection: 0..0,
             settings_open: false,
+            window: None,
             appearance: settings.appearance,
             reading_key: settings.reading_key,
             escape_mapping: None,
@@ -886,6 +954,7 @@ impl RusidianApp {
         if let Err(error) = crate::settings::update(|settings| settings.reading_key = key) {
             self.show_notice(error, true, cx);
         }
+        cx.defer(sync_settings);
         if key != ReadingKey::Escape
             && self
                 .nvim_warning
@@ -923,6 +992,7 @@ impl RusidianApp {
         if let Err(error) = crate::settings::update(|settings| settings.appearance = appearance) {
             self.show_notice(error, true, cx);
         }
+        cx.defer(sync_settings);
         cx.notify();
     }
 
@@ -1020,6 +1090,14 @@ impl RusidianApp {
                             this.pending_close = None;
                             this.nvim_warning = Some(warning.into());
                             this.view = View::Source;
+                            // Quitting may have started from another window; show why it stopped.
+                            if let Some(handle) = this.window {
+                                cx.defer(move |cx| {
+                                    handle
+                                        .update(cx, |_, window, _| window.activate_window())
+                                        .ok();
+                                });
+                            }
                             cx.notify();
                         }
                         NvimEvent::Cursor { line, column } => {
@@ -1164,8 +1242,41 @@ impl RusidianApp {
                 self.start_nvim(cx);
                 cx.notify();
             }
-            PendingClose::Quit => cx.quit(),
-            PendingClose::Restart => cx.restart(),
+            PendingClose::CloseWindow => self.close_window(None, cx),
+            PendingClose::Quit => self.close_window(Some(PendingClose::Quit), cx),
+            PendingClose::Restart => self.close_window(Some(PendingClose::Restart), cx),
+        }
+    }
+
+    /// Remove this window now that its Neovim has exited, then carry `then` to the others.
+    fn close_window(&mut self, then: Option<PendingClose>, cx: &mut Context<Self>) {
+        let Some(handle) = self.window else {
+            return;
+        };
+        // The window cannot remove itself while it is being updated.
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+            close_next_window(then, cx);
+        });
+    }
+
+    /// Re-read settings another window may have changed.
+    fn load_settings(&mut self) {
+        let settings = crate::settings::load();
+        self.appearance = settings.appearance;
+        self.reading_key = settings.reading_key;
+        self.recent = settings.recent;
+        self.remote_image_vaults = settings.remote_image_vaults;
+        self.auto_update = settings.auto_update;
+        if self.reading_key != ReadingKey::Escape
+            && self
+                .nvim_warning
+                .as_ref()
+                .is_some_and(|warning| warning.starts_with(ESCAPE_MAPPED_PREFIX))
+        {
+            self.nvim_warning = None;
         }
     }
 
@@ -1201,6 +1312,7 @@ impl RusidianApp {
             next.attach_vault(vault);
         }
         next.focus_handle = self.focus_handle.take();
+        next.window = self.window;
         next.nvim_size = self.nvim_size.clone();
         next.cell_size = self.cell_size;
         next.grid_origin = self.grid_origin.clone();
@@ -1297,7 +1409,7 @@ impl RusidianApp {
             (Some(nvim), Some(document)) if self.open_buffers.len() > 1 => {
                 nvim.close_buffer(document.file.clone());
             }
-            _ => self.request_close(PendingClose::Quit, cx),
+            _ => self.request_close(PendingClose::CloseWindow, cx),
         }
     }
 
@@ -4106,6 +4218,9 @@ impl Render for RusidianApp {
             .on_action(cx.listener(Self::choose_folder))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_tab(cx)))
+            .on_action(cx.listener(|this, _: &CloseWindow, _, cx| {
+                this.request_close(PendingClose::CloseWindow, cx);
+            }))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(false, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
