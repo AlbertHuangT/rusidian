@@ -4278,7 +4278,9 @@ impl RusidianApp {
         let theme = self.theme;
         let hits = self.backlinks.as_ref()?.1.as_ref()?;
         let vault_root = self.vault.as_ref().map(|vault| vault.root.clone());
-        let rows = hits.iter().enumerate().map(|(index, hit)| {
+        // A hub note can have hundreds; every row is drawn on each frame.
+        const SHOWN: usize = 100;
+        let rows = hits.iter().take(SHOWN).enumerate().map(|(index, hit)| {
             let path = hit.path.clone();
             let line = hit.line;
             let vault_root = vault_root.clone();
@@ -4355,6 +4357,19 @@ impl RusidianApp {
                         }),
                 )
                 .children(rows)
+                .when(hits.len() > SHOWN, |element| {
+                    element.child(div().px_3().text_sm().text_color(rgb(theme.faint)).child(
+                        format!(
+                            "还有 {} 处，可用 {} 搜索",
+                            hits.len() - SHOWN,
+                            if cfg!(target_os = "macos") {
+                                "⌘⇧F"
+                            } else {
+                                "Ctrl+Shift+F"
+                            }
+                        ),
+                    ))
+                })
                 .into_any_element(),
         )
     }
