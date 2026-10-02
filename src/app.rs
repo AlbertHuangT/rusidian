@@ -445,6 +445,8 @@ struct RusidianApp {
     embeds: HashMap<PathBuf, EmbeddedNote>,
     /// Link destinations in the note that name no existing file, shown dimmed like Obsidian.
     unresolved_links: HashSet<String>,
+    /// Lines of other notes linking to the note shown, found for that note's path.
+    backlinks: Option<(PathBuf, Vec<TextHit>)>,
     /// Vaults whose remote images load automatically.
     remote_image_vaults: Vec<PathBuf>,
     auto_update: bool,
@@ -585,6 +587,71 @@ fn search_notes(files: &[PathBuf], root: Option<&Path>, query: &str, limit: usiz
             });
             if hits.len() >= limit {
                 return hits;
+            }
+        }
+    }
+    hits
+}
+
+/// Lines of `files` (other notes of the vault at `root`) that link to `note`: wikilinks and
+/// embeds by name or vault path, as Obsidian resolves them, and Markdown links by file path.
+fn find_backlinks(files: &[PathBuf], root: &Path, note: &Path) -> Vec<TextHit> {
+    let stem = note
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let relative = note
+        .strip_prefix(root)
+        .unwrap_or(note)
+        .with_extension("")
+        .to_string_lossy()
+        .to_lowercase();
+    let wiki_target = |target: &str| {
+        let target = crate::vault::split_fragment(target).0.trim();
+        let target = target.strip_suffix(".md").unwrap_or(target).to_lowercase();
+        target == stem || target == relative || relative.ends_with(&format!("/{target}"))
+    };
+    let mut hits = Vec::new();
+    for path in files.iter().filter(|path| *path != note) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let folder = path.parent().unwrap_or(root);
+        let links_here = |line: &str| {
+            line.split("[[").skip(1).any(|rest| {
+                rest.split_once("]]")
+                    .is_some_and(|(inside, _)| wiki_target(inside.split('|').next().unwrap_or("")))
+            }) || line.split("](").skip(1).any(|rest| {
+                let destination = rest.split(')').next().unwrap_or("");
+                let destination = crate::vault::percent_decode(
+                    crate::vault::split_fragment(destination.trim()).0,
+                );
+                !destination.is_empty()
+                    && !destination.contains("://")
+                    && folder
+                        .join(&destination)
+                        .canonicalize()
+                        .is_ok_and(|target| target == note)
+            })
+        };
+        let relative_path = path.strip_prefix(root).unwrap_or(path);
+        for (line, content) in text.lines().enumerate() {
+            if links_here(content) {
+                hits.push(TextHit {
+                    path: path.clone(),
+                    name: relative_path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    folder: relative_path
+                        .parent()
+                        .map(|folder| folder.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    line,
+                    text: hit_excerpt(content, "[["),
+                });
             }
         }
     }
@@ -739,6 +806,7 @@ impl RusidianApp {
             remote_images: HashMap::new(),
             embeds: HashMap::new(),
             unresolved_links: HashSet::new(),
+            backlinks: None,
             remote_image_vaults: settings.remote_image_vaults,
             auto_update: settings.auto_update,
             update_status: UpdateStatus::Idle,
@@ -950,6 +1018,7 @@ impl RusidianApp {
         // First: embedded notes' diagrams and formulas compile with the note's own.
         self.load_embeds();
         self.find_unresolved_links();
+        self.load_backlinks(cx);
         self.compile_tikz(cx);
         self.compile_math(cx);
         self.load_allowed_remote_images(cx);
@@ -1003,6 +1072,46 @@ impl RusidianApp {
                 .insert(path, EmbeddedNote { modified, markdown });
             self.invalidate_block_heights();
         }
+    }
+
+    /// Find the vault's notes linking to the note shown, in the background, once per note.
+    fn load_backlinks(&mut self, cx: &mut Context<Self>) {
+        let (Some(vault), Some(document)) = (&self.vault, &self.document) else {
+            self.backlinks = None;
+            return;
+        };
+        let note = document
+            .file
+            .canonicalize()
+            .unwrap_or_else(|_| document.file.clone());
+        if !document.is_markdown
+            || self
+                .backlinks
+                .as_ref()
+                .is_some_and(|(path, _)| *path == note)
+        {
+            return;
+        }
+        self.backlinks = Some((note.clone(), Vec::new()));
+        let files = vault.files.clone();
+        let root = vault.root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let target = note.clone();
+            let hits = executor
+                .spawn(async move { find_backlinks(&files, &root, &target) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some((path, found)) = &mut this.backlinks
+                    && *path == note
+                {
+                    *found = hits;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn find_unresolved_links(&mut self) {
@@ -4005,6 +4114,92 @@ impl RusidianApp {
         cx.stop_propagation();
     }
 
+    /// Notes linking to this one, under its last block.
+    fn render_backlinks(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = self.theme;
+        let (_, hits) = self.backlinks.as_ref()?;
+        let vault_root = self.vault.as_ref().map(|vault| vault.root.clone());
+        let rows = hits.iter().enumerate().map(|(index, hit)| {
+            let path = hit.path.clone();
+            let line = hit.line;
+            let vault_root = vault_root.clone();
+            div()
+                .id(("backlink", index))
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|element| element.bg(rgb(theme.hover)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.request_close(
+                        PendingClose::Open {
+                            path: path.clone(),
+                            vault_root: vault_root.clone(),
+                            fragment: Some(line_fragment(line)),
+                        },
+                        cx,
+                    );
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap_3()
+                        .child(div().text_color(rgb(theme.accent)).child(hit.name.clone()))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(theme.faint))
+                                .child(hit.folder.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_sm()
+                        .text_color(rgb(theme.muted))
+                        .child(hit.text.clone()),
+                )
+        });
+        let notes = hits
+            .iter()
+            .map(|hit| &hit.path)
+            .collect::<HashSet<_>>()
+            .len();
+        Some(
+            div()
+                .mx_auto()
+                .w_full()
+                .max_w(px(820.0))
+                .flex_none()
+                .mt_8()
+                .pt_4()
+                .border_t_1()
+                .border_color(rgb(theme.border))
+                .flex()
+                .flex_col()
+                .gap_1()
+                // Not text: the reading cursor stays where it is.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .mb_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme.muted))
+                        .child(if hits.is_empty() {
+                            "反向链接：没有其他笔记链接到这里".to_owned()
+                        } else {
+                            format!("反向链接 · {notes} 个笔记")
+                        }),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
     fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let Some(switcher) = self.switcher.as_ref() else {
@@ -4947,12 +5142,14 @@ impl Render for RusidianApp {
                 .children(children)
                 .child({
                     // Prepainted after every block: from here on this frame's text layouts can be
-                    // queried. Kept last so child indices match `BlockHeights::children`.
+                    // queried. Right after the blocks so child indices match
+                    // `BlockHeights::children`.
                     let ready = self.layouts_ready.clone();
                     canvas(move |_, _, _| ready.set(true), |_, _, _, _| {})
                         .absolute()
                         .size_0()
                 })
+                .children(self.render_backlinks(cx))
                 .into_any_element()
         } else {
             div()
@@ -7238,6 +7435,39 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn finds_backlinks() {
+        let root = std::env::temp_dir().join(format!("rusidian-backlinks-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let note = root.join("sub/Target.md");
+        std::fs::write(&note, "# Target\n[[Target]] links itself\n").unwrap();
+        std::fs::write(
+            root.join("a.md"),
+            "See [[target]].\nAlias [[sub/Target|here]] and ![[Target#Part]].\nNot [[Targets]].\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.md"),
+            "Markdown [link](sub/Target.md) and [web](https://x.org)\n",
+        )
+        .unwrap();
+        let files = [root.join("a.md"), root.join("b.md"), note.clone()];
+        let found: Vec<_> = find_backlinks(&files, &root, &note)
+            .into_iter()
+            .map(|hit| (hit.name, hit.line))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("a".to_owned(), 0),
+                ("a".to_owned(), 1),
+                ("b".to_owned(), 0)
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
