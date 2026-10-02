@@ -5243,10 +5243,13 @@ fn fragment_highlights(
                     HighlightStyle {
                         font_weight: span.bold.then_some(FontWeight::BOLD),
                         font_style: span.italic.then_some(FontStyle::Italic),
+                        color: span.tag.then(|| rgb(theme.accent_soft_text).into()),
                         background_color: if span.code {
                             Some(rgb(theme.inline_code).into())
                         } else if span.highlight {
                             Some(rgb(theme.highlight).into())
+                        } else if span.tag {
+                            Some(rgb(theme.accent_soft_bg).into())
                         } else {
                             None
                         },

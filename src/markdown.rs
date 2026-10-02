@@ -84,6 +84,8 @@ pub struct Span {
     pub strike: bool,
     /// Obsidian `==highlight==`.
     pub highlight: bool,
+    /// An Obsidian `#tag`.
+    pub tag: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -327,8 +329,8 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 } else {
                     let block = current
                         .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items));
-                    // Bare URLs become links, as in Obsidian, except in code and inside links.
-                    let linkify = link.is_none()
+                    // Bare URLs and #tags are marked, as in Obsidian, except in code and links.
+                    let marks = link.is_none()
                         && !matches!(
                             block.kind,
                             BlockKind::Code(_) | BlockKind::Html | BlockKind::Metadata
@@ -346,7 +348,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                                 &text[piece.clone()],
                                 (bold > 0, italic > 0, strike > 0),
                                 link.as_deref(),
-                                linkify,
+                                marks,
                             );
                             let pushed = start..block.text.len();
                             if kind == Inline::Highlight {
@@ -357,6 +359,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                                     code: false,
                                     strike: false,
                                     highlight: true,
+                                    tag: false,
                                 });
                             }
                             block.map_source(
@@ -371,7 +374,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                             &text,
                             (bold > 0, italic > 0, strike > 0),
                             link.as_deref(),
-                            linkify,
+                            marks,
                         );
                     }
                 }
@@ -605,6 +608,24 @@ fn bare_urls(text: &str) -> Vec<Range<usize>> {
     urls
 }
 
+/// Obsidian tags: `#` starting a word, then letters, digits, `_`, `-` or `/`, not only digits.
+fn tags(text: &str) -> Vec<Range<usize>> {
+    text.match_indices('#')
+        .filter_map(|(start, _)| {
+            let starts_word = text[..start].chars().next_back().is_none_or(|character| {
+                character.is_whitespace() || is_wide_punctuation(character)
+            });
+            let name = &text[start + 1..];
+            let length = name
+                .find(|character: char| !(character.is_alphanumeric() || "_-/".contains(character)))
+                .unwrap_or(name.len());
+            let name = &name[..length];
+            (starts_word && !name.is_empty() && !name.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| start..start + 1 + length)
+        })
+        .collect()
+}
+
 /// Full-width (CJK) punctuation, which ends a bare URL written in Chinese text.
 fn is_wide_punctuation(character: char) -> bool {
     matches!(
@@ -618,29 +639,50 @@ fn is_wide_punctuation(character: char) -> bool {
 }
 
 impl Block {
-    /// Push text with its emphasis (bold, italic, strike), linking bare URLs when `linkify`.
+    /// Push text with its emphasis (bold, italic, strike). With `marks`, bare URLs become
+    /// links and `#tags` are marked.
     fn push_text(
         &mut self,
         text: &str,
         (bold, italic, strike): (bool, bool, bool),
         link: Option<&str>,
-        linkify: bool,
+        marks: bool,
     ) {
-        let urls = if linkify { bare_urls(text) } else { Vec::new() };
+        // Marked pieces in order; `true` for a URL, `false` for a tag.
+        let mut pieces: Vec<(Range<usize>, bool)> = Vec::new();
+        if marks {
+            let urls = bare_urls(text);
+            let tags = tags(text).into_iter().filter(|tag| {
+                !urls
+                    .iter()
+                    .any(|url| url.start < tag.end && tag.start < url.end)
+            });
+            pieces.extend(tags.map(|tag| (tag, false)));
+            pieces.extend(urls.into_iter().map(|url| (url, true)));
+            pieces.sort_by_key(|(range, _)| range.start);
+        }
         let mut start = 0;
-        for url in urls {
-            if start < url.start {
-                self.push(&text[start..url.start], bold, italic, false, strike, link);
+        for (range, url) in pieces {
+            if start < range.start {
+                self.push(&text[start..range.start], bold, italic, false, strike, link);
             }
-            self.push(
-                &text[url.clone()],
-                bold,
-                italic,
-                false,
-                strike,
-                Some(&text[url.clone()]),
-            );
-            start = url.end;
+            let piece = &text[range.clone()];
+            if url {
+                self.push(piece, bold, italic, false, strike, Some(piece));
+            } else {
+                let at = self.text.len();
+                self.push(piece, bold, italic, false, strike, link);
+                self.spans.push(Span {
+                    range: at..self.text.len(),
+                    bold: false,
+                    italic: false,
+                    code: false,
+                    strike: false,
+                    highlight: false,
+                    tag: true,
+                });
+            }
+            start = range.end;
         }
         if start < text.len() {
             self.push(&text[start..], bold, italic, false, strike, link);
@@ -667,6 +709,7 @@ impl Block {
                 code,
                 strike,
                 highlight: false,
+                tag: false,
             });
         }
         if let Some(destination) = link {
@@ -1081,6 +1124,29 @@ mod tests {
         // The item's second paragraph has no marker of its own.
         assert_eq!(loose.blocks[1].list_marker, None);
         assert_eq!(loose.blocks[2].list_marker.as_deref(), Some("2."));
+    }
+
+    #[test]
+    fn marks_obsidian_tags() {
+        let found = |text: &str| {
+            tags(text)
+                .into_iter()
+                .map(|range| text[range].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found("#todo and #project/rusidian-app, C# #123 #2026年 a#b"),
+            ["#todo", "#project/rusidian-app", "#2026年"]
+        );
+        assert_eq!(found("标签：#中文标签，后文"), ["#中文标签"]);
+        let document = parse("See #todo at https://x.org/#frag and `#code`\n");
+        let tagged: Vec<_> = document.blocks[0]
+            .spans
+            .iter()
+            .filter(|span| span.tag)
+            .map(|span| &document.blocks[0].text[span.range.clone()])
+            .collect();
+        assert_eq!(tagged, ["#todo"]);
     }
 
     #[test]
