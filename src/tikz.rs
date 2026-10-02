@@ -35,12 +35,18 @@ fn compile_tex(source: &str, template_version: u8, tex: String) -> Result<Vec<u8
             let input = job.join("input.tex");
             fs::write(&input, &tex).map_err(|error| format!("无法写入 TeX：{error}"))?;
 
-            let output = Command::new("tectonic")
+            let output = Command::new(crate::paths::executable("tectonic"))
                 .args(["--untrusted", "--color", "never", "--outdir"])
                 .arg(&job)
                 .arg(&input)
                 .output()
-                .map_err(|error| format!("无法启动 Tectonic：{error}"))?;
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        "找不到 Tectonic。TikZ 需要 Tectonic，例如 brew install tectonic".to_owned()
+                    } else {
+                        format!("无法启动 Tectonic：{error}")
+                    }
+                })?;
 
             if !output.status.success() {
                 let message = if output.stderr.is_empty() {
@@ -89,7 +95,7 @@ fn rasterize(pdf: &std::path::Path, png: &std::path::Path) -> Result<(), String>
 fn rasterize(pdf: &std::path::Path, png: &std::path::Path) -> Result<(), String> {
     // Poppler appends ".png" to the output root when writing a single page.
     let root = png.with_extension("");
-    let output = Command::new("pdftoppm")
+    let output = Command::new(crate::paths::executable("pdftoppm"))
         .args(["-png", "-singlefile", "-r"])
         .arg((72.0 * PREVIEW_SCALE).to_string())
         .arg(pdf)

@@ -3,6 +3,7 @@ mod fonts;
 mod markdown;
 mod math;
 mod nvim;
+mod paths;
 mod settings;
 mod theme;
 mod tikz;

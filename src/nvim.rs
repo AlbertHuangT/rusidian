@@ -186,7 +186,9 @@ impl Client {
                     commands: follow,
                     attached: attached.clone(),
                 };
-                let mut command = tokio::process::Command::new("nvim");
+                let mut command = tokio::process::Command::new(crate::paths::executable("nvim"));
+                // Plugins that run git, rg and friends need the full PATH too.
+                command.env("PATH", crate::paths::search_path());
                 command.kill_on_drop(true);
                 if let Some(directory) = directory.filter(|directory| directory.is_dir()) {
                     command.current_dir(directory);
@@ -204,7 +206,11 @@ impl Client {
                     Ok(session) => session,
                     Err(error) => {
                         let _ = event_sender
-                            .send(Event::Error(format!("无法启动 Neovim：{error}")))
+                            .send(Event::Error(if error.kind() == std::io::ErrorKind::NotFound {
+                                "找不到 Neovim（nvim）。请先安装 Neovim，例如在终端运行 brew install neovim，然后按 Enter 重试。".to_owned()
+                            } else {
+                                format!("无法启动 Neovim：{error}")
+                            }))
                             .await;
                         return;
                     }
