@@ -133,7 +133,8 @@ struct RusidianApp {
     document: Option<Document>,
     vault: Option<Vault>,
     error: Option<SharedString>,
-    tikz: HashMap<usize, TikzState>,
+    /// Rendered TikZ keyed by block source, so unchanged diagrams survive edits elsewhere.
+    tikz: HashMap<String, TikzState>,
     math: HashMap<(String, bool), MathState>,
     view: View,
     nvim: Option<NvimClient>,
@@ -317,49 +318,50 @@ impl RusidianApp {
         self.vault = Some(vault);
     }
 
-    fn compile_tikz(&mut self, cx: &mut Context<Self>) {
+    fn pending_tikz(&mut self) -> Vec<String> {
         let Some(document) = &self.document else {
-            return;
+            self.tikz.clear();
+            return Vec::new();
         };
-
-        let jobs = document
+        let sources: HashSet<_> = document
             .markdown
             .blocks
             .iter()
-            .enumerate()
-            .filter_map(|(index, block)| match &block.kind {
-                BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
-                    Some((index, block.text.clone()))
+            .filter(|block| is_tikz(block))
+            .map(|block| block.text.clone())
+            .collect();
+        self.tikz.retain(|source, _| sources.contains(source));
+        sources
+            .into_iter()
+            .filter(|source| {
+                if self.tikz.contains_key(source) {
+                    return false;
                 }
-                _ => None,
+                self.tikz.insert(source.clone(), TikzState::Loading);
+                true
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
-        for (index, source) in jobs {
-            self.tikz.insert(index, TikzState::Loading);
-            let expected = source.clone();
+    fn compile_tikz(&mut self, cx: &mut Context<Self>) {
+        for source in self.pending_tikz() {
             let executor = cx.background_executor().clone();
             cx.spawn(async move |this, cx| {
+                let input = source.clone();
                 let result = executor
-                    .spawn(async move { crate::tikz::compile(&source) })
+                    .spawn(async move { crate::tikz::compile(&input) })
                     .await;
                 this.update(cx, |this, cx| {
-                    let is_current = this
-                        .document
-                        .as_ref()
-                        .and_then(|document| document.markdown.blocks.get(index))
-                        .is_some_and(|block| block.text == expected);
-                    if !is_current {
+                    if !this.tikz.contains_key(&source) {
                         return;
                     }
-
                     let state = match result {
                         Ok(bytes) => {
                             TikzState::Ready(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
                         }
                         Err(error) => TikzState::Failed(error.into()),
                     };
-                    this.tikz.insert(index, state);
+                    this.tikz.insert(source, state);
                     cx.notify();
                 })
                 .ok();
@@ -548,7 +550,6 @@ impl RusidianApp {
                             more,
                         } => {
                             if this.update_buffer(first, last, lines, more) && !more {
-                                this.tikz.clear();
                                 if this.view == View::Reading {
                                     this.compile_visuals(cx);
                                 }
@@ -798,7 +799,7 @@ impl RusidianApp {
                     }
                 }
                 BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz") => {
-                    if let Some(TikzState::Ready(image)) = self.tikz.get(&bounds.0.block) {
+                    if let Some(TikzState::Ready(image)) = self.tikz.get(&block.text) {
                         return Some(ClipboardItem::new_image(image));
                     }
                 }
@@ -2029,7 +2030,7 @@ impl Render for RusidianApp {
                                 .max_w(px(820.0))
                                 .child(render_block(
                                     block,
-                                    self.tikz.get(&index),
+                                    self.tikz.get(&block.text),
                                     &self.math,
                                     text_baseline,
                                     &document.file,
@@ -2872,9 +2873,11 @@ fn render_inline_paragraph(
 }
 
 fn is_object(block: &Block) -> bool {
-    matches!(&block.kind, BlockKind::Image(_))
-        || block.kind == BlockKind::Math
-        || matches!(&block.kind, BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz"))
+    matches!(&block.kind, BlockKind::Image(_)) || block.kind == BlockKind::Math || is_tikz(block)
+}
+
+fn is_tikz(block: &Block) -> bool {
+    matches!(&block.kind, BlockKind::Code(Some(language)) if language.eq_ignore_ascii_case("tikz"))
 }
 
 fn block_len(block: &Block) -> usize {
@@ -3384,6 +3387,24 @@ mod tests {
         app.document.as_mut().unwrap().markdown = crate::markdown::parse("$$x_i$$");
         assert_eq!(app.pending_math(), vec![("x_i".into(), true)]);
         assert!(!app.math.contains_key(&("x_i".into(), false)));
+    }
+
+    #[test]
+    fn keeps_rendered_tikz_until_its_source_changes() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
+        let source = "\\begin{tikzpicture}\\end{tikzpicture}\n";
+        app.document.as_mut().unwrap().markdown =
+            crate::markdown::parse(&format!("a\n\n```tikz\n{source}```\n"));
+        assert_eq!(app.pending_tikz(), vec![source.to_owned()]);
+        app.tikz
+            .insert(source.into(), TikzState::Failed("cached".into()));
+        app.document.as_mut().unwrap().markdown =
+            crate::markdown::parse(&format!("changed\n\n```tikz\n{source}```\n"));
+        assert!(app.pending_tikz().is_empty());
+        assert!(matches!(app.tikz.get(source), Some(TikzState::Failed(_))));
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse("no diagrams");
+        assert!(app.pending_tikz().is_empty());
+        assert!(app.tikz.is_empty());
     }
 
     #[test]
