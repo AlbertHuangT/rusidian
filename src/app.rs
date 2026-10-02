@@ -741,11 +741,12 @@ fn hit_excerpt(line: &str, needle: &str) -> String {
     )
 }
 
-/// A note the quick switcher offers: its path, name and folder.
+/// A note the quick switcher offers: its path, name and folder, and the alias that matched.
 struct SwitcherItem {
     path: PathBuf,
     name: String,
     folder: String,
+    alias: Option<String>,
 }
 
 /// Most rows the quick switcher lists; it scrolls past the first dozen.
@@ -1446,6 +1447,7 @@ impl RusidianApp {
                     .parent()
                     .map(|folder| folder.to_string_lossy().into_owned())
                     .unwrap_or_default(),
+                alias: None,
             }
         };
         if query.trim().is_empty() {
@@ -1468,7 +1470,20 @@ impl RusidianApp {
                     format!("{}/{}", item.folder, item.name)
                 };
                 let name_start = text.chars().count() - item.name.chars().count();
-                fuzzy_score(query, &text, name_start).map(|score| (score, item))
+                // A note also matches by its front-matter aliases, whichever scores best.
+                let mut best = fuzzy_score(query, &text, name_start).map(|score| (score, None));
+                let aliases = self
+                    .vault
+                    .as_ref()
+                    .and_then(|vault| vault.aliases.get(&item.path));
+                for alias in aliases.into_iter().flatten() {
+                    if let Some(score) = fuzzy_score(query, alias, 0)
+                        && best.as_ref().is_none_or(|(best, _)| score > *best)
+                    {
+                        best = Some((score, Some(alias.clone())));
+                    }
+                }
+                best.map(|(score, alias)| (score, SwitcherItem { alias, ..item }))
             })
             .collect();
         scored.sort_by(|(a, first), (b, second)| {
@@ -4373,7 +4388,18 @@ impl RusidianApp {
         } else {
             self.switcher_items()
                 .into_iter()
-                .map(|item| (item.name, item.folder, None))
+                .map(|item| match item.alias {
+                    // An alias match shows the alias, then the note it names.
+                    Some(alias) => {
+                        let note = if item.folder.is_empty() {
+                            item.name
+                        } else {
+                            format!("{}/{}", item.folder, item.name)
+                        };
+                        (alias, format!("↪ {note}"), None)
+                    }
+                    None => (item.name, item.folder, None),
+                })
                 .collect()
         };
         let empty = entries.is_empty();

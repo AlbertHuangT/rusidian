@@ -13,6 +13,8 @@ pub struct Vault {
     by_name: HashMap<String, Vec<PathBuf>>,
     pub is_obsidian: bool,
     pub settings: ObsidianSettings,
+    /// Front-matter aliases of notes that have them, which the quick switcher also matches.
+    pub aliases: HashMap<PathBuf, Vec<String>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -57,9 +59,18 @@ impl Vault {
                     .push(path.clone());
             }
         }
+        let files: Vec<PathBuf> = all.into_iter().filter(|path| is_markdown(path)).collect();
+        let aliases = files
+            .iter()
+            .filter_map(|path| {
+                let aliases = read_aliases(path);
+                (!aliases.is_empty()).then(|| (path.clone(), aliases))
+            })
+            .collect();
         Ok(Self {
             root: root.to_path_buf(),
-            files: all.into_iter().filter(|path| is_markdown(path)).collect(),
+            files,
+            aliases,
             by_name,
             // Obsidian creates app.json only after a setting changes; the folder is the marker.
             is_obsidian: root.join(".obsidian").is_dir(),
@@ -370,6 +381,55 @@ fn is_regex_filter(filter: &str) -> bool {
     filter.len() > 1 && filter.starts_with('/') && filter.ends_with('/')
 }
 
+/// The `aliases` (or `alias`) listed in a note's front matter, read from its first 4 KiB.
+fn read_aliases(path: &Path) -> Vec<String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    if fs::File::open(path)
+        .and_then(|file| file.take(4096).read_to_end(&mut head))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return Vec::new();
+    }
+    let clean = |value: &str| {
+        value
+            .trim()
+            .trim_matches(|character| character == '"' || character == '\'')
+            .to_owned()
+    };
+    let mut aliases = Vec::new();
+    let mut in_aliases = false;
+    for line in lines {
+        if line.trim_end() == "---" {
+            break;
+        }
+        if let Some(item) = line.trim_start().strip_prefix("- ") {
+            if in_aliases {
+                aliases.push(clean(item));
+            }
+        } else if !line.starts_with(char::is_whitespace)
+            && let Some((key, value)) = line.split_once(':')
+        {
+            in_aliases = matches!(key.trim(), "aliases" | "alias");
+            let value = value.trim();
+            if in_aliases && !value.is_empty() {
+                let list = value
+                    .strip_prefix('[')
+                    .and_then(|value| value.strip_suffix(']'))
+                    .unwrap_or(value);
+                aliases.extend(list.split(',').map(clean));
+            }
+        }
+    }
+    aliases.retain(|alias| !alias.is_empty());
+    aliases
+}
+
 fn visit(
     root: &Path,
     directory: &Path,
@@ -508,6 +568,7 @@ mod tests {
             by_name: HashMap::new(),
             is_obsidian: false,
             settings: ObsidianSettings::default(),
+            aliases: HashMap::new(),
         };
         let names = |rows: Vec<TreeRow>| {
             rows.into_iter()
@@ -613,6 +674,34 @@ mod tests {
                 "note-2499"
             ]
         );
+    }
+
+    #[test]
+    fn reads_front_matter_aliases() {
+        let folder = std::env::temp_dir().join(format!("rusidian-aliases-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let note = |name: &str, text: &str| {
+            let path = folder.join(name);
+            fs::write(&path, text).unwrap();
+            read_aliases(&path)
+        };
+        assert_eq!(
+            note(
+                "a.md",
+                "---\naliases: [First, 'Second']\ntags: [x]\n---\nbody\n"
+            ),
+            ["First", "Second"]
+        );
+        assert_eq!(
+            note(
+                "b.md",
+                "---\ntitle: t\naliases:\n  - One\n  - \"Two\"\ntags:\n  - no\n---\n"
+            ),
+            ["One", "Two"]
+        );
+        assert_eq!(note("c.md", "---\nalias: Solo\n---\n"), ["Solo"]);
+        assert!(note("d.md", "# No front matter\naliases: [x]\n").is_empty());
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
