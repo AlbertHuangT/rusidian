@@ -832,6 +832,16 @@ impl RusidianApp {
         }
     }
 
+    fn links(&self) -> Links<'_> {
+        Links {
+            note: self
+                .document
+                .as_ref()
+                .map_or(Path::new(""), |document| document.file.as_path()),
+            vault: self.vault.as_ref(),
+        }
+    }
+
     fn take_reading_count(&mut self) -> usize {
         self.reading_count.take().unwrap_or(1)
     }
@@ -843,7 +853,7 @@ impl RusidianApp {
         if bounds.0 == bounds.1 {
             let block = blocks.get(bounds.0.block)?;
             if let Some(image) = inline_image_at_offset(block, bounds.0.offset)
-                && let Some(path) = local_image_path(&document.file, &image.source)
+                && let Some(path) = self.links().image(&image.source)
                 && let Some(format) = image_format(&path)
                 && let Ok(bytes) = std::fs::read(path)
             {
@@ -861,7 +871,7 @@ impl RusidianApp {
             }
             match &block.kind {
                 BlockKind::Image(source) => {
-                    if let Some(path) = local_image_path(&document.file, source)
+                    if let Some(path) = self.links().image(source)
                         && let Some(format) = image_format(&path)
                         && let Ok(bytes) = std::fs::read(path)
                     {
@@ -2179,6 +2189,10 @@ impl Render for RusidianApp {
             ),
         );
         let reading = if let Some(document) = &self.document {
+            let links = Links {
+                note: &document.file,
+                vault: self.vault.as_ref(),
+            };
             let selection = self.reading_selection.and_then(|selection| {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
             });
@@ -2220,7 +2234,7 @@ impl Render for RusidianApp {
                                     self.tikz.get(&block.text),
                                     &self.math,
                                     text_baseline,
-                                    &document.file,
+                                    links,
                                     (reading_cursor.block == index)
                                         .then_some(reading_cursor.offset),
                                     selection.and_then(|bounds| {
@@ -2491,12 +2505,33 @@ fn source_lines(source: &str) -> Vec<String> {
     }
 }
 
-fn local_image_path(note: &Path, source: &str) -> Option<PathBuf> {
-    let path = Path::new(source);
-    if path.is_absolute() || source.contains("://") || source.starts_with("data:") {
-        return None;
+/// Resolves image and link targets relative to the open note and its vault.
+#[derive(Clone, Copy)]
+struct Links<'a> {
+    note: &'a Path,
+    vault: Option<&'a Vault>,
+}
+
+impl Links<'_> {
+    /// The local file for an image source. Unresolved local sources keep a note-relative path so
+    /// the reading view can report the missing file; remote and absolute sources return `None`.
+    fn image(&self, source: &str) -> Option<PathBuf> {
+        let decoded = crate::vault::percent_decode(source);
+        if decoded.contains("://")
+            || decoded.starts_with("data:")
+            || Path::new(&decoded).is_absolute()
+        {
+            return None;
+        }
+        crate::vault::resolve_target(self.note, self.vault, source).or_else(|| {
+            Some(
+                self.note
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(decoded),
+            )
+        })
     }
-    Some(note.parent().unwrap_or_else(|| Path::new(".")).join(path))
 }
 
 fn image_format(path: &Path) -> Option<ImageFormat> {
@@ -2519,7 +2554,7 @@ fn render_block(
     tikz: Option<&TikzState>,
     math: &HashMap<(String, bool), MathState>,
     text_baseline: f32,
-    note: &Path,
+    links: Links,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
@@ -2539,16 +2574,16 @@ fn render_block(
             .child(text)
             .into_any_element(),
         BlockKind::Paragraph if !block.images.is_empty() => {
-            render_inline_paragraph(block, math, text_baseline, note, cursor, selection)
+            render_inline_paragraph(block, math, text_baseline, links, cursor, selection)
         }
         BlockKind::Paragraph if !block.maths.is_empty() => {
-            render_inline_paragraph(block, math, text_baseline, note, cursor, selection)
+            render_inline_paragraph(block, math, text_baseline, links, cursor, selection)
         }
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
         BlockKind::Image(source) => {
             let source_label = source.clone();
             let alt = block.text.clone();
-            let Some(path) = local_image_path(note, source) else {
+            let Some(path) = links.image(source) else {
                 return decorate_block(
                     block,
                     div()
@@ -2948,7 +2983,7 @@ fn render_inline_paragraph(
     block: &Block,
     math: &HashMap<(String, bool), MathState>,
     text_baseline: f32,
-    note: &Path,
+    links: Links,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
@@ -2991,7 +3026,7 @@ fn render_inline_paragraph(
             InlineAtom::Image(image) => {
                 let alt = image.alt.clone();
                 let source = image.source.clone();
-                if let Some(path) = local_image_path(note, &image.source) {
+                if let Some(path) = links.image(&image.source) {
                     div()
                         .pt(px(ascent - 24.0))
                         .child(
@@ -3893,7 +3928,12 @@ mod tests {
             })
             .unwrap();
         assert!(image.text().is_none());
-        assert!(local_image_path(Path::new("note.md"), "https://example.com/a.png").is_none());
+        let links = Links {
+            note: Path::new("note.md"),
+            vault: None,
+        };
+        assert!(links.image("https://example.com/a.png").is_none());
+        assert_eq!(links.image("a%20b.png"), Some(PathBuf::from("a b.png")));
 
         app.document.as_mut().unwrap().markdown = crate::markdown::parse("a ![图](rusidian.svg) b");
         app.reading_cursor = ReadingCursor {
