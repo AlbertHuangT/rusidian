@@ -205,6 +205,7 @@ fn open_window(path: Option<PathBuf>, first: bool, cx: &mut App) -> Option<AnyWi
                         if let Some(nvim) = &this.nvim {
                             nvim.check_time();
                         }
+                        this.notice_missing_file(cx);
                         cx.notify();
                     }
                 })
@@ -302,6 +303,8 @@ struct Document {
     /// Only Markdown files have a reading view; other text files stay in Neovim.
     is_markdown: bool,
     markdown: MarkdownDocument,
+    /// The file was on disk when last seen; a new note is not until it is saved.
+    on_disk: bool,
 }
 
 impl Document {
@@ -926,6 +929,7 @@ impl RusidianApp {
                     lines: source_lines(&content),
                     is_markdown: crate::vault::is_markdown(path),
                     markdown: MarkdownDocument { blocks: Vec::new() },
+                    on_disk: true,
                 };
                 document.parse(false);
                 if !document.is_markdown {
@@ -1830,6 +1834,11 @@ impl RusidianApp {
                             this.show_notice("TeX 前导内容已保存，TikZ 将重新编译", false, cx);
                         }
                         NvimEvent::BufferWritten(path) => {
+                            if let Some(document) = &mut this.document
+                                && same_file(&document.file, &path)
+                            {
+                                document.on_disk = true;
+                            }
                             if this.vault.as_ref().is_some_and(|vault| {
                                 path.starts_with(&vault.root)
                                     && crate::vault::is_markdown(&path)
@@ -2297,6 +2306,7 @@ impl RusidianApp {
             name,
             path: path.to_string_lossy().into_owned().into(),
             is_markdown,
+            on_disk: path.is_file(),
             file: path,
             lines: vec![String::new()],
             markdown: MarkdownDocument { blocks: Vec::new() },
@@ -2316,6 +2326,24 @@ impl RusidianApp {
         self.reading_search = None;
         self.reading_scroll.set_offset(point(px(0.0), px(0.0)));
         cx.notify();
+    }
+
+    /// Say once when the note shown was deleted or moved outside Rusidian: Neovim keeps its
+    /// text, which closing the tab would lose.
+    fn notice_missing_file(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        if !document.on_disk || document.file.is_file() {
+            return;
+        }
+        document.on_disk = false;
+        let name = document.name.clone();
+        self.show_notice(
+            format!("{name} 已在磁盘上被删除或移动；内容仍在 Neovim 中，:w 可重新保存"),
+            true,
+            cx,
+        );
     }
 
     /// Rescan the vault in the background: after a new note is saved from Neovim, or when the
