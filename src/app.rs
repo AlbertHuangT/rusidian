@@ -1083,6 +1083,9 @@ impl RusidianApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.document.is_none() || self.settings_open {
+            return;
+        }
         if self.nvim.is_none() {
             self.nvim_error = None;
             self.grid = NvimGrid::default();
@@ -1340,7 +1343,9 @@ impl RusidianApp {
             cx.notify();
             return;
         }
-        if event.keystroke.key == "escape" && (self.grid.is_normal() || self.nvim_error.is_some()) {
+        if event.keystroke.key == "escape"
+            && (self.grid.is_normal() || self.nvim_error.is_some() || self.nvim.is_none())
+        {
             self.view = View::Reading;
             self.compile_visuals(cx);
             cx.notify();
