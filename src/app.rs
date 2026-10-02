@@ -1387,7 +1387,11 @@ impl RusidianApp {
         let Some(document) = &self.document else {
             return false;
         };
-        let target = if let Some(id) = fragment.strip_prefix('^') {
+        let target = if let Some(label) = crate::markdown::footnote_label(fragment) {
+            document.markdown.blocks.iter().position(|block| {
+                matches!(&block.kind, BlockKind::Footnote { label: found, .. } if found == label)
+            })
+        } else if let Some(id) = fragment.strip_prefix('^') {
             let marker = format!("^{id}");
             document.markdown.blocks.iter().position(|block| {
                 block
@@ -4454,7 +4458,7 @@ fn block_gap(block: &Block, next: Option<&Block>) -> Pixels {
         }
         BlockKind::Paragraph if block.tight && next.is_some_and(|next| next.in_list) => px(4.0),
         BlockKind::Rule | BlockKind::DefinitionTitle => px(0.0),
-        BlockKind::Footnote(_) | BlockKind::Definition => px(12.0),
+        BlockKind::Footnote { .. } | BlockKind::Definition => px(12.0),
         _ => px(16.0),
     }
 }
@@ -4703,16 +4707,17 @@ fn render_block(
                 .child("正在排版公式…")
                 .into_any_element(),
         },
-        BlockKind::Footnote(label) => div()
+        BlockKind::Footnote { number, .. } => div()
             .flex()
             .text_sm()
             .child(
                 div()
-                    .mr_2()
+                    .w(px(30.0))
+                    .flex_none()
                     .text_color(rgb(theme.accent))
-                    .child(format!("[^{label}]")),
+                    .children(number.map(|number| format!("{number}."))),
             )
-            .child(text())
+            .child(div().flex_1().min_w_0().child(text()))
             .into_any_element(),
         BlockKind::DefinitionTitle => div()
             .mt_3()
@@ -5999,8 +6004,9 @@ mod tests {
     #[test]
     fn reveals_heading_and_block_fragments() {
         let mut app = RusidianApp::open(Some(Path::new("examples/tikz.md")));
-        app.document.as_mut().unwrap().markdown =
-            crate::markdown::parse("# Intro\n\ntext\n\n## Second Part\n\nquoted line ^abc123\n");
+        app.document.as_mut().unwrap().markdown = crate::markdown::parse(
+            "# Intro\n\ntext[^n]\n\n## Second Part\n\nquoted line ^abc123\n\n[^n]: Note.\n",
+        );
         assert!(app.reveal_fragment("Second%20Part"));
         assert_eq!(
             app.reading_cursor,
@@ -6013,6 +6019,15 @@ mod tests {
         assert!(app.reveal_fragment("^abc123"));
         assert_eq!(app.reading_cursor.block, 3);
         assert!(!app.reveal_fragment("Missing"));
+        // Footnote references link to their definition.
+        app.reading_cursor = ReadingCursor {
+            block: 1,
+            offset: 5,
+        };
+        assert_eq!(app.current_link().as_deref(), Some("#[^n]"));
+        assert!(app.reveal_fragment("[^n]"));
+        assert_eq!(app.reading_cursor.block, 4);
+        assert!(!app.reveal_fragment("[^missing]"));
         assert_eq!(heading_key("Hello, World!"), heading_key("hello-world"));
         assert!(is_text_file(Path::new("README.md")));
         assert!(!is_text_file(Path::new("assets/app-icon.png")));

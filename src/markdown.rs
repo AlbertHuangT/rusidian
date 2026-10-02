@@ -58,9 +58,16 @@ pub enum BlockKind {
     Html,
     Metadata,
     Rule,
-    Table { header: bool },
+    Table {
+        header: bool,
+    },
     Math,
-    Footnote(String),
+    /// A footnote definition's paragraph. `number` follows the order of first references and
+    /// is only on the definition's first paragraph.
+    Footnote {
+        label: String,
+        number: Option<usize>,
+    },
     DefinitionTitle,
     Definition,
 }
@@ -139,6 +146,8 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     let mut cell_start = None;
     let mut table_alignments = Vec::new();
     let mut footnote: Option<String> = None;
+    // Footnote labels in the order they are first referenced.
+    let mut footnotes: Vec<String> = Vec::new();
 
     for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
         let before = current.as_ref().map(|block: &Block| block.text.len());
@@ -149,7 +158,10 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 Tag::Paragraph if current.is_none() => {
                     let mut block = new_block(
                         footnote.as_ref().map_or(BlockKind::Paragraph, |label| {
-                            BlockKind::Footnote(label.clone())
+                            BlockKind::Footnote {
+                                label: label.clone(),
+                                number: None,
+                            }
                         }),
                         quote,
                         &mut items,
@@ -409,9 +421,18 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     .task = Some(checked);
             }
             Event::FootnoteReference(label) => {
+                let number = footnote_number(&mut footnotes, &label);
+                // Shown as a link that `gf` follows to the definition.
                 current
                     .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
-                    .push(&format!("[^{label}]"), false, false, false, false, None);
+                    .push(
+                        &format!("[{number}]"),
+                        false,
+                        false,
+                        false,
+                        false,
+                        Some(&footnote_link(&label)),
+                    );
             }
         }
         if let Some(block) = current.as_mut().filter(|_| !mapped) {
@@ -424,7 +445,41 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
 
     push_current(&mut blocks, &mut current);
     apply_callouts(&mut blocks, &alerts);
+    number_footnotes(&mut blocks, &mut footnotes);
     MarkdownDocument { blocks }
+}
+
+fn footnote_number(footnotes: &mut Vec<String>, label: &str) -> usize {
+    match footnotes.iter().position(|known| known == label) {
+        Some(index) => index + 1,
+        None => {
+            footnotes.push(label.to_owned());
+            footnotes.len()
+        }
+    }
+}
+
+/// The in-note destination of a footnote reference; see [`footnote_label`].
+fn footnote_link(label: &str) -> String {
+    format!("#[^{label}]")
+}
+
+/// The label a link fragment from [`footnote_link`] points to.
+pub fn footnote_label(fragment: &str) -> Option<&str> {
+    fragment.strip_prefix("[^")?.strip_suffix(']')
+}
+
+/// Number each definition's first paragraph; unreferenced definitions follow the referenced ones.
+fn number_footnotes(blocks: &mut [Block], footnotes: &mut Vec<String>) {
+    let mut numbered = Vec::new();
+    for block in blocks {
+        if let BlockKind::Footnote { label, number } = &mut block.kind
+            && !numbered.contains(label)
+        {
+            *number = Some(footnote_number(footnotes, label));
+            numbered.push(label.clone());
+        }
+    }
 }
 
 fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
@@ -930,8 +985,23 @@ mod tests {
             extras
                 .blocks
                 .iter()
-                .any(|block| matches!(&block.kind, BlockKind::Footnote(label) if label == "1"))
+                .any(|block| matches!(&block.kind, BlockKind::Footnote { label, number: Some(1) } if label == "1"))
         );
+        let footnotes =
+            parse("A[^b] B[^a] again[^b]\n\n[^a]: First.\n\n[^b]: Second.\n\n[^c]: Unused.\n");
+        let text = &footnotes.blocks[0];
+        assert_eq!(text.text, "A[1] B[2] again[1]");
+        assert_eq!(text.links[0].destination, "#[^b]");
+        assert_eq!(footnote_label(&text.links[1].destination[1..]), Some("a"));
+        let numbers: Vec<_> = footnotes
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                BlockKind::Footnote { label, number } => Some((label.as_str(), *number)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, [("a", Some(2)), ("b", Some(1)), ("c", Some(3))]);
         assert_eq!(parse("a\nb").blocks[0].text, "a\nb");
         assert_eq!(parse_with_options("a\nb", true).blocks[0].text, "a b");
         assert_eq!(parse_with_options("a  \nb", true).blocks[0].text, "a\nb");
