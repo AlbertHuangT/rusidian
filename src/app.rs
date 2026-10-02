@@ -841,7 +841,7 @@ impl RusidianApp {
             return app;
         }
 
-        match std::fs::read_to_string(path) {
+        match read_text(path) {
             Ok(content) => {
                 let path = &path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
                 let mut document = Document {
@@ -6857,6 +6857,23 @@ fn display_name(path: &Path) -> String {
 }
 
 /// Whether a linked file can be edited as text: valid UTF-8 without NUL bytes near the start.
+/// A file's text for the first view, before Neovim loads it. Text in another encoding is
+/// shown as best it can be; Neovim decodes it properly and its lines replace these. Files with
+/// NUL bytes are not text.
+fn read_text(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "文件不存在".to_owned(),
+        std::io::ErrorKind::PermissionDenied => "没有读取权限".to_owned(),
+        _ if path.is_dir() => "这是文件夹".to_owned(),
+        _ => error.to_string(),
+    })?;
+    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        return Err("这不是文本文件".into());
+    }
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
+}
+
 fn is_text_file(path: &Path) -> bool {
     use std::io::Read;
     let Ok(file) = std::fs::File::open(path) else {
