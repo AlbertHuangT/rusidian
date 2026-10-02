@@ -5606,7 +5606,20 @@ impl Render for RusidianApp {
                             .child(
                                 self.document
                                     .as_ref()
-                                    .map(|document| document.path.clone())
+                                    .map(|document| {
+                                        // Inside a vault, the path within it says enough.
+                                        self.vault
+                                            .as_ref()
+                                            .and_then(|vault| {
+                                                document.file.strip_prefix(&vault.root).ok()
+                                            })
+                                            .map_or_else(
+                                                || document.path.clone(),
+                                                |relative| {
+                                                    relative.to_string_lossy().into_owned().into()
+                                                },
+                                            )
+                                    })
                                     .or_else(|| {
                                         let vault = self.vault.as_ref()?;
                                         Some(vault.root.to_string_lossy().into_owned().into())
