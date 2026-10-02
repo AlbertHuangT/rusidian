@@ -325,6 +325,12 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 } else {
                     let block = current
                         .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items));
+                    // Bare URLs become links, as in Obsidian, except in code and inside links.
+                    let linkify = link.is_none()
+                        && !matches!(
+                            block.kind,
+                            BlockKind::Code(_) | BlockKind::Html | BlockKind::Metadata
+                        );
                     let pieces = obsidian_inline(&text);
                     // Pieces map to exact source ranges only when the text is the source verbatim.
                     let verbatim = source.get(range.clone()) == Some(&*text);
@@ -334,13 +340,11 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                                 continue;
                             }
                             let start = block.text.len();
-                            block.push(
+                            block.push_text(
                                 &text[piece.clone()],
-                                bold > 0,
-                                italic > 0,
-                                false,
-                                strike > 0,
+                                (bold > 0, italic > 0, strike > 0),
                                 link.as_deref(),
+                                linkify,
                             );
                             let pushed = start..block.text.len();
                             if kind == Inline::Highlight {
@@ -361,13 +365,11 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         }
                         mapped = true;
                     } else {
-                        block.push(
+                        block.push_text(
                             &text,
-                            bold > 0,
-                            italic > 0,
-                            false,
-                            strike > 0,
+                            (bold > 0, italic > 0, strike > 0),
                             link.as_deref(),
+                            linkify,
                         );
                     }
                 }
@@ -540,7 +542,92 @@ fn push_current(blocks: &mut Vec<Block>, current: &mut Option<Block>) {
     }
 }
 
+/// Bare `http://` and `https://` URLs in text, as GFM's autolink extension and Obsidian find
+/// them. Trailing punctuation, unbalanced `)` and Chinese punctuation are not part of the URL.
+fn bare_urls(text: &str) -> Vec<Range<usize>> {
+    let mut urls = Vec::new();
+    let mut search = 0;
+    while let Some(found) = text[search..].find("http") {
+        let start = search + found;
+        let rest = &text[start..];
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            search = start + 4;
+            continue;
+        };
+        let starts_word = text[..start].chars().next_back().is_none_or(|character| {
+            character.is_whitespace() || !character.is_ascii() || "([{<\"'".contains(character)
+        });
+        let mut end = start
+            + rest
+                .find(|character: char| {
+                    character.is_whitespace()
+                        || "<>\"`".contains(character)
+                        || is_wide_punctuation(character)
+                })
+                .unwrap_or(rest.len());
+        while let Some(last) = text[start..end].chars().next_back() {
+            let unbalanced = last == ')'
+                && text[start..end].matches(')').count() > text[start..end].matches('(').count();
+            if ".,:;!?'*_~".contains(last) || unbalanced {
+                end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if starts_word && end > start + scheme {
+            urls.push(start..end);
+        }
+        search = end.max(start + scheme);
+    }
+    urls
+}
+
+/// Full-width (CJK) punctuation, which ends a bare URL written in Chinese text.
+fn is_wide_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3000}'..='\u{303f}'
+            | '\u{ff01}'..='\u{ff0f}'
+            | '\u{ff1a}'..='\u{ff20}'
+            | '\u{ff3b}'..='\u{ff40}'
+            | '\u{ff5b}'..='\u{ff65}'
+    )
+}
+
 impl Block {
+    /// Push text with its emphasis (bold, italic, strike), linking bare URLs when `linkify`.
+    fn push_text(
+        &mut self,
+        text: &str,
+        (bold, italic, strike): (bool, bool, bool),
+        link: Option<&str>,
+        linkify: bool,
+    ) {
+        let urls = if linkify { bare_urls(text) } else { Vec::new() };
+        let mut start = 0;
+        for url in urls {
+            if start < url.start {
+                self.push(&text[start..url.start], bold, italic, false, strike, link);
+            }
+            self.push(
+                &text[url.clone()],
+                bold,
+                italic,
+                false,
+                strike,
+                Some(&text[url.clone()]),
+            );
+            start = url.end;
+        }
+        if start < text.len() {
+            self.push(&text[start..], bold, italic, false, strike, link);
+        }
+    }
+
     fn push(
         &mut self,
         text: &str,
@@ -941,6 +1028,49 @@ mod tests {
         // The item's second paragraph has no marker of its own.
         assert_eq!(loose.blocks[1].list_marker, None);
         assert_eq!(loose.blocks[2].list_marker.as_deref(), Some("2."));
+    }
+
+    #[test]
+    fn links_bare_urls() {
+        let found = |text: &str| {
+            bare_urls(text)
+                .into_iter()
+                .map(|range| text[range].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found("see https://example.com/a_b?x=1. And (http://x.org/wiki/A_(b)) too"),
+            ["https://example.com/a_b?x=1", "http://x.org/wiki/A_(b)"]
+        );
+        assert_eq!(
+            found("访问https://example.com/路径，然后"),
+            ["https://example.com/路径"]
+        );
+        assert!(found("nohttps://x.org https:// httpx").is_empty());
+
+        let document = parse(
+            "Go to https://example.com, `https://code.example` or [a](https://b.org).\n\n```\nhttps://in.code\n```\n",
+        );
+        let paragraph = &document.blocks[0];
+        let links: Vec<_> = paragraph
+            .links
+            .iter()
+            .map(|link| {
+                (
+                    &paragraph.text[link.range.clone()],
+                    link.destination.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("https://example.com", "https://example.com"),
+                ("a", "https://b.org")
+            ]
+        );
+        assert_eq!(paragraph.source_offset(6), Some(6));
+        assert!(document.blocks[1].links.is_empty());
     }
 
     #[test]
