@@ -58,7 +58,8 @@ impl Vault {
             root: root.to_path_buf(),
             files: all.into_iter().filter(|path| is_markdown(path)).collect(),
             by_name,
-            is_obsidian: config.is_file(),
+            // Obsidian creates app.json only after a setting changes; the folder is the marker.
+            is_obsidian: root.join(".obsidian").is_dir(),
             settings,
         })
     }
@@ -427,6 +428,16 @@ mod tests {
                 "0:zeta"
             ]
         );
+    }
+
+    #[test]
+    fn treats_any_obsidian_folder_as_a_vault() {
+        let root = std::env::temp_dir().join(format!("rusidian-bare-vault-{}", std::process::id()));
+        fs::create_dir_all(root.join(".obsidian")).unwrap();
+        assert!(Vault::open(&root).unwrap().is_obsidian);
+        fs::remove_dir_all(root.join(".obsidian")).unwrap();
+        assert!(!Vault::open(&root).unwrap().is_obsidian);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
