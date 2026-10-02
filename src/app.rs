@@ -1450,7 +1450,7 @@ impl RusidianApp {
                         ));
                     }
                 }
-                let text = StyledText::new(line).with_highlights(highlights);
+                let text = StyledText::new(line).with_highlights(merge_highlights(highlights));
                 div().whitespace_nowrap().child(text)
             }))
             .when_some(focus, |element, focus| {
@@ -2536,7 +2536,39 @@ fn fragment_highlights(
             },
         ));
     }
-    highlights
+    merge_highlights(highlights)
+}
+
+/// GPUI turns highlights into text runs in order, so ranges must be sorted and must not overlap.
+/// Split overlapping ranges into segments; later highlights take precedence.
+fn merge_highlights(
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let mut boundaries = highlights
+        .iter()
+        .flat_map(|(range, _)| [range.start, range.end])
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut merged: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+    for pair in boundaries.windows(2) {
+        let segment = pair[0]..pair[1];
+        let style = highlights
+            .iter()
+            .filter(|(range, _)| range.start <= segment.start && segment.end <= range.end)
+            .map(|(_, style)| *style)
+            .reduce(HighlightStyle::highlight);
+        let Some(style) = style else {
+            continue;
+        };
+        match merged.last_mut() {
+            Some((last, last_style)) if last.end == segment.start && *last_style == style => {
+                last.end = segment.end;
+            }
+            _ => merged.push((segment, style)),
+        }
+    }
+    merged
 }
 
 fn clipped_range(
@@ -3593,6 +3625,30 @@ mod tests {
             offset: link_block.text[..byte].chars().count(),
         };
         assert_eq!(app.current_link().as_deref(), Some("linked.md"));
+    }
+
+    #[test]
+    fn cursor_and_selection_highlights_do_not_overlap_styled_spans() {
+        let document = crate::markdown::parse("a **[bold](x.md)** c");
+        let block = &document.blocks[0];
+        assert_eq!(block.text, "a bold c");
+        let highlights = fragment_highlights(block, &(0..block.text.len()), Some(3), Some((2, 4)));
+        for pair in highlights.windows(2) {
+            assert!(pair[0].0.end <= pair[1].0.start, "{highlights:?}");
+        }
+        let cursor = highlights
+            .iter()
+            .find(|(_, style)| style.color == Some(rgb(0x111418).into()))
+            .unwrap();
+        assert_eq!(cursor.0, 3..4);
+        assert_eq!(cursor.1.font_weight, Some(FontWeight::BOLD));
+        assert_eq!(
+            highlights
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            [2..3, 3..4, 4..5, 5..6]
+        );
     }
 
     #[test]
