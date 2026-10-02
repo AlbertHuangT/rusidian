@@ -25,6 +25,8 @@ pub struct Theme {
     /// Code blocks, formulas and placeholders.
     pub block: u32,
     pub inline_code: u32,
+    /// Obsidian `==highlight==`.
+    pub highlight: u32,
     pub table_header: u32,
     pub accent: u32,
     pub accent_soft_bg: u32,
@@ -69,6 +71,7 @@ impl Theme {
         surface: 0x0c0f12,
         block: 0x1c2229,
         inline_code: 0x242a32,
+        highlight: 0x5e4c16,
         table_header: 0x1a1f25,
         accent: 0xf28c45,
         accent_soft_bg: 0x452519,
@@ -112,6 +115,7 @@ impl Theme {
         surface: 0xf3f1ec,
         block: 0xf0eee8,
         inline_code: 0xe9e6df,
+        highlight: 0xfbe68a,
         table_header: 0xf3f1ec,
         accent: 0xc4501a,
         accent_soft_bg: 0xfbe3d3,

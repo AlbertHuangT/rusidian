@@ -4312,7 +4312,13 @@ fn fragment_highlights(
                     HighlightStyle {
                         font_weight: span.bold.then_some(FontWeight::BOLD),
                         font_style: span.italic.then_some(FontStyle::Italic),
-                        background_color: span.code.then_some(rgb(theme.inline_code).into()),
+                        background_color: if span.code {
+                            Some(rgb(theme.inline_code).into())
+                        } else if span.highlight {
+                            Some(rgb(theme.highlight).into())
+                        } else {
+                            None
+                        },
                         strikethrough: span.strike.then_some(StrikethroughStyle {
                             thickness: px(1.0),
                             color: None,

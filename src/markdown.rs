@@ -64,6 +64,8 @@ pub struct Span {
     pub italic: bool,
     pub code: bool,
     pub strike: bool,
+    /// Obsidian `==highlight==`.
+    pub highlight: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -131,6 +133,8 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
 
     for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
         let before = current.as_ref().map(|block: &Block| block.text.len());
+        // Set when an event maps its own pieces to the source.
+        let mut mapped = false;
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph if current.is_none() => {
@@ -278,9 +282,45 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 if let Some(image) = &mut image {
                     image.alt.push_str(&text);
                 } else {
-                    current
-                        .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items))
-                        .push(
+                    let block = current
+                        .get_or_insert_with(|| new_block(BlockKind::Paragraph, quote, &mut items));
+                    let pieces = obsidian_inline(&text);
+                    // Pieces map to exact source ranges only when the text is the source verbatim.
+                    let verbatim = source.get(range.clone()) == Some(&*text);
+                    if pieces.len() > 1 && verbatim {
+                        for (piece, kind) in pieces {
+                            if kind == Inline::Comment {
+                                continue;
+                            }
+                            let start = block.text.len();
+                            block.push(
+                                &text[piece.clone()],
+                                bold > 0,
+                                italic > 0,
+                                false,
+                                strike > 0,
+                                link.as_deref(),
+                            );
+                            let pushed = start..block.text.len();
+                            if kind == Inline::Highlight {
+                                block.spans.push(Span {
+                                    range: pushed.clone(),
+                                    bold: false,
+                                    italic: false,
+                                    code: false,
+                                    strike: false,
+                                    highlight: true,
+                                });
+                            }
+                            block.map_source(
+                                pushed,
+                                source,
+                                range.start + piece.start..range.start + piece.end,
+                            );
+                        }
+                        mapped = true;
+                    } else {
+                        block.push(
                             &text,
                             bold > 0,
                             italic > 0,
@@ -288,6 +328,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                             strike > 0,
                             link.as_deref(),
                         );
+                    }
                 }
             }
             Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
@@ -354,7 +395,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                     .push(&format!("[^{label}]"), false, false, false, false, None);
             }
         }
-        if let Some(block) = &mut current {
+        if let Some(block) = current.as_mut().filter(|_| !mapped) {
             let start = before.unwrap_or(0);
             if block.text.len() > start {
                 block.map_source(start..block.text.len(), source, range);
@@ -429,6 +470,7 @@ impl Block {
                 italic,
                 code,
                 strike,
+                highlight: false,
             });
         }
         if let Some(destination) = link {
@@ -496,6 +538,62 @@ impl Block {
             }];
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Inline {
+    Plain,
+    /// `==text==`, shown highlighted without the markers.
+    Highlight,
+    /// `%%text%%`, hidden in the reading view.
+    Comment,
+}
+
+/// Split text into plain runs, Obsidian highlights and comments (markers excluded). Only pairs
+/// within the same text run are recognized; a highlight must not start or end with a space.
+fn obsidian_inline(text: &str) -> Vec<(Range<usize>, Inline)> {
+    let mut pieces = Vec::new();
+    let mut plain = 0;
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        let marker = if rest.starts_with("==") {
+            Some(("==", Inline::Highlight))
+        } else if rest.starts_with("%%") {
+            Some(("%%", Inline::Comment))
+        } else {
+            None
+        };
+        if let Some((marker, kind)) = marker
+            && let Some(length) = rest[2..].find(marker)
+        {
+            let inner = &rest[2..2 + length];
+            let valid = match kind {
+                Inline::Highlight => {
+                    !inner.is_empty()
+                        && !inner.starts_with(char::is_whitespace)
+                        && !inner.ends_with(char::is_whitespace)
+                }
+                _ => true,
+            };
+            if valid {
+                if plain < index {
+                    pieces.push((plain..index, Inline::Plain));
+                }
+                if !inner.is_empty() {
+                    pieces.push((index + 2..index + 2 + length, kind));
+                }
+                index += 4 + length;
+                plain = index;
+                continue;
+            }
+        }
+        index += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    if plain < text.len() {
+        pieces.push((plain..text.len(), Inline::Plain));
+    }
+    pieces
 }
 
 /// Turn blockquotes into callouts: GitHub alerts (`> [!NOTE]`, already parsed by pulldown-cmark)
@@ -800,6 +898,19 @@ mod tests {
             Some(("warning".into(), None, 10))
         );
         assert_eq!(parse_callout_header("[not callout]"), None);
+
+        let obsidian = parse("a ==marked text== b %%hidden%% c == d");
+        let paragraph = &obsidian.blocks[0];
+        assert_eq!(paragraph.text, "a marked text b  c == d");
+        let marked = paragraph.spans.iter().find(|span| span.highlight).unwrap();
+        assert_eq!(&paragraph.text[marked.range.clone()], "marked text");
+        assert_eq!(paragraph.source_offset(2), Some(4));
+        assert_eq!(paragraph.text_offset(0), Some(0));
+        assert_eq!(
+            obsidian_inline("x == y == z"),
+            [(0..11, Inline::Plain)],
+            "spaced pairs are comparisons, not highlights"
+        );
 
         let wiki = parse("[[目标笔记|显示名称]]");
         assert_eq!(wiki.blocks[0].text, "显示名称");
