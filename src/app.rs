@@ -307,6 +307,57 @@ impl Document {
     }
 }
 
+/// The reading view's children: each drawn block alone, each run of other blocks together.
+/// Returns the block ranges, each block's child and each block's top within its child.
+fn group_blocks(
+    drawn: &[bool],
+    heights: &[Option<Pixels>],
+    gaps: &[Pixels],
+) -> (Vec<std::ops::Range<usize>>, Vec<usize>, Vec<Pixels>) {
+    let mut children: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut child_of = Vec::with_capacity(drawn.len());
+    let mut offsets = Vec::with_capacity(drawn.len());
+    let mut run_height = px(0.0);
+    for (index, &draw) in drawn.iter().enumerate() {
+        match children.last_mut() {
+            Some(run) if !draw && index > 0 && !drawn[index - 1] => {
+                run.end = index + 1;
+                offsets.push(run_height);
+            }
+            _ => {
+                children.push(index..index + 1);
+                offsets.push(px(0.0));
+                run_height = px(0.0);
+            }
+        }
+        run_height += heights[index].unwrap_or_default() + gaps[index];
+        child_of.push(children.len() - 1);
+    }
+    (children, child_of, offsets)
+}
+
+/// Heights of reading-view blocks measured in earlier frames. Runs of blocks far from the view
+/// are drawn as one stretch of empty space, which keeps long notes responsive: drawing every
+/// block on each key press took tens of milliseconds in a 3000-line note.
+#[derive(Default)]
+struct BlockHeights {
+    /// The reading view's width when measured; another width wraps text differently.
+    width: Pixels,
+    /// Each block's height, without the space below it.
+    heights: Vec<Option<Pixels>>,
+    /// Space below each block, outside it.
+    gaps: Vec<Pixels>,
+    /// Blocks drawn in full in the last frame, whose heights can be measured.
+    drawn: Vec<bool>,
+    /// The reading view's children in the last frame: each a drawn block, or the run of blocks
+    /// one stretch of empty space stands for.
+    children: Vec<std::ops::Range<usize>>,
+    /// Each block's index in `children`.
+    child_of: Vec<usize>,
+    /// Each block's top within its child: zero for drawn blocks.
+    offsets: Vec<Pixels>,
+}
+
 struct RusidianApp {
     document: Option<Document>,
     vault: Option<Vault>,
@@ -343,6 +394,7 @@ struct RusidianApp {
     fragment_layouts: RefCell<Vec<FragmentLayout>>,
     /// Whether `fragment_layouts` were laid out and prepainted; GPUI panics on unlaid layouts.
     layouts_ready: Rc<Cell<bool>>,
+    block_heights: RefCell<BlockHeights>,
     reading_pending_g: bool,
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
@@ -497,6 +549,7 @@ impl RusidianApp {
             reading_desired_x: None,
             fragment_layouts: RefCell::new(Vec::new()),
             layouts_ready: Rc::new(Cell::new(false)),
+            block_heights: RefCell::new(BlockHeights::default()),
             reading_pending_g: false,
             reading_count: None,
             reading_find: None,
@@ -637,6 +690,9 @@ impl RusidianApp {
         for source in &ready {
             self.tikz.insert(source.clone(), TikzState::Loading);
         }
+        if !ready.is_empty() {
+            self.invalidate_block_heights();
+        }
         self.compile_tikz_sources(ready, cx);
     }
 
@@ -665,6 +721,7 @@ impl RusidianApp {
                         Err(error) => TikzState::Failed(error.into()),
                     };
                     this.tikz.insert(source, state);
+                    this.invalidate_block_heights();
                     cx.notify();
                 })
                 .ok();
@@ -713,6 +770,7 @@ impl RusidianApp {
                     if !this.math.contains_key(&key) {
                         return;
                     }
+                    this.invalidate_block_heights();
                     this.math.insert(
                         key,
                         match result {
@@ -782,6 +840,7 @@ impl RusidianApp {
             };
             self.embeds
                 .insert(path, EmbeddedNote { modified, markdown });
+            self.invalidate_block_heights();
         }
     }
 
@@ -840,6 +899,7 @@ impl RusidianApp {
             return;
         }
         self.remote_images.insert(url.clone(), RemoteImage::Loading);
+        self.invalidate_block_heights();
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
@@ -855,6 +915,7 @@ impl RusidianApp {
                     Err(error) => RemoteImage::Failed(error.into()),
                 };
                 this.remote_images.insert(url, state);
+                this.invalidate_block_heights();
                 cx.notify();
             })
             .ok();
@@ -1317,6 +1378,86 @@ impl RusidianApp {
         });
     }
 
+    /// Forget measured block heights after anything that can change a block's size: the
+    /// note's text, or a formula, diagram, image or embed finishing loading.
+    fn invalidate_block_heights(&self) {
+        *self.block_heights.borrow_mut() = BlockHeights::default();
+    }
+
+    /// Where block `index` was laid out in the last frame, unscrolled like the scroll handle's
+    /// child bounds. A block inside a stretch of empty space gets its share of that stretch.
+    fn block_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
+        let cache = self.block_heights.borrow();
+        let child = *cache.child_of.get(index)?;
+        let bounds = self.reading_scroll.bounds_for_item(child)?;
+        if cache.drawn[index] {
+            return Some(bounds);
+        }
+        Some(Bounds::new(
+            point(bounds.left(), bounds.top() + cache.offsets[index]),
+            size(bounds.size.width, cache.heights[index].unwrap_or_default()),
+        ))
+    }
+
+    /// Which blocks to draw in full this frame: those within a screen and a half of the view,
+    /// the cursor's neighborhood, blocks with images (which size themselves once loaded) and
+    /// any not measured yet. Records how the rest will be grouped into stretches of space.
+    fn plan_blocks(&self, blocks: &[Block], gaps: Vec<Pixels>) -> Vec<bool> {
+        let view = self.reading_scroll.bounds();
+        let usable = {
+            let cache = self.block_heights.borrow();
+            cache.heights.len() == blocks.len() && cache.width == view.size.width
+        };
+        if !usable {
+            *self.block_heights.borrow_mut() = BlockHeights {
+                width: view.size.width,
+                heights: vec![None; blocks.len()],
+                ..BlockHeights::default()
+            };
+        }
+        // Measure the blocks drawn last frame, and find where every block was.
+        let positions: Vec<Option<Bounds<Pixels>>> = (0..blocks.len())
+            .map(|index| self.block_bounds(index))
+            .collect();
+        let mut cache = self.block_heights.borrow_mut();
+        for (index, bounds) in positions.iter().enumerate() {
+            if cache.drawn.get(index) == Some(&true)
+                && let Some(bounds) = bounds
+            {
+                cache.heights[index] = Some(bounds.size.height);
+            }
+        }
+        // Positions in the note are offsets from the view's top; the visible part starts at
+        // minus the scroll offset.
+        let scrolled = -self.reading_scroll.offset().y;
+        let margin = view.size.height * 1.5;
+        let (near_top, near_bottom) = (scrolled - margin, scrolled + view.size.height + margin);
+        let cursor = self.reading_cursor.block;
+        let drawn: Vec<bool> = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| {
+                let Some(bounds) = positions[index]
+                    .filter(|_| cache.heights[index].is_some() && view.size.height > px(0.0))
+                else {
+                    return true;
+                };
+                let top = bounds.top() - view.top();
+                index.abs_diff(cursor) <= 2
+                    || !block.images.is_empty()
+                    || matches!(block.kind, BlockKind::Image(_))
+                    || (top + bounds.size.height >= near_top && top <= near_bottom)
+            })
+            .collect();
+        let (children, child_of, offsets) = group_blocks(&drawn, &cache.heights, &gaps);
+        cache.children = children;
+        cache.child_of = child_of;
+        cache.offsets = offsets;
+        cache.gaps = gaps;
+        cache.drawn.clone_from(&drawn);
+        drawn
+    }
+
     /// Re-read settings another window may have changed.
     fn load_settings(&mut self) {
         let settings = crate::settings::load();
@@ -1509,6 +1650,7 @@ impl RusidianApp {
         self.error = None;
         self.reading_cursor = ReadingCursor::default();
         self.layouts_ready.set(false);
+        self.invalidate_block_heights();
         self.place_initial_cursor = true;
         self.tikz_lines.clear();
         self.synced_cursor = None;
@@ -1645,6 +1787,7 @@ impl RusidianApp {
         document.lines.splice(first..end, replacement);
         if !more {
             document.parse(strict_line_breaks);
+            self.invalidate_block_heights();
             // Layouts from the last frame describe the old text until the next render.
             self.layouts_ready.set(false);
             self.clamp_reading_cursor();
@@ -1864,7 +2007,7 @@ impl RusidianApp {
                 return Some((position.y, position.y + fragment.layout.line_height()));
             }
         }
-        let bounds = self.reading_scroll.bounds_for_item(cursor.block)?;
+        let bounds = self.block_bounds(cursor.block)?;
         let offset = self.reading_scroll.offset().y;
         Some((bounds.top() + offset, bounds.bottom() + offset))
     }
@@ -1876,8 +2019,9 @@ impl RusidianApp {
             .cursor_screen_span()
             .filter(|_| view.size.height > px(0.0))
         else {
-            self.reading_scroll
-                .scroll_to_item(self.reading_cursor.block);
+            let block = self.reading_cursor.block;
+            let child = self.block_heights.borrow().child_of.get(block).copied();
+            self.reading_scroll.scroll_to_item(child.unwrap_or(block));
             return;
         };
         let margin = (view.size.height / 6.0).min(px(48.0));
@@ -1921,12 +2065,15 @@ impl RusidianApp {
             }
         };
         let scroll = self.reading_scroll.offset().y;
+        let heights = self.block_heights.borrow();
+        // Blocks drawn as empty space have no text layout; they count as one position.
+        let placeholder = |index: usize| heights.drawn.get(index) == Some(&false);
         let objects = (0..blocks.len()).filter_map(|index| {
             let block = blocks.get(index)?;
-            if !is_object(block) {
+            if !is_object(block) && !placeholder(index) {
                 return None;
             }
-            let bounds = self.reading_scroll.bounds_for_item(index)?;
+            let bounds = self.block_bounds(index)?;
             Some((index, bounds.top() + scroll, bounds.bottom() + scroll))
         });
         enum Target<'a> {
@@ -4064,6 +4211,60 @@ impl Render for RusidianApp {
             let selection = self.reading_selection.and_then(|selection| {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
             });
+            let blocks = &document.markdown.blocks;
+            // Space below each block: outside it, or inside a quote that continues.
+            let spacing: Vec<(Pixels, bool)> = blocks
+                .iter()
+                .enumerate()
+                .map(|(index, block)| {
+                    let next = blocks.get(index + 1);
+                    (block_gap(block, next), continues_quote(block, next))
+                })
+                .collect();
+            let drawn = self.plan_blocks(
+                blocks,
+                spacing
+                    .iter()
+                    .map(|&(gap, joined)| if joined { px(0.0) } else { gap })
+                    .collect(),
+            );
+            let plan = self.block_heights.borrow();
+            let children = plan.children.iter().map(|run| {
+                if !drawn[run.start] {
+                    // One stretch of space for a run of blocks far from the view.
+                    let height: Pixels = run
+                        .clone()
+                        .map(|index| plan.heights[index].unwrap_or_default() + plan.gaps[index])
+                        .sum();
+                    // Without flex_none the column would shrink empty space to nothing.
+                    return div().flex_none().h(height).into_any_element();
+                }
+                let index = run.start;
+                let block = &blocks[index];
+                let (gap, joined) = spacing[index];
+                div()
+                    .id(("block", index))
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(820.0))
+                    .flex()
+                    .flex_col()
+                    .when(!joined, |element| element.mb(gap))
+                    .child(render_block(
+                        RenderContext {
+                            block_index: index,
+                            ..context
+                        },
+                        block,
+                        self.tikz.get(&block.text),
+                        (reading_cursor.block == index).then_some(reading_cursor.offset),
+                        selection.and_then(|bounds| {
+                            selection_for_block(bounds, index, block_len(block))
+                        }),
+                        if joined { gap } else { px(0.0) },
+                    ))
+                    .into_any_element()
+            });
             div()
                 .flex_1()
                 // Beside the sidebar, wide images or tables must not widen the column.
@@ -4076,44 +4277,10 @@ impl Render for RusidianApp {
                 .p_8()
                 .text_base()
                 .track_scroll(&self.reading_scroll)
-                .children(
-                    document
-                        .markdown
-                        .blocks
-                        .iter()
-                        .enumerate()
-                        .map(|(index, block)| {
-                            let next = document.markdown.blocks.get(index + 1);
-                            let gap = block_gap(block, next);
-                            // Inside one quote the gap stays within the border and background.
-                            let joined = continues_quote(block, next);
-                            div()
-                                .id(("block", index))
-                                .mx_auto()
-                                .w_full()
-                                .max_w(px(820.0))
-                                .flex()
-                                .flex_col()
-                                .when(!joined, |element| element.mb(gap))
-                                .child(render_block(
-                                    RenderContext {
-                                        block_index: index,
-                                        ..context
-                                    },
-                                    block,
-                                    self.tikz.get(&block.text),
-                                    (reading_cursor.block == index)
-                                        .then_some(reading_cursor.offset),
-                                    selection.and_then(|bounds| {
-                                        selection_for_block(bounds, index, block_len(block))
-                                    }),
-                                    if joined { gap } else { px(0.0) },
-                                ))
-                        }),
-                )
+                .children(children)
                 .child({
                     // Prepainted after every block: from here on this frame's text layouts can be
-                    // queried. Kept last so block indices match the scroll handle's children.
+                    // queried. Kept last so child indices match `BlockHeights::children`.
                     let ready = self.layouts_ready.clone();
                     canvas(move |_, _, _| ready.set(true), |_, _, _, _| {})
                         .absolute()
@@ -6372,6 +6539,17 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn groups_blocks_far_from_the_view() {
+        let drawn = [false, false, true, false, false, false, true];
+        let heights = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0].map(|height| Some(px(height)));
+        let gaps = [px(1.0); 7];
+        let (children, child_of, offsets) = group_blocks(&drawn, &heights, &gaps);
+        assert_eq!(children, [0..2, 2..3, 3..6, 6..7]);
+        assert_eq!(child_of, [0, 0, 1, 2, 2, 2, 3]);
+        assert_eq!(offsets, [0.0, 11.0, 0.0, 0.0, 41.0, 92.0, 0.0].map(px));
     }
 
     #[test]
