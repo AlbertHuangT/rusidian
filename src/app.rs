@@ -241,8 +241,10 @@ struct RusidianApp {
     reading_column: Option<usize>,
     /// The horizontal position gj/gk keep while moving between screen lines.
     reading_desired_x: Option<Pixels>,
-    /// Text layouts from the last rendered reading view, for gj/gk.
+    /// Text layouts from the last rendered reading view, for gj/gk, paging and reveal.
     fragment_layouts: RefCell<Vec<FragmentLayout>>,
+    /// Whether `fragment_layouts` were laid out and prepainted; GPUI panics on unlaid layouts.
+    layouts_ready: Rc<Cell<bool>>,
     reading_pending_g: bool,
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
@@ -372,6 +374,7 @@ impl RusidianApp {
             reading_column: None,
             reading_desired_x: None,
             fragment_layouts: RefCell::new(Vec::new()),
+            layouts_ready: Rc::new(Cell::new(false)),
             reading_pending_g: false,
             reading_count: None,
             reading_find: None,
@@ -892,6 +895,7 @@ impl RusidianApp {
         next.nvim_size = self.nvim_size.clone();
         next.cell_size = self.cell_size;
         next.grid_origin = self.grid_origin.clone();
+        next.layouts_ready = self.layouts_ready.clone();
         next.settings_open = self.settings_open;
         next.appearance = self.appearance;
         next.recent = std::mem::take(&mut self.recent);
@@ -1311,35 +1315,177 @@ impl RusidianApp {
         self.last_search = Some(prompt);
     }
 
-    fn reveal_reading_cursor(&self) {
-        self.reading_scroll
-            .scroll_to_item(self.reading_cursor.block);
+    /// The cursor's line on screen (top and bottom) as laid out in the last frame.
+    fn cursor_screen_span(&self) -> Option<(Pixels, Pixels)> {
+        let cursor = self.reading_cursor;
+        let block = self.document.as_ref()?.markdown.blocks.get(cursor.block)?;
+        if !is_object(block)
+            && self.layouts_ready.get()
+            && let Some(byte) = text_range(&block.text, cursor.offset).map(|range| range.start)
+        {
+            let layouts = self.fragment_layouts.borrow();
+            if let Some(fragment) = layouts
+                .iter()
+                .find(|fragment| fragment.block == cursor.block && fragment.range.contains(&byte))
+                && let Some(position) = fragment
+                    .layout
+                    .position_for_index(byte - fragment.range.start)
+            {
+                return Some((position.y, position.y + fragment.layout.line_height()));
+            }
+        }
+        let bounds = self.reading_scroll.bounds_for_item(cursor.block)?;
+        let offset = self.reading_scroll.offset().y;
+        Some((bounds.top() + offset, bounds.bottom() + offset))
     }
 
-    fn scroll_reading(&mut self, down: bool, full_page: bool) {
-        let height = self.reading_scroll.bounds().size.height;
-        if height <= px(0.0) {
+    /// Scroll just enough to show the cursor's line, also inside blocks taller than the view.
+    fn reveal_reading_cursor(&self) {
+        let view = self.reading_scroll.bounds();
+        let Some((top, bottom)) = self
+            .cursor_screen_span()
+            .filter(|_| view.size.height > px(0.0))
+        else {
+            self.reading_scroll
+                .scroll_to_item(self.reading_cursor.block);
+            return;
+        };
+        let margin = (view.size.height / 6.0).min(px(48.0));
+        let offset = self.reading_scroll.offset();
+        let mut y = offset.y;
+        if top < view.top() + margin {
+            y += view.top() + margin - top;
+        } else if bottom > view.bottom() - margin {
+            y -= bottom - (view.bottom() - margin);
+        }
+        let y = y.clamp(-self.reading_scroll.max_offset().y, px(0.0));
+        if y != offset.y {
+            self.reading_scroll.set_offset(point(offset.x, y));
+        }
+    }
+
+    /// The reading position drawn at window position (x, y) in the last frame. Between blocks it
+    /// is the nearest text line or object, preferring the direction of travel (`down`).
+    fn reading_position_at(&self, x: Pixels, y: Pixels, down: bool) -> Option<ReadingCursor> {
+        let blocks = &self.document.as_ref()?.markdown.blocks;
+        let ready = self.layouts_ready.get();
+        let layouts = self.fragment_layouts.borrow();
+        let layouts = if ready { layouts.as_slice() } else { &[] };
+        let horizontal = |bounds: Bounds<Pixels>| {
+            if x < bounds.left() {
+                bounds.left() - x
+            } else if x > bounds.right() {
+                x - bounds.right()
+            } else {
+                px(0.0)
+            }
+        };
+        // Vertical distance to a span, with a small preference for the travel direction.
+        let vertical = |top: Pixels, bottom: Pixels| {
+            if y < top {
+                (top - y) * if down { 1.0 } else { 1.5 }
+            } else if y >= bottom {
+                (y - bottom) * if down { 1.5 } else { 1.0 }
+            } else {
+                px(0.0)
+            }
+        };
+        let scroll = self.reading_scroll.offset().y;
+        let objects = (0..blocks.len()).filter_map(|index| {
+            let block = blocks.get(index)?;
+            if !is_object(block) {
+                return None;
+            }
+            let bounds = self.reading_scroll.bounds_for_item(index)?;
+            Some((index, bounds.top() + scroll, bounds.bottom() + scroll))
+        });
+        enum Target<'a> {
+            Text(&'a FragmentLayout),
+            Object(usize),
+        }
+        let best = layouts
+            .iter()
+            .map(|fragment| {
+                let bounds = fragment.layout.bounds();
+                (
+                    vertical(bounds.top(), bounds.bottom()),
+                    horizontal(bounds),
+                    Target::Text(fragment),
+                )
+            })
+            .chain(objects.map(|(index, top, bottom)| {
+                (vertical(top, bottom), px(0.0), Target::Object(index))
+            }))
+            .min_by(|a, b| {
+                f32::from(a.0)
+                    .total_cmp(&f32::from(b.0))
+                    .then(f32::from(a.1).total_cmp(&f32::from(b.1)))
+            });
+        match best {
+            Some((_, _, Target::Text(fragment))) => {
+                let block = blocks.get(fragment.block)?;
+                let bounds = fragment.layout.bounds();
+                let probe = point(
+                    x.clamp(bounds.left(), bounds.right()),
+                    y.clamp(bounds.top(), bounds.bottom() - px(1.0)),
+                );
+                let index = fragment
+                    .layout
+                    .index_for_position(probe)
+                    .unwrap_or_else(|nearest| nearest);
+                let text = &block.text[fragment.range.clone()];
+                let local = (0..=index.min(text.len()))
+                    .rev()
+                    .find(|byte| text.is_char_boundary(*byte))
+                    .unwrap_or(0);
+                let offset = visible_offset(&block.text, fragment.range.start + local)
+                    .min(block_len(block).saturating_sub(1));
+                Some(ReadingCursor {
+                    block: fragment.block,
+                    offset,
+                })
+            }
+            Some((_, _, Target::Object(block))) => Some(ReadingCursor { block, offset: 0 }),
+            None => None,
+        }
+    }
+
+    /// Ctrl-d/u (half page) and Ctrl-f/b (full page): scroll, keeping the cursor at the same
+    /// height on screen like Vim. At either end the cursor moves instead.
+    fn scroll_reading(&mut self, down: bool, full_page: bool, count: usize) {
+        let view = self.reading_scroll.bounds();
+        if view.size.height <= px(0.0) {
             return;
         }
-        let distance = height * if full_page { 1.0 } else { 0.5 };
+        let distance =
+            view.size.height * if full_page { 1.0 } else { 0.5 } * count.clamp(1, 100) as f32;
         let offset = self.reading_scroll.offset();
         let maximum = self.reading_scroll.max_offset().y;
         let y = (offset.y + if down { -distance } else { distance }).clamp(-maximum, px(0.0));
-        self.reading_scroll.set_offset(point(offset.x, y));
-
-        let visible = self
-            .reading_scroll
-            .bottom_item()
-            .saturating_sub(self.reading_scroll.top_item())
-            + 1;
-        let lines = if full_page {
-            visible
-        } else {
-            visible.div_ceil(2)
+        let delta = y - offset.y;
+        let (anchor_x, anchor_y) = match self.cursor_screen_span() {
+            Some((top, bottom)) => (
+                self.reading_desired_x.unwrap_or(view.left()),
+                ((top + bottom) / 2.0).clamp(view.top(), view.bottom() - px(1.0)),
+            ),
+            None => (view.left(), view.top()),
         };
-        for _ in 0..lines {
-            self.move_reading_line(down);
+        // Layouts are from before the scroll: the content that will sit at `anchor_y` is the
+        // content currently at `anchor_y - delta`.
+        let probe = if delta == px(0.0) {
+            anchor_y + if down { distance } else { -distance }
+        } else {
+            anchor_y - delta
+        };
+        self.reading_scroll.set_offset(point(offset.x, y));
+        if let Some(cursor) = self.reading_position_at(anchor_x, probe, down)
+            && cursor != self.reading_cursor
+        {
+            self.reading_cursor = cursor;
+        } else if delta == px(0.0) {
+            self.move_reading_document_edge(down);
         }
+        self.reading_column = None;
     }
 
     fn current_link(&self) -> Option<String> {
@@ -1504,6 +1650,9 @@ impl RusidianApp {
         else {
             return false;
         };
+        if !self.layouts_ready.get() {
+            return false;
+        }
         let layouts = self.fragment_layouts.borrow();
         let fragments = layouts
             .iter()
@@ -1772,9 +1921,7 @@ impl RusidianApp {
                     _ => return,
                 };
                 let count = self.take_reading_count();
-                for _ in 0..count {
-                    self.scroll_reading(down, full_page);
-                }
+                self.scroll_reading(down, full_page, count);
                 self.reading_pending_g = false;
                 cx.notify();
                 return;
@@ -3085,7 +3232,10 @@ impl Render for RusidianApp {
         );
         let view = cx.entity().downgrade();
         self.fragment_layouts.borrow_mut().clear();
-        let reading = if let Some(document) = &self.document {
+        self.layouts_ready.set(false);
+        let reading = if self.view == View::Source {
+            div().into_any_element()
+        } else if let Some(document) = &self.document {
             let context = RenderContext {
                 theme: &theme,
                 math: &self.math,
@@ -3149,6 +3299,14 @@ impl Render for RusidianApp {
                                 ))
                         }),
                 )
+                .child({
+                    // Prepainted after every block: from here on this frame's text layouts can be
+                    // queried. Kept last so block indices match the scroll handle's children.
+                    let ready = self.layouts_ready.clone();
+                    canvas(move |_, _, _| ready.set(true), |_, _, _, _| {})
+                        .absolute()
+                        .size_0()
+                })
                 .into_any_element()
         } else {
             div()
@@ -3545,7 +3703,8 @@ fn render_block(
     let theme = context.theme;
     let links = context.links;
     let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
-    let text = styled_fragment(context, block, 0..block.text.len(), cursor, selection);
+    // Only text blocks lay the fragment out; objects must not register an unused layout.
+    let text = || styled_fragment(context, block, 0..block.text.len(), cursor, selection);
 
     let content = match &block.kind {
         BlockKind::Heading(level) => div()
@@ -3557,7 +3716,7 @@ fn render_block(
                 _ => 19.0,
             }))
             .font_weight(FontWeight::SEMIBOLD)
-            .child(text)
+            .child(text())
             .into_any_element(),
         BlockKind::Paragraph if !block.images.is_empty() => {
             render_inline_paragraph(context, block, cursor, selection)
@@ -3565,7 +3724,7 @@ fn render_block(
         BlockKind::Paragraph if !block.maths.is_empty() => {
             render_inline_paragraph(context, block, cursor, selection)
         }
-        BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
+        BlockKind::Paragraph => div().mb_4().child(text()).into_any_element(),
         BlockKind::Image(source) => {
             let source_label = source.clone();
             let alt = block.text.clone();
@@ -3661,7 +3820,7 @@ fn render_block(
                         .child(language.clone()),
                 )
             })
-            .child(text)
+            .child(text())
             .into_any_element(),
         BlockKind::Html | BlockKind::Metadata => div()
             .mb_4()
@@ -3669,7 +3828,7 @@ fn render_block(
             .rounded_md()
             .bg(rgb(theme.block))
             .font_family(crate::fonts::mono())
-            .child(text)
+            .child(text())
             .into_any_element(),
         BlockKind::Rule => div()
             .my_4()
@@ -3745,14 +3904,14 @@ fn render_block(
                     .text_color(rgb(theme.accent))
                     .child(format!("[^{label}]")),
             )
-            .child(text)
+            .child(text())
             .into_any_element(),
         BlockKind::DefinitionTitle => div()
             .mt_3()
             .font_weight(FontWeight::BOLD)
-            .child(text)
+            .child(text())
             .into_any_element(),
-        BlockKind::Definition => div().mb_3().ml_6().child(text).into_any_element(),
+        BlockKind::Definition => div().mb_3().ml_6().child(text()).into_any_element(),
     };
     let content = if is_object(block) {
         div()
