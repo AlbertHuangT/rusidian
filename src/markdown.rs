@@ -164,8 +164,14 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     let mut wiki_fragment = false;
     // Footnote labels in the order they are first referenced.
     let mut footnotes: Vec<String> = Vec::new();
+    let comments = comment_ranges(source);
 
     for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+        // Whatever lies inside a comment is not shown; an element's start and end share its
+        // range, so they are skipped together.
+        if inside(&comments, &range) {
+            continue;
+        }
         let before = current.as_ref().map(|block: &Block| block.text.len());
         // Set when an event maps its own pieces to the source.
         let mut mapped = false;
@@ -359,38 +365,46 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                             block.kind,
                             BlockKind::Code(_) | BlockKind::Html | BlockKind::Metadata
                         );
-                    let pieces = obsidian_inline(&text);
                     // Pieces map to exact source ranges only when the text is the source verbatim.
                     let verbatim = source.get(range.clone()) == Some(&*text);
-                    if pieces.len() > 1 && verbatim {
-                        for (piece, kind) in pieces {
-                            if kind == Inline::Comment {
-                                continue;
+                    // The text outside comments that start or end inside it.
+                    let parts = if verbatim {
+                        uncommented(&comments, range.clone())
+                    } else {
+                        vec![range.clone()]
+                    };
+                    if verbatim
+                        && (parts.len() != 1
+                            || parts[0] != range
+                            || obsidian_inline(&text).len() > 1)
+                    {
+                        for part in parts {
+                            for (piece, kind) in obsidian_inline(&source[part.clone()]) {
+                                if kind == Inline::Comment {
+                                    continue;
+                                }
+                                let piece = part.start + piece.start..part.start + piece.end;
+                                let start = block.text.len();
+                                block.push_text(
+                                    &source[piece.clone()],
+                                    (bold > 0, italic > 0, strike > 0),
+                                    link.as_deref(),
+                                    marks,
+                                );
+                                let pushed = start..block.text.len();
+                                if kind == Inline::Highlight {
+                                    block.spans.push(Span {
+                                        range: pushed.clone(),
+                                        bold: false,
+                                        italic: false,
+                                        code: false,
+                                        strike: false,
+                                        highlight: true,
+                                        tag: false,
+                                    });
+                                }
+                                block.map_source(pushed, source, piece);
                             }
-                            let start = block.text.len();
-                            block.push_text(
-                                &text[piece.clone()],
-                                (bold > 0, italic > 0, strike > 0),
-                                link.as_deref(),
-                                marks,
-                            );
-                            let pushed = start..block.text.len();
-                            if kind == Inline::Highlight {
-                                block.spans.push(Span {
-                                    range: pushed.clone(),
-                                    bold: false,
-                                    italic: false,
-                                    code: false,
-                                    strike: false,
-                                    highlight: true,
-                                    tag: false,
-                                });
-                            }
-                            block.map_source(
-                                pushed,
-                                source,
-                                range.start + piece.start..range.start + piece.end,
-                            );
                         }
                         mapped = true;
                     } else {
@@ -489,6 +503,67 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
     number_footnotes(&mut blocks, &mut footnotes);
     attach_standalone_block_ids(&mut blocks);
     MarkdownDocument { blocks }
+}
+
+/// Obsidian's `%%comments%%`, inline or across lines and blocks: the source ranges they take,
+/// markers included. `%%` in code does not count, and one left open is shown as written.
+fn comment_ranges(source: &str) -> Vec<Range<usize>> {
+    if !source.contains("%%") {
+        return Vec::new();
+    }
+    let mut markers = Vec::new();
+    let mut code = 0;
+    for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::MetadataBlock(_)) => code += 1,
+            Event::End(TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_)) => {
+                code -= 1;
+            }
+            Event::Text(_) if code == 0 => {
+                let raw = &source[range.clone()];
+                let mut from = 0;
+                while let Some(at) = raw[from..].find("%%") {
+                    markers.push(range.start + from + at);
+                    from += at + 2;
+                }
+            }
+            _ => {}
+        }
+    }
+    markers
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[open, close]| *open..close + 2)
+        .collect()
+}
+
+/// Whether `range` lies wholly inside one of the (sorted) `comments`.
+fn inside(comments: &[Range<usize>], range: &Range<usize>) -> bool {
+    let index = comments.partition_point(|comment| comment.end < range.end);
+    comments
+        .get(index)
+        .is_some_and(|comment| comment.start <= range.start && range.end <= comment.end)
+}
+
+/// The parts of `range` outside the (sorted) `comments`.
+fn uncommented(comments: &[Range<usize>], range: Range<usize>) -> Vec<Range<usize>> {
+    let mut parts = Vec::new();
+    let mut start = range.start;
+    let first = comments.partition_point(|comment| comment.end <= range.start);
+    for comment in comments[first..]
+        .iter()
+        .take_while(|comment| comment.start < range.end)
+    {
+        if comment.start > start {
+            parts.push(start..comment.start);
+        }
+        start = start.max(comment.end);
+    }
+    if start < range.end {
+        parts.push(start..range.end);
+    }
+    parts
 }
 
 /// A paragraph holding only `^id` names the block before it (how Obsidian marks lists, quotes
@@ -1438,5 +1513,23 @@ mod tests {
         let wiki = parse("[[目标笔记|显示名称]]");
         assert_eq!(wiki.blocks[0].text, "显示名称");
         assert_eq!(wiki.blocks[0].links[0].destination, "目标笔记");
+    }
+
+    #[test]
+    fn hides_comments_across_lines_and_blocks() {
+        let source =
+            "a %%one\ntwo%% b\n\n%%\nhidden\n\n- item\n\n# Title\n%%\n\n`%%x%%` and %% open\n";
+        let blocks = parse(source).blocks;
+        let texts: Vec<_> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["a  b", "%%x%% and %% open"]);
+        // What is shown still maps to its source.
+        assert_eq!(
+            blocks[0].source_offset(3),
+            source.find(" b").map(|at| at + 1)
+        );
+        assert!(comment_ranges("no comments").is_empty());
+        assert_eq!(uncommented(&[2..4, 6..8], 0..10), [0..2, 4..6, 8..10]);
+        let comments = [2..8, 10..12];
+        assert!(inside(&comments, &(3..5)) && !inside(&comments, &(1..5)));
     }
 }
