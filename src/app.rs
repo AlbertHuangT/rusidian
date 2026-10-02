@@ -56,8 +56,27 @@ fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
+/// Paths from `file://` URLs the system asks the app to open (Finder, “Open With”).
+fn paths_from_urls(urls: Vec<String>) -> Vec<PathBuf> {
+    urls.into_iter()
+        .filter_map(|url| {
+            cargo_packager_updater::url::Url::parse(&url)
+                .ok()?
+                .to_file_path()
+                .ok()
+        })
+        .collect()
+}
+
 pub fn run(initial_path: Option<PathBuf>) {
-    application().run(move |cx: &mut App| {
+    let (opened_paths, opened) = async_channel::unbounded::<PathBuf>();
+    let app = application();
+    app.on_open_urls(move |urls| {
+        for path in paths_from_urls(urls) {
+            let _ = opened_paths.try_send(path);
+        }
+    });
+    app.run(move |cx: &mut App| {
         crate::fonts::init(cx);
         cx.bind_keys(key_bindings());
         cx.set_menus([
@@ -108,6 +127,28 @@ pub fn run(initial_path: Option<PathBuf>) {
                     close_window_app
                         .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
                         .ok();
+                });
+                let open_app = app.downgrade();
+                cx.spawn(async move |cx| {
+                    while let Ok(path) = opened.recv().await {
+                        let opened = open_app.update(cx, |app, cx| {
+                            let vault_root = app.vault.as_ref().and_then(|vault| {
+                                path.starts_with(&vault.root).then(|| vault.root.clone())
+                            });
+                            app.request_close(PendingClose::Open { path, vault_root }, cx);
+                        });
+                        if opened.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                let close_app = app.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    close_app
+                        .update(cx, |app, cx| app.request_close(PendingClose::Quit, cx))
+                        .ok();
+                    false
                 });
                 app
             },
@@ -3432,6 +3473,17 @@ mod tests {
                 .is_some_and(|vault| vault.files.len() >= 3)
         );
         assert!(vault.document.is_some());
+    }
+
+    #[test]
+    fn reads_paths_from_system_open_urls() {
+        assert_eq!(
+            paths_from_urls(vec![
+                "file:///Users/me/My%20Notes/%E4%B8%AD%E6%96%87.md".into(),
+                "https://example.com/a.md".into(),
+            ]),
+            [PathBuf::from("/Users/me/My Notes/中文.md")]
+        );
     }
 
     #[test]
