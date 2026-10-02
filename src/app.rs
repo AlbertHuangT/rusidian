@@ -49,6 +49,7 @@ actions!(
         NextTab,
         PreviousTab,
         ToggleSidebar,
+        QuickSwitcher,
         EnterSourceNormal
     ]
 );
@@ -90,6 +91,7 @@ fn key_bindings() -> Vec<KeyBinding> {
             context,
         ),
         KeyBinding::new(&format!("{modifier}-\\"), ToggleSidebar, context),
+        KeyBinding::new(&format!("{modifier}-p"), QuickSwitcher, context),
         KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
     ]
 }
@@ -125,6 +127,7 @@ pub fn run(initial_path: Option<PathBuf>) {
             ]),
             Menu::new("文件").items([
                 MenuItem::action("新建窗口", NewWindow),
+                MenuItem::action("快速打开笔记…", QuickSwitcher),
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
                 MenuItem::separator(),
@@ -406,6 +409,7 @@ struct RusidianApp {
     marked_text: String,
     marked_selection: std::ops::Range<usize>,
     settings_open: bool,
+    switcher: Option<Switcher>,
     /// The window showing this app, to close it once Neovim agrees.
     window: Option<AnyWindowHandle>,
     appearance: Appearance,
@@ -504,6 +508,56 @@ struct SearchPrompt {
     forward: bool,
 }
 
+/// The quick switcher: find a note by name and open it.
+#[derive(Default)]
+struct Switcher {
+    query: String,
+    selected: usize,
+}
+
+/// A note the quick switcher offers: its path, name and folder.
+struct SwitcherItem {
+    path: PathBuf,
+    name: String,
+    folder: String,
+}
+
+/// Rows the quick switcher shows.
+const SWITCHER_ROWS: usize = 12;
+
+/// How well `query` matches `text` (a note's folder and name), ignoring case and spaces: its
+/// characters must appear in order. Consecutive characters, word starts and matches in the
+/// name (from character `name_start` on) score higher; `None` when it does not match.
+fn fuzzy_score(query: &str, text: &str, name_start: usize) -> Option<i64> {
+    let text: Vec<char> = text
+        .chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .collect();
+    let mut score = 0;
+    let mut from = 0;
+    let mut previous: Option<usize> = None;
+    for wanted in query
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+    {
+        let found = (from..text.len()).find(|&index| text[index] == wanted)?;
+        score += 1;
+        if previous.is_some_and(|previous| previous + 1 == found) {
+            score += 5;
+        }
+        if found >= name_start {
+            score += 2;
+        }
+        if found == 0 || matches!(text[found - 1], '/' | ' ' | '-' | '_' | '.') {
+            score += 3;
+        }
+        previous = Some(found);
+        from = found + 1;
+    }
+    Some(score * 100 - text.len() as i64)
+}
+
 #[derive(Clone, Copy)]
 enum WordMotion {
     Next,
@@ -563,6 +617,7 @@ impl RusidianApp {
             marked_text: String::new(),
             marked_selection: 0..0,
             settings_open: false,
+            switcher: None,
             window: None,
             appearance: settings.appearance,
             reading_key: settings.reading_key,
@@ -992,6 +1047,101 @@ impl RusidianApp {
 
     fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = true;
+        self.switcher = None;
+        cx.notify();
+    }
+
+    fn open_switcher(&mut self, _: &QuickSwitcher, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.marked_text.clear();
+        self.switcher = Some(Switcher::default());
+        cx.notify();
+    }
+
+    /// Notes matching the switcher's query, best first: the vault's notes, or recent files
+    /// without a vault. With no query, recent notes come first.
+    fn switcher_items(&self) -> Vec<SwitcherItem> {
+        let query = self
+            .switcher
+            .as_ref()
+            .map(|switcher| switcher.query.as_str())
+            .unwrap_or_default();
+        let root = self.vault.as_ref().map(|vault| vault.root.as_path());
+        let candidates: Vec<&PathBuf> = match &self.vault {
+            Some(vault) => vault.files.iter().collect(),
+            None => self.recent.iter().filter(|path| path.is_file()).collect(),
+        };
+        let item = |path: &PathBuf| {
+            let relative = root
+                .and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            SwitcherItem {
+                path: path.clone(),
+                name: relative
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                folder: relative
+                    .parent()
+                    .map(|folder| folder.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            }
+        };
+        if query.trim().is_empty() {
+            let recent = self.recent.iter().filter(|path| candidates.contains(path));
+            let rest = candidates
+                .iter()
+                .copied()
+                .filter(|path| !self.recent.contains(path));
+            return recent.chain(rest).map(item).collect();
+        }
+        let mut scored: Vec<(i64, SwitcherItem)> = candidates
+            .into_iter()
+            .map(item)
+            .filter_map(|item| {
+                // Inside a vault the folder helps tell notes apart; recent files outside one
+                // have absolute folders, which would match nearly anything.
+                let text = if item.folder.is_empty() || root.is_none() {
+                    item.name.clone()
+                } else {
+                    format!("{}/{}", item.folder, item.name)
+                };
+                let name_start = text.chars().count() - item.name.chars().count();
+                fuzzy_score(query, &text, name_start).map(|score| (score, item))
+            })
+            .collect();
+        scored.sort_by(|(a, first), (b, second)| {
+            b.cmp(a)
+                .then_with(|| first.name.len().cmp(&second.name.len()))
+                .then_with(|| first.path.cmp(&second.path))
+        });
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+
+    fn open_switcher_selection(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        let items = self.switcher_items();
+        let selected = index
+            .or_else(|| self.switcher.as_ref().map(|switcher| switcher.selected))
+            .unwrap_or(0);
+        let Some(item) = items.get(selected.min(items.len().saturating_sub(1))) else {
+            return;
+        };
+        let path = item.path.clone();
+        self.switcher = None;
+        self.marked_text.clear();
+        self.request_close(
+            PendingClose::Open {
+                vault_root: self
+                    .vault
+                    .as_ref()
+                    .filter(|vault| path.starts_with(&vault.root))
+                    .map(|vault| vault.root.clone()),
+                path,
+                fragment: None,
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -2627,6 +2777,37 @@ impl RusidianApp {
             }
             return;
         }
+        if let Some(switcher) = &mut self.switcher {
+            let control = event.keystroke.modifiers.control;
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.switcher = None;
+                    self.marked_text.clear();
+                }
+                "enter" => self.open_switcher_selection(None, cx),
+                "up" => switcher.selected = switcher.selected.saturating_sub(1),
+                "p" | "k" if control => switcher.selected = switcher.selected.saturating_sub(1),
+                "down" => switcher.selected = (switcher.selected + 1).min(SWITCHER_ROWS - 1),
+                "n" | "j" if control => {
+                    switcher.selected = (switcher.selected + 1).min(SWITCHER_ROWS - 1);
+                }
+                "backspace" => {
+                    switcher.query.pop();
+                    switcher.selected = 0;
+                }
+                _ if event.keystroke.key_char.is_some()
+                    && !control
+                    && !event.keystroke.modifiers.platform =>
+                {
+                    // Typed text, IME composition included, arrives through the input handler.
+                    cx.propagate();
+                    return;
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         if self.view == View::Reading {
             if self.notice.take().is_some() {
                 cx.notify();
@@ -3617,6 +3798,143 @@ impl RusidianApp {
         cx.stop_propagation();
     }
 
+    fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let switcher = self.switcher.as_ref();
+        let query = switcher
+            .map(|switcher| switcher.query.clone())
+            .unwrap_or_default();
+        let items = self.switcher_items();
+        let selected = switcher
+            .map(|switcher| switcher.selected)
+            .unwrap_or(0)
+            .min(items.len().saturating_sub(1));
+        let typed = format!("{query}{}", self.marked_text);
+        let input = div()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(rgb(theme.border))
+            .when(typed.is_empty(), |element| {
+                element
+                    .text_color(rgb(theme.faint))
+                    .child(if self.vault.is_some() {
+                        "输入笔记名称…"
+                    } else {
+                        "输入最近打开的文件名…"
+                    })
+            })
+            .when(!typed.is_empty(), |element| element.child(typed))
+            .child(div().ml_px().w(px(2.0)).h(px(18.0)).bg(rgb(theme.accent)));
+        let rows = items
+            .iter()
+            .take(SWITCHER_ROWS)
+            .enumerate()
+            .map(|(index, item)| {
+                div()
+                    .id(("switcher-row", index))
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .items_baseline()
+                    .gap_3()
+                    .cursor_pointer()
+                    .when(index == selected, |element| {
+                        element.bg(rgb(theme.accent_soft_bg))
+                    })
+                    .when(index != selected, |element| {
+                        element.hover(|element| element.bg(rgb(theme.hover)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_switcher_selection(Some(index), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(320.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(rgb(if index == selected {
+                                theme.accent_soft_text
+                            } else {
+                                theme.text
+                            }))
+                            .child(item.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .text_color(rgb(theme.faint))
+                            .child(item.folder.clone()),
+                    )
+            });
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(72.0))
+            .px_4()
+            .bg(rgb(theme.overlay).opacity(theme.overlay_opacity * 0.5))
+            .id("switcher-backdrop")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.switcher = None;
+                this.marked_text.clear();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("switcher")
+                    .w(px(560.0))
+                    .max_h(px(520.0))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme.card_border))
+                    .bg(rgb(theme.panel))
+                    // Clicks inside the panel do not close it.
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(input)
+                    .children(rows)
+                    .when(items.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .px_4()
+                                .py_3()
+                                .text_sm()
+                                .text_color(rgb(theme.muted))
+                                .child(if query.trim().is_empty() {
+                                    "没有可打开的笔记"
+                                } else {
+                                    "没有匹配的笔记"
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .border_t_1()
+                            .border_color(rgb(theme.border))
+                            .text_xs()
+                            .text_color(rgb(theme.faint))
+                            .child("↑↓ 选择 · Enter 打开 · Esc 关闭"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let busy = matches!(
@@ -4140,6 +4458,13 @@ impl EntityInputHandler for RusidianApp {
     ) {
         self.marked_text.clear();
         self.marked_selection = 0..0;
+        if let Some(switcher) = &mut self.switcher {
+            switcher.query.push_str(text);
+            switcher.selected = 0;
+            window.invalidate_character_coordinates();
+            cx.notify();
+            return;
+        }
         match self.view {
             View::Reading if !self.settings_open => {
                 if let Some(search) = &mut self.reading_search {
@@ -4180,6 +4505,16 @@ impl EntityInputHandler for RusidianApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.switcher.is_some() {
+            // The candidate window opens under the switcher's query.
+            return Some(Bounds::new(
+                point(
+                    element_bounds.center().x - px(260.0),
+                    element_bounds.top() + px(96.0),
+                ),
+                size(px(8.0), px(18.0)),
+            ));
+        }
         if self.view == View::Reading && self.reading_search.is_some() {
             return Some(Bounds::new(
                 point(
@@ -4213,7 +4548,8 @@ impl EntityInputHandler for RusidianApp {
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        (self.view == View::Source && self.grid.accepts_text_input())
+        self.switcher.is_some()
+            || (self.view == View::Source && self.grid.accepts_text_input())
             || (self.view == View::Reading && self.reading_search.is_some())
     }
 }
@@ -4244,6 +4580,7 @@ impl Render for RusidianApp {
             )
         });
         let settings = self.settings_open.then(|| self.render_settings(cx));
+        let switcher = self.switcher.is_some().then(|| self.render_switcher(cx));
 
         let text_baseline = f32::from(
             cx.text_system().baseline_offset(
@@ -4524,7 +4861,10 @@ impl Render for RusidianApp {
         };
 
         div()
-            .key_context(if self.view == View::Source {
+            .key_context(if self.switcher.is_some() {
+                // Keys belong to the switcher, not to Enter-to-edit or Neovim.
+                "Switcher"
+            } else if self.view == View::Source {
                 "Source"
             } else if self.reading_search.is_some() {
                 "ReadingSearch"
@@ -4534,6 +4874,7 @@ impl Render for RusidianApp {
             .on_action(cx.listener(Self::choose_file))
             .on_action(cx.listener(Self::choose_folder))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_tab(cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, _, cx| {
                 this.request_close(PendingClose::CloseWindow, cx);
@@ -4573,7 +4914,11 @@ impl Render for RusidianApp {
                                 self.document
                                     .as_ref()
                                     .map(|document| document.path.clone())
-                                    .unwrap_or_else(|| "技术原型".into()),
+                                    .or_else(|| {
+                                        let vault = self.vault.as_ref()?;
+                                        Some(vault.root.to_string_lossy().into_owned().into())
+                                    })
+                                    .unwrap_or_default(),
                             ),
                     ),
             )
@@ -4601,6 +4946,7 @@ impl Render for RusidianApp {
                 },
             )
             .when_some(settings, |element, settings| element.child(settings))
+            .when_some(switcher, |element, switcher| element.child(switcher))
     }
 }
 
@@ -6645,6 +6991,22 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn scores_fuzzy_note_matches() {
+        let score = |query: &str, folder: &str, name: &str| {
+            let text = format!("{folder}{name}");
+            fuzzy_score(query, &text, folder.chars().count())
+        };
+        assert!(score("plan", "Projects/Rusidian/", "plan").is_some());
+        assert!(score("xyz", "Projects/", "plan").is_none());
+        // Order matters; case and spaces do not.
+        assert!(score("nalp", "", "plan").is_none());
+        assert!(score("P LAN", "", "plan").is_some());
+        // Consecutive letters in the name beat scattered ones in folders.
+        assert!(score("plan", "", "plan") > score("plan", "people/landing/", "notes"));
+        assert!(score("日记", "Daily/", "2026 日记") > score("日记", "日/", "记录"));
     }
 
     #[test]
