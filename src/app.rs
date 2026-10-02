@@ -403,6 +403,13 @@ struct RusidianApp {
     layouts_ready: Rc<Cell<bool>>,
     block_heights: RefCell<BlockHeights>,
     reading_pending_g: bool,
+    /// `z` was typed; `za` toggles the callout at the cursor.
+    reading_pending_z: bool,
+    /// Foldable callouts (by quote id) toggled from how they start.
+    callout_toggles: HashSet<usize>,
+    /// A callout just folded with `za` and the cursor left on its title, which stays folded
+    /// until the cursor moves. Anywhere else, the cursor opens a folded callout it is in.
+    callout_cursor_parked: Option<(usize, ReadingCursor)>,
     reading_count: Option<usize>,
     reading_find: Option<FindPending>,
     reading_selection: Option<ReadingSelection>,
@@ -834,6 +841,9 @@ impl RusidianApp {
             layouts_ready: Rc::new(Cell::new(false)),
             block_heights: RefCell::new(BlockHeights::default()),
             reading_pending_g: false,
+            reading_pending_z: false,
+            callout_toggles: HashSet::new(),
+            callout_cursor_parked: None,
             reading_count: None,
             reading_find: None,
             reading_selection: None,
@@ -1954,6 +1964,28 @@ impl RusidianApp {
         );
         self.tree_rows.replace(Some(rows.clone()));
         rows
+    }
+
+    /// Foldable callouts shown folded now: those starting folded (`[!tip]-`) unless toggled,
+    /// and those starting open (`[!tip]+`) once toggled.
+    fn folded_callouts(&self, blocks: &[Block]) -> HashSet<usize> {
+        blocks
+            .iter()
+            .filter(|block| block.callout_title.is_some())
+            .filter_map(|block| {
+                let id = block.callout_quote?;
+                let starts_folded = block.callout_fold?;
+                (starts_folded != self.callout_toggles.contains(&id)).then_some(id)
+            })
+            .collect()
+    }
+
+    fn toggle_callout(&mut self, id: usize, cx: &mut Context<Self>) {
+        if !self.callout_toggles.remove(&id) {
+            self.callout_toggles.insert(id);
+        }
+        self.invalidate_block_heights();
+        cx.notify();
     }
 
     /// Forget measured block heights after anything that can change a block's size: the
@@ -3452,6 +3484,48 @@ impl RusidianApp {
                 }
                 return;
             }
+            if std::mem::take(&mut self.reading_pending_z) {
+                if key == Some("a")
+                    && let Some(id) = self.document.as_ref().and_then(|document| {
+                        let block = document.markdown.blocks.get(self.reading_cursor.block)?;
+                        let id = block.callout_quote?;
+                        // Only callouts written as foldable fold.
+                        document
+                            .markdown
+                            .blocks
+                            .iter()
+                            .any(|block| {
+                                block.callout_quote == Some(id) && block.callout_fold.is_some()
+                            })
+                            .then_some(id)
+                    })
+                {
+                    self.toggle_callout(id, cx);
+                    // Folding moves the cursor out of the hidden part, onto the title line.
+                    if self.document.as_ref().is_some_and(|document| {
+                        self.folded_callouts(&document.markdown.blocks)
+                            .contains(&id)
+                    }) && let Some(first) = self.document.as_ref().and_then(|document| {
+                        document
+                            .markdown
+                            .blocks
+                            .iter()
+                            .position(|block| block.callout_quote == Some(id))
+                    }) {
+                        self.reading_cursor = ReadingCursor {
+                            block: first,
+                            offset: 0,
+                        };
+                        self.callout_cursor_parked = Some((id, self.reading_cursor));
+                    }
+                }
+                self.reading_count = None;
+                return;
+            }
+            if key == Some("z") {
+                self.reading_pending_z = true;
+                return;
+            }
             if key == Some("g") {
                 self.reading_pending_g = true;
                 return;
@@ -4113,6 +4187,9 @@ impl RusidianApp {
             }
             if self.reading_pending_g {
                 pending.push('g');
+            }
+            if self.reading_pending_z {
+                pending.push('z');
             }
             if let Some(find) = self.reading_find {
                 pending.push(match (find.forward, find.till) {
@@ -4852,6 +4929,7 @@ impl RusidianApp {
                     ),
                     ("/ ? n N · * #".to_owned(), "查找".to_owned()),
                     ("v V · y".to_owned(), "选择并复制".to_owned()),
+                    ("za".to_owned(), "折叠 / 展开可折叠的 callout".to_owned()),
                     (
                         "gf · gx".to_owned(),
                         "打开链接、嵌入、标签 / 用系统应用打开".to_owned(),
@@ -5289,6 +5367,26 @@ impl Render for RusidianApp {
         let view = cx.entity().downgrade();
         self.fragment_layouts.borrow_mut().clear();
         self.layouts_ready.set(false);
+        // The cursor never hides: a folded callout it is in opens, unless it was just folded
+        // with the cursor parked on its title.
+        if self.view == View::Reading
+            && let Some(document) = &self.document
+            && let Some(id) = document
+                .markdown
+                .blocks
+                .get(self.reading_cursor.block)
+                .and_then(|block| block.callout_quote)
+            && self
+                .folded_callouts(&document.markdown.blocks)
+                .contains(&id)
+            && self.callout_cursor_parked != Some((id, self.reading_cursor))
+        {
+            if !self.callout_toggles.remove(&id) {
+                self.callout_toggles.insert(id);
+            }
+            self.callout_cursor_parked = None;
+            self.invalidate_block_heights();
+        }
         let reading = if self.view == View::Source {
             div().into_any_element()
         } else if let Some(document) = &self.document {
@@ -5323,13 +5421,21 @@ impl Render for RusidianApp {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
             });
             let blocks = &document.markdown.blocks;
+            let folded = self.folded_callouts(blocks);
+            // A folded callout shows its title on its first block; the rest of it is hidden.
+            let in_folded =
+                |block: &Block| block.callout_quote.is_some_and(|id| folded.contains(&id));
             // Space below each block: outside it, or inside a quote that continues.
             let spacing: Vec<(Pixels, usize)> = blocks
                 .iter()
                 .enumerate()
-                .map(|(index, block)| {
-                    let next = blocks.get(index + 1);
-                    (block_gap(block, next), shared_quote_depth(block, next))
+                .map(|(index, block)| match in_folded(block) {
+                    true if block.callout_title.is_some() => (px(16.0), 0),
+                    true => (px(0.0), 0),
+                    false => {
+                        let next = blocks.get(index + 1);
+                        (block_gap(block, next), shared_quote_depth(block, next))
+                    }
                 })
                 .collect();
             let drawn = self.plan_blocks(
@@ -5354,6 +5460,28 @@ impl Render for RusidianApp {
                 let block = &blocks[index];
                 let (gap, shared) = spacing[index];
                 let joined = shared > 0;
+                if in_folded(block) {
+                    let wrapper = div()
+                        .id(("block", index))
+                        .mx_auto()
+                        .w_full()
+                        .max_w(px(820.0));
+                    return match block.callout_title.as_ref() {
+                        Some(title) => wrapper
+                            .mb(gap)
+                            .child(render_folded_callout(
+                                RenderContext {
+                                    block_index: index,
+                                    ..context
+                                },
+                                block,
+                                title,
+                                reading_cursor.block == index,
+                            ))
+                            .into_any_element(),
+                        None => wrapper.into_any_element(),
+                    };
+                }
                 div()
                     .id(("block", index))
                     .mx_auto()
@@ -6129,7 +6257,7 @@ fn render_block(
                 // Files outside the note's folder and vault need a permission Rusidian does not
                 // grant yet; show the reference instead.
                 return decorate_block(
-                    theme,
+                    context,
                     block,
                     div()
                         .p_4()
@@ -6393,7 +6521,40 @@ fn render_block(
     } else {
         content
     };
-    decorate_block(theme, block, content, inner_gap, continued)
+    decorate_block(context, block, content, inner_gap, continued)
+}
+
+/// A folded callout: its title alone, which a click (or `za`) opens.
+fn render_folded_callout(
+    context: RenderContext,
+    block: &Block,
+    title: &str,
+    active: bool,
+) -> AnyElement {
+    let color = crate::theme::callout_color(block.callout.as_deref().unwrap_or_default());
+    let view = context.view.clone();
+    let id = block.callout_quote;
+    div()
+        .ml(px(12.0 * block.quote_depth.saturating_sub(1) as f32))
+        .px_3()
+        .py_2()
+        .border_l_2()
+        .border_color(rgb(color))
+        .bg(rgba((color << 8) | if active { 0x30 } else { 0x14 }))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(color))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            if let Some(id) = id
+                && view
+                    .update(cx, |this, cx| this.toggle_callout(id, cx))
+                    .is_ok()
+            {
+                cx.stop_propagation();
+            }
+        })
+        .child(format!("▸ {title}"))
+        .into_any_element()
 }
 
 /// A note, heading section or block shown with `![[note]]`, in a card titled with its name.
@@ -6528,12 +6689,13 @@ fn fragment_block(blocks: &[Block], fragment: &str) -> Option<usize> {
 }
 
 fn decorate_block(
-    theme: &Theme,
+    context: RenderContext,
     block: &Block,
     content: AnyElement,
     inner_gap: Pixels,
     continued: usize,
 ) -> AnyElement {
+    let theme = context.theme;
     let marker: Option<SharedString> = if let Some(checked) = block.task {
         Some(if checked { "☑" } else { "☐" }.into())
     } else {
@@ -6571,12 +6733,34 @@ fn decorate_block(
             .border_color(rgb(color))
             .bg(rgba((color << 8) | 0x14))
             .when_some(block.callout_title.clone(), |element, title| {
+                // A foldable callout's title folds it.
+                let foldable = block.callout_fold.is_some();
+                let view = context.view.clone();
+                let id = block.callout_quote;
                 element.pt_2().child(
                     div()
                         .mb_2()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(color))
-                        .child(title),
+                        .when(foldable, |element| {
+                            element.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                move |_, _, cx| {
+                                    if let Some(id) = id
+                                        && view
+                                            .update(cx, |this, cx| this.toggle_callout(id, cx))
+                                            .is_ok()
+                                    {
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            )
+                        })
+                        .child(if foldable {
+                            format!("▾ {title}")
+                        } else {
+                            title
+                        }),
                 )
             })
             .child(content);

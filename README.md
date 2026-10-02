@@ -100,6 +100,7 @@ cargo run --locked -- examples/markdown.md
 | 翻页 | `Ctrl-d/u`、`Ctrl-f/b` | 同左 |
 | 查找（全小写时不区分大小写） | `/ ?`、`n N`、`* #`、`f F t T` | 同左 |
 | 选择并复制 | `v` / `V`，然后 `y` | 同左 |
+| 折叠 / 展开 `[!tip]-` 这类可折叠 callout | `za`，或点击标题 | 同左 |
 | 打开光标处的内部 / 外部链接 | `gf` / `gx`，或直接点击 | 同左 |
 | 切换标签 | `⌘ {` / `⌘ }`、`Ctrl+Tab` | `Ctrl+PageUp/PageDown`、`Ctrl+Tab` |
 | 快速打开笔记（按名称模糊查找） | `⌘ P` | `Ctrl+P` |

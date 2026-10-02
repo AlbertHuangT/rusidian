@@ -34,6 +34,11 @@ pub struct Block {
     pub callout: Option<String>,
     /// The callout's title, on the first block of the callout only.
     pub callout_title: Option<String>,
+    /// The blockquote id of the callout this block is in, nested quotes included.
+    pub callout_quote: Option<usize>,
+    /// On a callout's first block: whether it can fold (`[!tip]-` or `[!tip]+`), and whether it
+    /// starts folded (`-`).
+    pub callout_fold: Option<bool>,
     /// For fenced code: whether the closing fence is present (an open fence runs to the end).
     pub fence_closed: bool,
     /// Obsidian's `^id` that block links point to; hidden from the text like in Obsidian.
@@ -552,6 +557,8 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         quote_root: quote.root,
         callout: None,
         callout_title: None,
+        callout_quote: None,
+        callout_fold: None,
         fence_closed: false,
         block_id: None,
         cells: Vec::new(),
@@ -916,28 +923,38 @@ fn apply_callouts(blocks: &mut [Block], alerts: &[Option<BlockQuoteKind>]) {
         };
         let callout = if let Some(kind) = alert {
             let kind = format!("{kind:?}").to_lowercase();
-            Some((kind, None))
+            Some((kind, None, None))
         } else if blocks[first].kind == BlockKind::Paragraph {
-            parse_callout_header(&blocks[first].text).map(|(kind, title, header)| {
+            parse_callout_header(&blocks[first].text).map(|(kind, title, fold, header)| {
                 blocks[first].remove_prefix(header);
-                (kind, title)
+                (kind, title, fold)
             })
         } else {
             None
         };
-        let Some((kind, title)) = callout else {
+        let Some((kind, title, fold)) = callout else {
             continue;
         };
         blocks[first].callout_title = Some(title.unwrap_or_else(|| capitalize(&kind)));
-        for block in blocks.iter_mut().filter(|block| block.quote == Some(id)) {
-            block.callout = Some(kind.clone());
+        blocks[first].callout_fold = fold;
+        let depth = blocks[first].quote_depth;
+        // The callout's blocks: its own, and those of quotes nested in it, until it ends.
+        for block in blocks[first..]
+            .iter_mut()
+            .take_while(|block| block.quote == Some(id) || block.quote_depth > depth)
+        {
+            if block.quote == Some(id) {
+                block.callout = Some(kind.clone());
+            }
+            block.callout_quote = Some(id);
         }
     }
 }
 
 /// `[!kind]`, an optional fold marker and an optional title on the first line. Returns the kind,
-/// the title and how many bytes of text the header line takes (including its newline).
-fn parse_callout_header(text: &str) -> Option<(String, Option<String>, usize)> {
+/// the title, the fold (`Some(true)` for `-`, folded at first; `Some(false)` for `+`) and how
+/// many bytes of text the header line takes (including its newline).
+fn parse_callout_header(text: &str) -> Option<(String, Option<String>, Option<bool>, usize)> {
     let line_end = text.find('\n').unwrap_or(text.len());
     let line = &text[..line_end];
     let rest = line.strip_prefix("[!")?;
@@ -950,7 +967,13 @@ fn parse_callout_header(text: &str) -> Option<(String, Option<String>, usize)> {
     {
         return None;
     }
-    let title = rest[close + 1..].trim_start_matches(['+', '-']).trim();
+    let after = &rest[close + 1..];
+    let fold = match after.chars().next() {
+        Some('-') => Some(true),
+        Some('+') => Some(false),
+        _ => None,
+    };
+    let title = after.trim_start_matches(['+', '-']).trim();
     let header = if line_end < text.len() {
         line_end + 1
     } else {
@@ -959,6 +982,7 @@ fn parse_callout_header(text: &str) -> Option<(String, Option<String>, usize)> {
     Some((
         kind.to_lowercase(),
         (!title.is_empty()).then(|| title.to_owned()),
+        fold,
         header,
     ))
 }
@@ -1375,8 +1399,21 @@ mod tests {
         assert_ne!(nested.quote, nested.quote_root);
         assert_eq!(
             parse_callout_header("[!warning]"),
-            Some(("warning".into(), None, 10))
+            Some(("warning".into(), None, None, 10))
         );
+        assert_eq!(
+            parse_callout_header("[!faq]- Why?\nBody"),
+            Some(("faq".into(), Some("Why?".into()), Some(true), 13))
+        );
+        let folded = parse("> [!faq]- Why?\n> Because.\n> > Nested\n\n> plain\n");
+        assert_eq!(folded.blocks[0].callout_fold, Some(true));
+        assert_eq!(folded.blocks[0].text, "Because.");
+        let ids: Vec<_> = folded
+            .blocks
+            .iter()
+            .map(|block| block.callout_quote)
+            .collect();
+        assert_eq!(ids, [Some(0), Some(0), None]);
         assert_eq!(parse_callout_header("[not callout]"), None);
 
         let obsidian = parse("a ==marked text== b %%hidden%% c == d");
