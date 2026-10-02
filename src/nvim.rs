@@ -64,6 +64,8 @@ enum Command {
         column: usize,
     },
     FollowCurrentBuffer,
+    /// Neovim detached our buffer (reloads such as :edit! or 'autoread' do that).
+    Reattach,
     Close,
 }
 
@@ -83,6 +85,17 @@ impl Handler for EventHandler {
         match name.as_str() {
             "redraw" => {
                 let _ = self.events.try_send(Event::Redraw(args));
+            }
+            "nvim_buf_detach_event"
+                if self
+                    .attached
+                    .lock()
+                    .ok()
+                    .and_then(|buffer| buffer.clone())
+                    .as_ref()
+                    == args.first() =>
+            {
+                let _ = self.commands.send(Command::Reattach);
             }
             "rusidian_buf_enter" => {
                 let _ = self.commands.send(Command::FollowCurrentBuffer);
@@ -360,6 +373,11 @@ impl Client {
                             let _ = nvim
                                 .input_mouse(button, action, &modifier, 0, row as i64, column as i64)
                                 .await;
+                        }
+                        Command::Reattach => {
+                            // A reloaded buffer sends its full contents again on attach. An
+                            // unloaded one cannot be attached; BufEnter will follow its successor.
+                            let _ = buffer.attach(true, Vec::new()).await;
                         }
                         Command::FollowCurrentBuffer => {
                             let Ok(current) = nvim.get_current_buf().await else {
@@ -1379,6 +1397,65 @@ mod tests {
             .await
             .expect("Neovim exit was not reported");
         });
+    }
+
+    /// Wait until a `BufferLines` event satisfies `done`.
+    fn wait_for_lines(
+        runtime: &tokio::runtime::Runtime,
+        client: &Client,
+        done: impl Fn(&[String]) -> bool,
+        what: &str,
+    ) {
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match client.events.recv().await.unwrap() {
+                        Event::BufferLines { lines, .. } if done(&lines) => break,
+                        Event::Error(error) | Event::CloseRefused(error) => panic!("{error}"),
+                        Event::Exited => panic!("Neovim exited unexpectedly"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires the external Neovim installation"]
+    fn keeps_following_the_buffer_after_a_reload() {
+        let path =
+            std::env::temp_dir().join(format!("rusidian-reload-test-{}.md", std::process::id()));
+        fs::write(&path, "original\n").unwrap();
+        let client = Client::start(path.clone(), None, true, (80, 20));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        wait_for_lines(
+            &runtime,
+            &client,
+            |lines| lines == ["original"],
+            "initial lines",
+        );
+        fs::write(&path, "changed outside\n").unwrap();
+        client.input(":edit!<CR>");
+        wait_for_lines(
+            &runtime,
+            &client,
+            |lines| lines.iter().any(|line| line == "changed outside"),
+            "the reloaded file",
+        );
+        client.input("A edited<Esc>");
+        wait_for_lines(
+            &runtime,
+            &client,
+            |lines| lines.iter().any(|line| line == "changed outside edited"),
+            "edits after the reload",
+        );
+        client.input(":qall!<CR>");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
