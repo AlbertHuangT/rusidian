@@ -2912,6 +2912,7 @@ impl RusidianApp {
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
             .bg(rgb(background))
@@ -4065,6 +4066,8 @@ impl Render for RusidianApp {
             });
             div()
                 .flex_1()
+                // Beside the sidebar, wide images or tables must not widen the column.
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .id("document")
