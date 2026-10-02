@@ -381,6 +381,8 @@ struct RusidianApp {
     open_buffers: Vec<(PathBuf, bool)>,
     /// Remote images the user asked to load, by URL.
     remote_images: HashMap<String, RemoteImage>,
+    /// Notes shown with `![[note]]`, read from disk by path.
+    embeds: HashMap<PathBuf, EmbeddedNote>,
     /// Vaults whose remote images load automatically.
     remote_image_vaults: Vec<PathBuf>,
     auto_update: bool,
@@ -523,6 +525,7 @@ impl RusidianApp {
             place_initial_cursor: false,
             open_buffers: Vec::new(),
             remote_images: HashMap::new(),
+            embeds: HashMap::new(),
             remote_image_vaults: settings.remote_image_vaults,
             auto_update: settings.auto_update,
             update_status: UpdateStatus::Idle,
@@ -588,14 +591,8 @@ impl RusidianApp {
     }
 
     fn pending_tikz(&mut self) -> Vec<String> {
-        let Some(document) = &self.document else {
-            self.tikz.clear();
-            return Vec::new();
-        };
-        let sources: HashSet<_> = document
-            .markdown
-            .blocks
-            .iter()
+        let sources: HashSet<_> = self
+            .shown_blocks()
             .filter(|block| is_tikz(block))
             .map(|block| block.text.clone())
             .collect();
@@ -677,14 +674,8 @@ impl RusidianApp {
     }
 
     fn pending_math(&mut self) -> Vec<(String, bool)> {
-        let Some(document) = &self.document else {
-            self.math.clear();
-            return Vec::new();
-        };
-        let keys: HashSet<_> = document
-            .markdown
-            .blocks
-            .iter()
+        let keys: HashSet<_> = self
+            .shown_blocks()
             .flat_map(|block| {
                 (block.kind == BlockKind::Math)
                     .then(|| (block.text.clone(), true))
@@ -738,9 +729,73 @@ impl RusidianApp {
     }
 
     fn compile_visuals(&mut self, cx: &mut Context<Self>) {
+        // First: embedded notes' diagrams and formulas compile with the note's own.
+        self.load_embeds();
         self.compile_tikz(cx);
         self.compile_math(cx);
         self.load_allowed_remote_images(cx);
+    }
+
+    /// Read the notes this note embeds, again whenever they changed on disk.
+    fn load_embeds(&mut self) {
+        let Some(document) = &self.document else {
+            self.embeds.clear();
+            return;
+        };
+        let links = Links {
+            note: &document.file,
+            vault: self.vault.as_ref(),
+        };
+        let wanted: HashSet<PathBuf> = document
+            .markdown
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                BlockKind::Image(source) => links.embedded_note(source),
+                _ => None,
+            })
+            .collect();
+        self.embeds.retain(|path, _| wanted.contains(path));
+        let strict_line_breaks = self
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.settings.strict_line_breaks);
+        for path in wanted {
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if modified.is_some()
+                && self
+                    .embeds
+                    .get(&path)
+                    .is_some_and(|embed| embed.modified == modified)
+            {
+                continue;
+            }
+            let markdown = match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.len() > EMBED_SIZE_LIMIT => {
+                    Err(format!("{} 太大，无法嵌入", display_name(&path)))
+                }
+                _ => std::fs::read_to_string(&path)
+                    .map(|text| crate::markdown::parse_with_options(&text, strict_line_breaks))
+                    .map_err(|error| format!("无法读取 {}：{error}", display_name(&path))),
+            };
+            self.embeds
+                .insert(path, EmbeddedNote { modified, markdown });
+        }
+    }
+
+    /// Blocks of the note and of the notes it embeds, whose diagrams and formulas are shown.
+    fn shown_blocks(&self) -> impl Iterator<Item = &Block> {
+        self.document
+            .iter()
+            .flat_map(|document| document.markdown.blocks.iter())
+            .chain(
+                self.embeds
+                    .values()
+                    .filter_map(|embed| embed.markdown.as_ref().ok())
+                    .flat_map(|markdown| markdown.blocks.iter()),
+            )
     }
 
     /// Remote image URLs in the current note.
@@ -1503,20 +1558,8 @@ impl RusidianApp {
             document.markdown.blocks.iter().position(|block| {
                 matches!(&block.kind, BlockKind::Footnote { label: found, .. } if found == label)
             })
-        } else if let Some(id) = fragment.strip_prefix('^') {
-            let marker = format!("^{id}");
-            document.markdown.blocks.iter().position(|block| {
-                block
-                    .text
-                    .split_whitespace()
-                    .last()
-                    .is_some_and(|word| word == marker)
-            })
         } else {
-            let wanted = heading_key(&crate::vault::percent_decode(fragment));
-            document.markdown.blocks.iter().position(|block| {
-                matches!(block.kind, BlockKind::Heading(_)) && heading_key(&block.text) == wanted
-            })
+            fragment_block(&document.markdown.blocks, fragment)
         };
         let Some(block) = target else {
             return false;
@@ -1990,8 +2033,25 @@ impl RusidianApp {
             .map(|link| link.destination.clone())
     }
 
+    /// What `gf` and `gx` open: the link under the cursor, or the embedded note or image the
+    /// cursor is on. Clicking only follows links, so clicking an image does not open it.
+    fn cursor_target(&self) -> Option<String> {
+        self.current_link().or_else(|| {
+            let block = self
+                .document
+                .as_ref()?
+                .markdown
+                .blocks
+                .get(self.reading_cursor.block)?;
+            match &block.kind {
+                BlockKind::Image(source) => Some(source.clone()),
+                _ => None,
+            }
+        })
+    }
+
     fn open_internal_link(&mut self, cx: &mut Context<Self>) {
-        let Some(destination) = self.current_link() else {
+        let Some(destination) = self.cursor_target() else {
             self.show_notice("光标处没有链接", false, cx);
             return;
         };
@@ -2049,7 +2109,7 @@ impl RusidianApp {
 
     /// Vim's `gx`: open the link under the cursor with the system handler.
     fn open_external_link(&mut self, cx: &mut Context<Self>) {
-        let Some(destination) = self.current_link() else {
+        let Some(destination) = self.cursor_target() else {
             self.show_notice("光标处没有链接", false, cx);
             return;
         };
@@ -3995,6 +4055,9 @@ impl Render for RusidianApp {
                             .iter()
                             .any(|allowed| allowed == root)
                     }),
+                tikz: &self.tikz,
+                embeds: &self.embeds,
+                embedded: false,
                 block_index: 0,
             };
             let selection = self.reading_selection.and_then(|selection| {
@@ -4375,6 +4438,19 @@ struct Links<'a> {
 }
 
 impl Links<'_> {
+    /// The note an `![[note]]` (or `![](note.md)`) embed shows; `![[#heading]]` is this note.
+    fn embedded_note(&self, source: &str) -> Option<PathBuf> {
+        if crate::remote::is_remote(source) {
+            return None;
+        }
+        let (target, _) = crate::vault::split_fragment(source);
+        if target.is_empty() {
+            return Some(self.note.to_path_buf());
+        }
+        crate::vault::resolve_target(self.note, self.vault, target)
+            .filter(|path| crate::vault::is_markdown(path))
+    }
+
     /// The local file for an image source. Unresolved local sources keep a note-relative path so
     /// the reading view can report the missing file; remote and absolute sources return `None`.
     fn image(&self, source: &str) -> Option<PathBuf> {
@@ -4409,6 +4485,16 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
         "pbm" | "ppm" | "pgm" => Some(ImageFormat::Pnm),
         _ => None,
     }
+}
+
+/// Larger notes are not embedded; they would be parsed again on every change.
+const EMBED_SIZE_LIMIT: u64 = 1024 * 1024;
+
+/// A note shown inside another with `![[note]]`.
+struct EmbeddedNote {
+    /// Its modification time when read, to read it again after it changed.
+    modified: Option<std::time::SystemTime>,
+    markdown: Result<MarkdownDocument, String>,
 }
 
 enum RemoteImage {
@@ -4541,6 +4627,10 @@ struct RenderContext<'a> {
     remote: &'a HashMap<String, RemoteImage>,
     /// The vault that could allow remote images automatically, if not already allowed.
     remote_vault: Option<&'a Path>,
+    tikz: &'a HashMap<String, TikzState>,
+    embeds: &'a HashMap<PathBuf, EmbeddedNote>,
+    /// Rendering inside an embed: further embeds show as links, not content.
+    embedded: bool,
     /// The block being rendered.
     block_index: usize,
 }
@@ -4619,6 +4709,9 @@ fn render_block(
             render_inline_paragraph(context, block, cursor, selection)
         }
         BlockKind::Paragraph => div().child(text()).into_any_element(),
+        BlockKind::Image(source) if let Some(path) = links.embedded_note(source) => {
+            render_embed(context, source, &path, object_cursor)
+        }
         BlockKind::Image(source) if crate::remote::is_remote(source) => div()
             .when(object_cursor, |element| {
                 element.border_2().border_color(rgb(theme.accent))
@@ -4853,6 +4946,141 @@ fn render_block(
         content
     };
     decorate_block(theme, block, content, inner_gap)
+}
+
+/// A note, heading section or block shown with `![[note]]`, in a card titled with its name.
+fn render_embed(context: RenderContext, source: &str, path: &Path, selected: bool) -> AnyElement {
+    let theme = context.theme;
+    let (_, fragment) = crate::vault::split_fragment(source);
+    let title = match fragment {
+        Some(fragment) => format!(
+            "{} › {}",
+            path.file_stem().unwrap_or_default().to_string_lossy(),
+            crate::vault::percent_decode(fragment.trim_start_matches('^'))
+        ),
+        None => path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let message = |text: String| {
+        div()
+            .text_sm()
+            .text_color(rgb(theme.muted))
+            .child(text)
+            .into_any_element()
+    };
+    let body = match context.embeds.get(path).map(|embed| &embed.markdown) {
+        // One level only: an embed inside an embed (or a note embedding itself) is a link.
+        _ if context.embedded => message("嵌入的笔记中的嵌入：按 gf 打开该笔记查看".into()),
+        Some(Ok(markdown)) => match embedded_blocks(&markdown.blocks, fragment) {
+            Some(blocks) if !blocks.is_empty() => render_embedded_blocks(context, blocks),
+            Some(_) => message("（空笔记）".into()),
+            None => message(format!("找不到标题或块：{}", fragment.unwrap_or_default())),
+        },
+        Some(Err(error)) => message(error.clone()),
+        None => message("正在读取…".into()),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px_4()
+        .py_3()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if selected {
+            theme.accent
+        } else {
+            theme.border_strong
+        }))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme.muted))
+                .child(title),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+/// Embedded blocks, rendered like the note's own but without cursor or click positions.
+fn render_embedded_blocks(context: RenderContext, blocks: &[Block]) -> AnyElement {
+    let layouts = RefCell::new(Vec::new());
+    let inert = WeakEntity::new_invalid();
+    div()
+        .flex()
+        .flex_col()
+        .children(blocks.iter().enumerate().map(|(index, block)| {
+            let next = blocks.get(index + 1);
+            let gap = if next.is_some() {
+                block_gap(block, next)
+            } else {
+                px(0.0)
+            };
+            let joined = continues_quote(block, next);
+            let nested = RenderContext {
+                layouts: &layouts,
+                view: &inert,
+                embedded: true,
+                block_index: index,
+                ..context
+            };
+            div()
+                .flex()
+                .flex_col()
+                .when(!joined, |element| element.mb(gap))
+                .child(render_block(
+                    nested,
+                    block,
+                    context.tikz.get(&block.text),
+                    None,
+                    None,
+                    if joined { gap } else { px(0.0) },
+                ))
+        }))
+        .into_any_element()
+}
+
+/// The blocks an embed shows: the note without its properties, a heading's section, or the
+/// block marked `^id`. `None` when the fragment names nothing in the note.
+fn embedded_blocks<'a>(blocks: &'a [Block], fragment: Option<&str>) -> Option<&'a [Block]> {
+    let Some(fragment) = fragment else {
+        let start = blocks
+            .iter()
+            .position(|block| block.kind != BlockKind::Metadata)
+            .unwrap_or(blocks.len());
+        return Some(&blocks[start..]);
+    };
+    let start = fragment_block(blocks, fragment)?;
+    let BlockKind::Heading(level) = blocks[start].kind else {
+        return Some(&blocks[start..=start]);
+    };
+    let end = blocks[start + 1..]
+        .iter()
+        .position(|block| matches!(block.kind, BlockKind::Heading(other) if other <= level))
+        .map_or(blocks.len(), |offset| start + 1 + offset);
+    Some(&blocks[start..end])
+}
+
+/// The block a link fragment points to: a heading, or a block ending in `^id`.
+fn fragment_block(blocks: &[Block], fragment: &str) -> Option<usize> {
+    if let Some(id) = fragment.strip_prefix('^') {
+        let marker = format!("^{id}");
+        return blocks.iter().position(|block| {
+            block
+                .text
+                .split_whitespace()
+                .last()
+                .is_some_and(|word| word == marker)
+        });
+    }
+    let wanted = heading_key(&crate::vault::percent_decode(fragment));
+    blocks.iter().position(|block| {
+        matches!(block.kind, BlockKind::Heading(_)) && heading_key(&block.text) == wanted
+    })
 }
 
 fn decorate_block(
@@ -6117,6 +6345,49 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn embeds_notes_sections_and_blocks() {
+        let blocks = crate::markdown::parse(
+            "---\ntags: [a]\n---\n# Top\n\nintro\n\n## Part\n\nin part\n\n### Deeper\n\nstill part\n\n## Next\n\nmarked ^id1\n",
+        )
+        .blocks;
+        let texts = |blocks: &[Block]| {
+            blocks
+                .iter()
+                .map(|block| block.text.clone())
+                .collect::<Vec<_>>()
+        };
+        // The whole note leaves out its properties.
+        assert_eq!(embedded_blocks(&blocks, None).unwrap()[0].text, "Top");
+        assert_eq!(
+            texts(embedded_blocks(&blocks, Some("Part")).unwrap()),
+            ["Part", "in part", "Deeper", "still part"]
+        );
+        assert_eq!(
+            texts(embedded_blocks(&blocks, Some("^id1")).unwrap()),
+            ["marked ^id1"]
+        );
+        assert!(embedded_blocks(&blocks, Some("Missing")).is_none());
+
+        let folder = std::env::temp_dir().join(format!("rusidian-embed-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let note = folder.join("index.md");
+        std::fs::write(folder.join("target.md"), "# Target\n").unwrap();
+        std::fs::write(folder.join("pic.png"), b"png").unwrap();
+        let links = Links {
+            note: &note,
+            vault: None,
+        };
+        assert_eq!(
+            links.embedded_note("target#Part"),
+            Some(folder.join("target.md"))
+        );
+        assert_eq!(links.embedded_note("#Part"), Some(note.clone()));
+        assert_eq!(links.embedded_note("pic.png"), None);
+        assert_eq!(links.embedded_note("https://example.com/a.md"), None);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
