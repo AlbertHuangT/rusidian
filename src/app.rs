@@ -4506,18 +4506,38 @@ enum RemoteImage {
     Failed(SharedString),
 }
 
+/// Obsidian's image size after the last `|` of the alt text: `![[pic.png|200]]` or
+/// `![logo|200x100](pic.png)`. Width alone keeps the image's proportions.
+fn image_size(alt: &str) -> Option<(f32, Option<f32>)> {
+    let spec = alt.rsplit('|').next()?.trim();
+    let number = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<f32>().ok())
+            .flatten()
+            .filter(|number| *number > 0.0)
+    };
+    match spec.split_once('x') {
+        Some((width, height)) => Some((number(width)?, Some(number(height)?))),
+        None => Some((number(spec)?, None)),
+    }
+}
+
+/// An image at its natural size, or the size its alt text asks for, never wider than its column.
+fn sized_image(image: gpui::Img, alt: &str) -> gpui::Img {
+    image
+        .max_w_full()
+        .when_some(image_size(alt), |image, (width, height)| {
+            image
+                .w(px(width))
+                .when_some(height, |image, height| image.h(px(height)))
+        })
+}
+
 /// A remote image: shown once loaded, otherwise a placeholder that loads it only when asked.
 fn remote_image(context: RenderContext, url: &str, alt: &str, inline: bool) -> AnyElement {
     let theme = context.theme;
     match context.remote.get(url) {
-        Some(RemoteImage::Ready(image)) => {
-            let image = img(image.clone()).max_w_full();
-            if inline {
-                image.h(px(24.0)).into_any_element()
-            } else {
-                image.into_any_element()
-            }
-        }
+        Some(RemoteImage::Ready(image)) => sized_image(img(image.clone()), alt).into_any_element(),
         Some(RemoteImage::Loading) => div()
             .px_2()
             .rounded_md()
@@ -4747,7 +4767,7 @@ fn render_block(
                 .when(object_cursor, |element| {
                     element.border_2().border_color(rgb(theme.accent))
                 })
-                .child(img(path).max_w_full().with_fallback({
+                .child(sized_image(img(path), &alt).with_fallback({
                     let theme = *theme;
                     move || {
                         div()
@@ -5342,11 +5362,7 @@ fn inline_extents(
     baseline: f32,
 ) -> (f32, f32) {
     // ponytail: all wrapped rows share the tallest formula's extents; per-row metrics if this wastes space.
-    let mut ascent = if block.images.is_empty() {
-        baseline
-    } else {
-        baseline.max(24.0)
-    };
+    let mut ascent = baseline;
     let mut descent = 24.0 - baseline;
     for formula in &block.maths {
         if let Some(MathState::Ready(formula)) = math.get(&(formula.source.clone(), false)) {
@@ -5447,29 +5463,37 @@ fn render_inline_paragraph(
             .count();
         let active = cursor == Some(offset)
             || selection.is_some_and(|(from, to)| from <= offset && offset <= to);
+        // Images keep their own size and sit on the baseline; everything else fills the row.
+        let mut picture = false;
         let child = match atom {
-            InlineAtom::Image(image) if crate::remote::is_remote(&image.source) => div()
-                .pt(px(ascent - 24.0))
-                .child(remote_image(context, &image.source, &image.alt, true))
-                .into_any_element(),
+            InlineAtom::Image(image) if crate::remote::is_remote(&image.source) => {
+                picture = matches!(
+                    context.remote.get(&image.source),
+                    Some(RemoteImage::Ready(_))
+                );
+                // The load placeholder is text and shares the text's baseline.
+                div()
+                    .when(!picture, |element| element.pt(px(ascent - text_baseline)))
+                    .child(remote_image(context, &image.source, &image.alt, true))
+                    .into_any_element()
+            }
             InlineAtom::Image(image) => {
                 let alt = image.alt.clone();
                 let source = image.source.clone();
                 if let Some(path) = links.image(&image.source) {
-                    div()
-                        .pt(px(ascent - 24.0))
-                        .child(
-                            img(path)
-                                .h(px(24.0))
-                                .max_w_full()
-                                .with_fallback(move || div().child(alt.clone()).into_any_element()),
-                        )
+                    picture = true;
+                    sized_image(img(path), &image.alt)
+                        .with_fallback(move || div().child(alt.clone()).into_any_element())
                         .into_any_element()
                 } else {
                     div()
-                        .px_1()
-                        .bg(rgb(theme.inline_code))
-                        .child(format!("![{alt}]({source})"))
+                        .pt(px(ascent - text_baseline))
+                        .child(
+                            div()
+                                .px_1()
+                                .bg(rgb(theme.inline_code))
+                                .child(format!("![{alt}]({source})")),
+                        )
                         .into_any_element()
                 }
             }
@@ -5494,7 +5518,8 @@ fn render_inline_paragraph(
         children.push(
             div()
                 .flex_none()
-                .h(px(row_height))
+                .when(picture, |element| element.max_w_full().pb(px(descent)))
+                .when(!picture, |element| element.h(px(row_height)))
                 .on_mouse_down(MouseButton::Left, context.click_at(offset))
                 .when(active, |element| element.bg(rgb(theme.atom_active)))
                 .child(child)
@@ -5513,10 +5538,11 @@ fn render_inline_paragraph(
             (ascent - text_baseline, row_height),
         );
     }
+    // Rows align at the bottom, so a tall image raises its row and text stays on the baseline.
     div()
         .flex()
         .flex_wrap()
-        .items_start()
+        .items_end()
         .line_height(px(24.0))
         .children(children)
         .into_any_element()
@@ -6348,6 +6374,17 @@ mod tests {
             ]),
             [PathBuf::from("/Users/me/My Notes/中文.md")]
         );
+    }
+
+    #[test]
+    fn reads_obsidian_image_sizes() {
+        assert_eq!(image_size("120"), Some((120.0, None)));
+        assert_eq!(image_size("logo|200x100"), Some((200.0, Some(100.0))));
+        assert_eq!(image_size(" 64 "), Some((64.0, None)));
+        assert_eq!(image_size("photo"), None);
+        assert_eq!(image_size("1920x1080 screenshot"), None);
+        assert_eq!(image_size("0"), None);
+        assert_eq!(image_size(""), None);
     }
 
     #[test]

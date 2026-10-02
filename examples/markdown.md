@@ -1,6 +1,6 @@
 # Markdown 完整示例
 
-段落包含 **粗体**、*斜体*、~~删除线~~、`行内代码`、[本地链接](linked.md)、[外部链接](https://example.com)、行内图片 ![Rusidian](rusidian.svg) 和公式 $E=mc^2$。
+段落包含 **粗体**、*斜体*、~~删除线~~、`行内代码`、[本地链接](linked.md)、[外部链接](https://example.com)、行内图片 ![Rusidian|96](rusidian.svg) 和公式 $E=mc^2$。
 
 > 引用中的文字。
 
