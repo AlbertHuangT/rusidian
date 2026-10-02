@@ -3871,6 +3871,96 @@ impl RusidianApp {
                     .bg(rgb(theme.knob)),
             );
 
+        // Linux builds come from source; the updater only installs the signed macOS app.
+        let updates = if cfg!(target_os = "macos") {
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme.card_border))
+                        .bg(rgb(theme.card))
+                        .child(
+                            div()
+                                .p_4()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("当前版本"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(status_color))
+                                                .child(status),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .children(check_button)
+                                        .children(install_button)
+                                        .children(restart_button),
+                                ),
+                        )
+                        .child(div().h(px(1.0)).bg(rgb(theme.border)))
+                        .child(
+                            div()
+                                .id("toggle-auto-update")
+                                .p_4()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(|element| element.bg(rgb(theme.hover)))
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx)))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("自动更新"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(theme.muted))
+                                                .child("启动时检查，验证签名后自动安装"),
+                                        ),
+                                )
+                                .child(auto_toggle),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme.faint))
+                        .child("更新仅访问 GitHub Release；笔记内容不会离开本机。"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_sm()
+                .text_color(rgb(theme.muted))
+                .child("Linux 版本从源码构建：拉取最新代码并重新构建即可更新。")
+                .into_any_element()
+        };
+
         div()
             .absolute()
             .size_full()
@@ -3994,85 +4084,7 @@ impl RusidianApp {
                                     .text_color(rgb(theme.accent))
                                     .child("软件更新"),
                             )
-                            .child(
-                                div()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(theme.card_border))
-                                    .bg(rgb(theme.card))
-                                    .child(
-                                        div()
-                                            .p_4()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_1()
-                                                    .child(
-                                                        div()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .child("当前版本"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .text_color(rgb(status_color))
-                                                            .child(status),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .gap_2()
-                                                    .children(check_button)
-                                                    .children(install_button)
-                                                    .children(restart_button),
-                                            ),
-                                    )
-                                    .child(div().h(px(1.0)).bg(rgb(theme.border)))
-                                    .child(
-                                        div()
-                                            .id("toggle-auto-update")
-                                            .p_4()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .cursor_pointer()
-                                            .hover(|element| element.bg(rgb(theme.hover)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_auto_update(cx)
-                                            }))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_1()
-                                                    .child(
-                                                        div()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .child("自动更新"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .text_color(rgb(theme.muted))
-                                                            .child(
-                                                                "启动时检查，验证签名后自动安装",
-                                                            ),
-                                                    ),
-                                            )
-                                            .child(auto_toggle),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(theme.faint))
-                                    .child("更新仅访问 GitHub Release；笔记内容不会离开本机。"),
-                            ),
+                            .child(updates),
                     ),
             )
             .into_any_element()
