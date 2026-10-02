@@ -305,6 +305,8 @@ struct Document {
     markdown: MarkdownDocument,
     /// The file was on disk when last seen; a new note is not until it is saved.
     on_disk: bool,
+    /// Some callout can fold; most notes have none, which spares line motions a scan.
+    foldable: bool,
 }
 
 impl Document {
@@ -314,6 +316,11 @@ impl Document {
         } else {
             MarkdownDocument { blocks: Vec::new() }
         };
+        self.foldable = self
+            .markdown
+            .blocks
+            .iter()
+            .any(|block| block.callout_fold.is_some());
     }
 }
 
@@ -321,7 +328,7 @@ impl Document {
 /// Returns the block ranges, each block's child and each block's top within its child.
 fn group_blocks(
     drawn: &[bool],
-    heights: &[Option<Pixels>],
+    heights: &[Pixels],
     gaps: &[Pixels],
 ) -> (Vec<std::ops::Range<usize>>, Vec<usize>, Vec<Pixels>) {
     let mut children: Vec<std::ops::Range<usize>> = Vec::new();
@@ -340,21 +347,80 @@ fn group_blocks(
                 run_height = px(0.0);
             }
         }
-        run_height += heights[index].unwrap_or_default() + gaps[index];
+        run_height += heights[index] + gaps[index];
         child_of.push(children.len() - 1);
     }
     (children, child_of, offsets)
 }
 
-/// Heights of reading-view blocks measured in earlier frames. Runs of blocks far from the view
-/// are drawn as one stretch of empty space, which keeps long notes responsive: drawing every
-/// block on each key press took tens of milliseconds in a 3000-line note.
+/// The reading view's padding above the first block.
+const READING_PADDING: f32 = 32.0;
+/// The reading column's widest text.
+const READING_WIDTH: f32 = 820.0;
+
+/// A block's height before it is first laid out, from its text: close enough to place what is
+/// far from the view and to size the scroll bar until it comes near and is measured.
+fn estimate_height(block: &Block, width: Pixels) -> Pixels {
+    let (font, line, extra) = match &block.kind {
+        BlockKind::Heading(level) => {
+            let font = match level {
+                1 => 32.0,
+                2 => 27.0,
+                3 => 23.0,
+                _ => 19.0,
+            };
+            (font, font * 1.25, 0.0)
+        }
+        BlockKind::Code(_) | BlockKind::Html => {
+            // Code keeps its lines (it scrolls sideways), in a padded card.
+            return px(block.text.lines().count().max(1) as f32 * 22.0 + 56.0);
+        }
+        BlockKind::Math => return px(64.0),
+        BlockKind::Image(_) => return px(240.0),
+        BlockKind::Rule => return px(17.0),
+        BlockKind::Table { .. } => (16.0, 24.0, 12.0),
+        _ => (16.0, 24.0, 0.0),
+    };
+    let indent = 24.0 * (block.list_depth + block.quote_depth) as f32;
+    // In half-em columns: about one for Latin letters, two for CJK.
+    let columns = ((f32::from(width) - indent).max(120.0) / (font * 0.5)) as usize;
+    let lines: usize = block
+        .text
+        .split('\n')
+        .map(|line| {
+            let width: usize = line
+                .chars()
+                .map(|character| if character.is_ascii() { 1 } else { 2 })
+                .sum();
+            width.div_ceil(columns).max(1)
+        })
+        .sum();
+    let title = if block.callout_title.is_some() {
+        34.0
+    } else {
+        0.0
+    };
+    px(lines as f32 * line + extra + title)
+}
+
+/// Heights of reading-view blocks. Runs of blocks far from the view are drawn as one stretch
+/// of empty space, which keeps long notes responsive: drawing every block on each key press
+/// took tens of milliseconds in a 3000-line note, and laying out a 3 MB note at once took
+/// half a minute. Blocks are measured once they come near the view, estimated until then.
 #[derive(Default)]
 struct BlockHeights {
     /// The reading view's width when measured; another width wraps text differently.
     width: Pixels,
-    /// Each block's height, without the space below it.
-    heights: Vec<Option<Pixels>>,
+    /// Each block's height, without the space below it: as measured, or estimated.
+    heights: Vec<Pixels>,
+    /// Whether each height was measured since the block or the width last changed.
+    measured: Vec<bool>,
+    /// Each block's content hash, to keep the heights of blocks an edit left alone.
+    keys: Vec<u64>,
+    /// The note's text changed: match blocks to the earlier ones by `keys`.
+    remap: bool,
+    /// Something changed since the last frame was laid out, so it measured stale sizes.
+    stale: bool,
     /// Space below each block, outside it.
     gaps: Vec<Pixels>,
     /// Blocks drawn in full in the last frame, whose heights can be measured.
@@ -366,6 +432,16 @@ struct BlockHeights {
     child_of: Vec<usize>,
     /// Each block's top within its child: zero for drawn blocks.
     offsets: Vec<Pixels>,
+}
+
+/// Identifies a block's content across edits, for `BlockHeights::keys`.
+fn block_key(block: &Block) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(&block.kind).hash(&mut hasher);
+    block.text.hash(&mut hasher);
+    (block.list_depth, block.quote_depth).hash(&mut hasher);
+    hasher.finish()
 }
 
 struct RusidianApp {
@@ -405,6 +481,11 @@ struct RusidianApp {
     /// Whether `fragment_layouts` were laid out and prepainted; GPUI panics on unlaid layouts.
     layouts_ready: Rc<Cell<bool>>,
     block_heights: RefCell<BlockHeights>,
+    /// Heights of blocks laid out out of view last frame, as (block, height).
+    block_measures: Rc<RefCell<Vec<(usize, Pixels)>>>,
+    /// The cursor was revealed using estimated heights: reveal it again once drawn, at most
+    /// this many more times.
+    reveal_again: Cell<u8>,
     reading_pending_g: bool,
     /// `z` was typed; `za` toggles the callout at the cursor.
     reading_pending_z: bool,
@@ -452,6 +533,11 @@ struct RusidianApp {
     pending_fragment: Option<String>,
     /// Put the reading cursor at the start of the note once its lines arrive from Neovim.
     place_initial_cursor: bool,
+    /// The note changed in the source view and is parsed once typing pauses: parsing a long
+    /// note on every key would slow typing down.
+    parse_pending: bool,
+    /// Counts edits waiting for that pause.
+    parse_generation: u64,
     /// Notes open in Neovim (its listed buffers), shown as tabs, with unsaved flags.
     open_buffers: Vec<(PathBuf, bool)>,
     /// Remote images the user asked to load, by URL.
@@ -845,6 +931,8 @@ impl RusidianApp {
             fragment_layouts: RefCell::new(Vec::new()),
             layouts_ready: Rc::new(Cell::new(false)),
             block_heights: RefCell::new(BlockHeights::default()),
+            block_measures: Rc::new(RefCell::new(Vec::new())),
+            reveal_again: Cell::new(0),
             reading_pending_g: false,
             reading_pending_z: false,
             callout_toggles: HashSet::new(),
@@ -878,6 +966,8 @@ impl RusidianApp {
             modified: false,
             pending_fragment: None,
             place_initial_cursor: false,
+            parse_pending: false,
+            parse_generation: 0,
             open_buffers: Vec::new(),
             remote_images: HashMap::new(),
             embeds: HashMap::new(),
@@ -932,6 +1022,7 @@ impl RusidianApp {
                     is_markdown: crate::vault::is_markdown(path),
                     markdown: MarkdownDocument { blocks: Vec::new() },
                     on_disk: true,
+                    foldable: false,
                 };
                 document.parse(false);
                 if !document.is_markdown {
@@ -1831,6 +1922,8 @@ impl RusidianApp {
                                 }
                                 if this.view == View::Reading {
                                     this.compile_visuals(cx);
+                                } else if this.parse_pending {
+                                    this.parse_when_idle(cx);
                                 } else {
                                     this.compile_finished_tikz(cx);
                                 }
@@ -1928,6 +2021,9 @@ impl RusidianApp {
                                 this.nvim_error =
                                     Some("Neovim 已退出；按 Enter 可重新打开源码视图".into());
                                 if this.has_reading_view() {
+                                    if this.parse_pending {
+                                        this.parse_document();
+                                    }
                                     this.view = View::Reading;
                                 }
                                 cx.notify();
@@ -2073,7 +2169,7 @@ impl RusidianApp {
     /// Like on Vim's closed folds, a cursor inside a folded callout rests on its title rather
     /// than opening it.
     fn rest_on_fold(&mut self) {
-        let Some(document) = &self.document else {
+        let Some(document) = self.document.as_ref().filter(|document| document.foldable) else {
             return;
         };
         let blocks = &document.markdown.blocks;
@@ -2093,7 +2189,16 @@ impl RusidianApp {
     /// Forget measured block heights after anything that can change a block's size: the
     /// note's text, or a formula, diagram, image or embed finishing loading.
     fn invalidate_block_heights(&self) {
-        *self.block_heights.borrow_mut() = BlockHeights::default();
+        // The old heights stay as estimates, so what is shown keeps its place until measured.
+        let mut cache = self.block_heights.borrow_mut();
+        cache.measured.fill(false);
+        cache.stale = true;
+    }
+
+    /// After the note's text changed: blocks may have come and gone.
+    fn remap_block_heights(&self) {
+        self.invalidate_block_heights();
+        self.block_heights.borrow_mut().remap = true;
     }
 
     /// Where block `index` was laid out in the last frame, unscrolled like the scroll handle's
@@ -2102,72 +2207,142 @@ impl RusidianApp {
         let cache = self.block_heights.borrow();
         let child = *cache.child_of.get(index)?;
         let bounds = self.reading_scroll.bounds_for_item(child)?;
-        if cache.drawn[index] {
+        if cache.drawn.get(index) == Some(&true) {
             return Some(bounds);
         }
         Some(Bounds::new(
-            point(bounds.left(), bounds.top() + cache.offsets[index]),
-            size(bounds.size.width, cache.heights[index].unwrap_or_default()),
+            point(bounds.left(), bounds.top() + *cache.offsets.get(index)?),
+            size(bounds.size.width, *cache.heights.get(index)?),
         ))
     }
 
     /// Which blocks to draw in full this frame: those within a screen and a half of the view,
-    /// the cursor's neighborhood, blocks with images (which size themselves once loaded) and
-    /// any not measured yet. Records how the rest will be grouped into stretches of space.
-    fn plan_blocks(&self, blocks: &[Block], gaps: Vec<Pixels>) -> Vec<bool> {
+    /// the cursor's neighborhood, and blocks with images (which size themselves once loaded).
+    /// Blocks above the view that were not measured yet are laid out out of view first (the
+    /// second list): drawn in place, their real height would move what is shown. Records how
+    /// the rest will be grouped into stretches of space. `hidden` blocks are folded away.
+    fn plan_blocks(
+        &self,
+        blocks: &[Block],
+        gaps: Vec<Pixels>,
+        hidden: &[bool],
+    ) -> (Vec<bool>, Vec<usize>) {
         let view = self.reading_scroll.bounds();
-        let usable = {
-            let cache = self.block_heights.borrow();
-            cache.heights.len() == blocks.len() && cache.width == view.size.width
+        // Before the first layout, plan for the window's first size.
+        let (width, height) = if view.size.height > px(0.0) {
+            (view.size.width, view.size.height)
+        } else {
+            (px(WINDOW_WIDTH), px(WINDOW_HEIGHT))
         };
-        if !usable {
-            *self.block_heights.borrow_mut() = BlockHeights {
-                width: view.size.width,
-                heights: vec![None; blocks.len()],
+        let column = (width - px(2.0 * READING_PADDING)).min(px(READING_WIDTH));
+        // Heights measured in the last frame: blocks drawn in place, then out of view.
+        let positions: Vec<(usize, Pixels)> = {
+            let cache = self.block_heights.borrow();
+            (0..cache.drawn.len())
+                .filter(|&index| cache.drawn[index])
+                .filter_map(|index| Some((index, self.block_bounds(index)?.size.height)))
+                .collect()
+        };
+        let measures = std::mem::take(&mut *self.block_measures.borrow_mut());
+        let mut cache = self.block_heights.borrow_mut();
+        let count = blocks.len();
+        let mut fresh = !cache.stale && cache.width == width;
+        if cache.heights.len() != count || cache.remap {
+            // Blocks before and after an edit keep their heights; others are estimated.
+            let keys: Vec<u64> = blocks.iter().map(block_key).collect();
+            let old_count = cache.keys.len().min(cache.heights.len());
+            let prefix = (0..old_count.min(count))
+                .take_while(|&index| cache.keys[index] == keys[index])
+                .count();
+            let suffix = (0..(old_count - prefix).min(count - prefix))
+                .take_while(|&back| cache.keys[old_count - 1 - back] == keys[count - 1 - back])
+                .count();
+            let heights = (0..count)
+                .map(|index| {
+                    if index < prefix {
+                        cache.heights[index]
+                    } else if index >= count - suffix {
+                        cache.heights[index + old_count - count]
+                    } else {
+                        estimate_height(&blocks[index], column)
+                    }
+                })
+                .collect();
+            *cache = BlockHeights {
+                heights,
+                measured: vec![false; count],
+                keys,
                 ..BlockHeights::default()
             };
+            fresh = false;
+        } else if !fresh {
+            cache.measured.fill(false);
         }
-        // Measure the blocks drawn last frame, and find where every block was.
-        let positions: Vec<Option<Bounds<Pixels>>> = (0..blocks.len())
-            .map(|index| self.block_bounds(index))
-            .collect();
-        let mut cache = self.block_heights.borrow_mut();
-        for (index, bounds) in positions.iter().enumerate() {
-            if cache.drawn.get(index) == Some(&true)
-                && let Some(bounds) = bounds
-            {
-                cache.heights[index] = Some(bounds.size.height);
-            }
-        }
+        cache.width = width;
+        cache.stale = false;
         // Positions in the note are offsets from the view's top; the visible part starts at
         // minus the scroll offset.
-        let scrolled = -self.reading_scroll.offset().y;
-        let margin = view.size.height * 1.5;
-        let (near_top, near_bottom) = (scrolled - margin, scrolled + view.size.height + margin);
+        let mut scrolled = -self.reading_scroll.offset().y;
+        if fresh {
+            for (index, height) in positions {
+                cache.heights[index] = height;
+                cache.measured[index] = true;
+            }
+            // Blocks measured out of view were above it: keep what is shown in place.
+            let mut tops = Vec::with_capacity(count);
+            let mut top = px(READING_PADDING);
+            for index in 0..count {
+                tops.push(top);
+                top += cache.heights[index] + cache.gaps.get(index).copied().unwrap_or_default();
+            }
+            let mut shift = px(0.0);
+            for (index, height) in measures {
+                if index >= count || cache.measured[index] {
+                    continue;
+                }
+                if tops[index] + cache.heights[index] <= scrolled {
+                    shift += height - cache.heights[index];
+                }
+                cache.heights[index] = height;
+                cache.measured[index] = true;
+            }
+            if shift != px(0.0) {
+                let offset = self.reading_scroll.offset();
+                self.reading_scroll
+                    .set_offset(point(offset.x, offset.y - shift));
+                scrolled += shift;
+            }
+        }
+        for (index, _) in hidden.iter().enumerate().filter(|(_, hidden)| **hidden) {
+            cache.heights[index] = px(0.0);
+            cache.measured[index] = true;
+        }
+        let margin = height * 1.5;
+        let (near_top, near_bottom) = (scrolled - margin, scrolled + height + margin);
         let cursor = self.reading_cursor.block;
-        let drawn: Vec<bool> = blocks
-            .iter()
-            .enumerate()
-            .map(|(index, block)| {
-                let Some(bounds) = positions[index]
-                    .filter(|_| cache.heights[index].is_some() && view.size.height > px(0.0))
-                else {
-                    return true;
-                };
-                let top = bounds.top() - view.top();
-                index.abs_diff(cursor) <= 2
-                    || !block.images.is_empty()
-                    || matches!(block.kind, BlockKind::Image(_))
-                    || (top + bounds.size.height >= near_top && top <= near_bottom)
-            })
-            .collect();
+        let mut drawn = Vec::with_capacity(count);
+        let mut measuring = Vec::new();
+        let mut top = px(READING_PADDING);
+        for (index, block) in blocks.iter().enumerate() {
+            let bottom = top + cache.heights[index];
+            let image = !block.images.is_empty() || matches!(block.kind, BlockKind::Image(_));
+            let wanted =
+                image || index.abs_diff(cursor) <= 2 || (bottom >= near_top && top <= near_bottom);
+            if wanted && !image && !cache.measured[index] && bottom <= scrolled {
+                measuring.push(index);
+                drawn.push(false);
+            } else {
+                drawn.push(wanted);
+            }
+            top = bottom + gaps[index];
+        }
         let (children, child_of, offsets) = group_blocks(&drawn, &cache.heights, &gaps);
         cache.children = children;
         cache.child_of = child_of;
         cache.offsets = offsets;
         cache.gaps = gaps;
         cache.drawn.clone_from(&drawn);
-        drawn
+        (drawn, measuring)
     }
 
     /// Re-read settings another window may have changed.
@@ -2378,6 +2553,7 @@ impl RusidianApp {
             path: path.to_string_lossy().into_owned().into(),
             is_markdown,
             on_disk: path.is_file(),
+            foldable: false,
             file: path,
             lines: vec![String::new()],
             markdown: MarkdownDocument { blocks: Vec::new() },
@@ -2385,7 +2561,9 @@ impl RusidianApp {
         self.error = None;
         self.reading_cursor = ReadingCursor::default();
         self.layouts_ready.set(false);
-        self.invalidate_block_heights();
+        // Another note's heights tell nothing about this one's.
+        *self.block_heights.borrow_mut() = BlockHeights::default();
+        self.block_measures.borrow_mut().clear();
         // Fold toggles number callouts within one note.
         self.callout_toggles.clear();
         self.callout_cursor_parked = None;
@@ -2553,10 +2731,6 @@ impl RusidianApp {
         replacement: Vec<String>,
         more: bool,
     ) -> bool {
-        let strict_line_breaks = self
-            .vault
-            .as_ref()
-            .is_some_and(|vault| vault.settings.strict_line_breaks);
         let Some(document) = &mut self.document else {
             return false;
         };
@@ -2566,13 +2740,52 @@ impl RusidianApp {
         }
         document.lines.splice(first..end, replacement);
         if !more {
-            document.parse(strict_line_breaks);
-            self.invalidate_block_heights();
-            // Layouts from the last frame describe the old text until the next render.
-            self.layouts_ready.set(false);
-            self.clamp_reading_cursor();
+            if self.view == View::Source
+                && !self.place_initial_cursor
+                && self.pending_fragment.is_none()
+            {
+                self.parse_pending = true;
+            } else {
+                self.parse_document();
+            }
         }
         true
+    }
+
+    /// Parse the note's current lines for the reading view.
+    fn parse_document(&mut self) {
+        self.parse_pending = false;
+        let strict_line_breaks = self
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.settings.strict_line_breaks);
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        document.parse(strict_line_breaks);
+        self.remap_block_heights();
+        // Layouts from the last frame describe the old text until the next render.
+        self.layouts_ready.set(false);
+        self.clamp_reading_cursor();
+    }
+
+    /// Parse the edited note once typing pauses, then start diagrams that were finished.
+    fn parse_when_idle(&mut self, cx: &mut Context<Self>) {
+        self.parse_generation += 1;
+        let generation = self.parse_generation;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(std::time::Duration::from_millis(200)).await;
+            this.update(cx, |this, cx| {
+                if this.parse_generation == generation && this.parse_pending {
+                    this.parse_document();
+                    this.compile_finished_tikz(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn clamp_reading_cursor(&mut self) {
@@ -2794,6 +3007,21 @@ impl RusidianApp {
 
     /// Scroll just enough to show the cursor's line, also inside blocks taller than the view.
     fn reveal_reading_cursor(&self) {
+        // Not drawn last frame, the cursor's place is estimated: once its block is drawn,
+        // reveal it again.
+        if self
+            .block_heights
+            .borrow()
+            .drawn
+            .get(self.reading_cursor.block)
+            != Some(&true)
+        {
+            self.reveal_again.set(2);
+        }
+        self.scroll_to_cursor();
+    }
+
+    fn scroll_to_cursor(&self) {
         let view = self.reading_scroll.bounds();
         let Some((top, bottom)) = self
             .cursor_screen_span()
@@ -3130,9 +3358,16 @@ impl RusidianApp {
         let (line, column) = cursor_line(current, self.reading_cursor.offset);
         let column = *self.reading_column.get_or_insert(column);
         // A folded callout the cursor rests on is a single line.
-        let fold = fold_ranges(blocks, &self.folded_callouts(blocks))
-            .into_iter()
-            .find(|range| range.contains(&self.reading_cursor.block));
+        let fold = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.foldable)
+            .then(|| {
+                fold_ranges(blocks, &self.folded_callouts(blocks))
+                    .into_iter()
+                    .find(|range| range.contains(&self.reading_cursor.block))
+            })
+            .flatten();
         let lines = if fold.is_some() {
             0
         } else {
@@ -3751,6 +3986,9 @@ impl RusidianApp {
             }
         }
         if self.has_reading_view() && leaves_source {
+            if self.parse_pending {
+                self.parse_document();
+            }
             self.view = View::Reading;
             if let Some(nvim) = &self.nvim {
                 nvim.query_cursor();
@@ -5494,6 +5732,14 @@ impl Render for RusidianApp {
             ),
         );
         let view = cx.entity().downgrade();
+        if self.view == View::Reading && self.parse_pending {
+            self.parse_document();
+        }
+        if self.view == View::Reading && self.reveal_again.get() > 0 {
+            // The last frame drew the cursor revealed by estimate: now place it exactly.
+            self.reveal_again.set(self.reveal_again.get() - 1);
+            self.scroll_to_cursor();
+        }
         self.fragment_layouts.borrow_mut().clear();
         self.layouts_ready.set(false);
         // The cursor never hides: folded callouts it is in open, unless it rests on the title.
@@ -5568,72 +5814,99 @@ impl Render for RusidianApp {
                     }
                 })
                 .collect();
-            let drawn = self.plan_blocks(
+            let hidden: Vec<bool> = fold.iter().map(|fold| *fold == Some(false)).collect();
+            let (drawn, measuring) = self.plan_blocks(
                 blocks,
                 spacing
                     .iter()
                     .map(|&(gap, shared)| if shared > 0 { px(0.0) } else { gap })
                     .collect(),
+                &hidden,
             );
-            let plan = self.block_heights.borrow();
-            let children = plan.children.iter().map(|run| {
-                if !drawn[run.start] {
-                    // One stretch of space for a run of blocks far from the view.
-                    let height: Pixels = run
-                        .clone()
-                        .map(|index| plan.heights[index].unwrap_or_default() + plan.gaps[index])
-                        .sum();
-                    // Without flex_none the column would shrink empty space to nothing.
-                    return div().flex_none().h(height).into_any_element();
-                }
-                let index = run.start;
+            if !measuring.is_empty() || self.reveal_again.get() > 0 {
+                // Next frame places what was measured out of view, or reveals the cursor.
+                window.request_animation_frame();
+            }
+            // A block as drawn in place, without the space below it.
+            let block_element = |context: RenderContext, index: usize| {
                 let block = &blocks[index];
                 let (gap, shared) = spacing[index];
-                let joined = shared > 0;
-                if let Some(title) = fold[index] {
-                    let wrapper = div()
-                        .id(("block", index))
-                        .mx_auto()
-                        .w_full()
-                        .max_w(px(820.0));
-                    return match block.callout_title.as_ref().filter(|_| title) {
-                        Some(title) => wrapper
-                            .mb(gap)
-                            .child(render_folded_callout(
-                                RenderContext {
-                                    block_index: index,
-                                    ..context
-                                },
+                let context = RenderContext {
+                    block_index: index,
+                    ..context
+                };
+                let wrapper = div()
+                    .id(("block", index))
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(READING_WIDTH));
+                match fold[index] {
+                    Some(true) => {
+                        wrapper.when_some(block.callout_title.as_ref(), |wrapper, title| {
+                            wrapper.child(render_folded_callout(
+                                context,
                                 block,
                                 title,
                                 reading_cursor.block == index,
                             ))
-                            .into_any_element(),
-                        None => wrapper.into_any_element(),
-                    };
-                }
-                div()
-                    .id(("block", index))
-                    .mx_auto()
-                    .w_full()
-                    .max_w(px(820.0))
-                    .flex()
-                    .flex_col()
-                    .when(!joined, |element| element.mb(gap))
-                    .child(render_block(
-                        RenderContext {
-                            block_index: index,
-                            ..context
-                        },
+                        })
+                    }
+                    Some(false) => wrapper,
+                    None => wrapper.flex().flex_col().child(render_block(
+                        context,
                         block,
                         self.tikz.get(&block.text),
                         (reading_cursor.block == index).then_some(reading_cursor.offset),
                         selection.and_then(|bounds| {
                             selection_for_block(bounds, index, block_len(block))
                         }),
-                        (if joined { gap } else { px(0.0) }, shared),
-                    ))
+                        (if shared > 0 { gap } else { px(0.0) }, shared),
+                    )),
+                }
+            };
+            let plan = self.block_heights.borrow();
+            let children = plan.children.iter().map(|run| {
+                if !drawn[run.start] {
+                    // One stretch of space for a run of blocks far from the view.
+                    let height: Pixels = run
+                        .clone()
+                        .map(|index| plan.heights[index] + plan.gaps[index])
+                        .sum();
+                    // Without flex_none the column would shrink empty space to nothing.
+                    return div().flex_none().h(height).into_any_element();
+                }
+                let (gap, shared) = spacing[run.start];
+                block_element(context, run.start)
+                    .when(shared == 0, |element| element.mb(gap))
                     .into_any_element()
+            });
+            // Laid out at the column's width but clipped away: only their heights are used.
+            let scratch = RefCell::new(Vec::new());
+            let measurer = (!measuring.is_empty()).then(|| {
+                let context = RenderContext {
+                    layouts: &scratch,
+                    ..context
+                };
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(READING_PADDING))
+                    .right(px(READING_PADDING))
+                    .h_0()
+                    .overflow_hidden()
+                    .children(measuring.iter().map(|&index| {
+                        let measures = self.block_measures.clone();
+                        block_element(context, index).relative().flex_none().child(
+                            canvas(
+                                move |bounds, _, _| {
+                                    measures.borrow_mut().push((index, bounds.size.height));
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                    }))
             });
             div()
                 .flex_1()
@@ -5663,12 +5936,13 @@ impl Render for RusidianApp {
                         .absolute()
                         .size_0()
                 })
+                .children(measurer)
                 .when(blocks.is_empty(), |element| {
                     element.child(
                         div()
                             .mx_auto()
                             .w_full()
-                            .max_w(px(820.0))
+                            .max_w(px(READING_WIDTH))
                             .text_color(rgb(theme.muted))
                             .child("空笔记：按 Enter 在 Neovim 中开始写作。"),
                     )
@@ -8391,12 +8665,64 @@ mod tests {
     #[test]
     fn groups_blocks_far_from_the_view() {
         let drawn = [false, false, true, false, false, false, true];
-        let heights = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0].map(|height| Some(px(height)));
+        let heights = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0].map(px);
         let gaps = [px(1.0); 7];
         let (children, child_of, offsets) = group_blocks(&drawn, &heights, &gaps);
         assert_eq!(children, [0..2, 2..3, 3..6, 6..7]);
         assert_eq!(child_of, [0, 0, 1, 2, 2, 2, 3]);
         assert_eq!(offsets, [0.0, 11.0, 0.0, 0.0, 41.0, 92.0, 0.0].map(px));
+    }
+
+    #[test]
+    fn estimates_heights_from_text() {
+        let blocks = crate::markdown::parse(&format!(
+            "# Title\n\n{}\n\n{}\n\n```\na\nb\nc\n```\n",
+            "word ".repeat(100),
+            "中文".repeat(250)
+        ))
+        .blocks;
+        let width = px(400.0);
+        let [heading, latin, cjk, code] =
+            [0, 1, 2, 3].map(|index| f32::from(estimate_height(&blocks[index], width)));
+        assert!(heading > 24.0 && heading < 60.0);
+        // 500 half-em columns at 50 a line: ten lines; CJK takes twice the room.
+        assert_eq!(latin, 240.0);
+        assert_eq!(cjk, 480.0);
+        assert!(code > 3.0 * 20.0);
+    }
+
+    #[test]
+    fn keeps_measured_heights_of_blocks_an_edit_left_alone() {
+        let mut app = RusidianApp::open(Some(Path::new("examples/markdown.md")));
+        let parse = |app: &mut RusidianApp, text: &str| {
+            let document = app.document.as_mut().unwrap();
+            document.markdown = crate::markdown::parse(text);
+            document.markdown.blocks.len()
+        };
+        let plan = |app: &RusidianApp| {
+            let blocks = &app.document.as_ref().unwrap().markdown.blocks;
+            app.plan_blocks(
+                blocks,
+                vec![px(0.0); blocks.len()],
+                &vec![false; blocks.len()],
+            );
+            app.block_heights.borrow().heights.clone()
+        };
+        let count = parse(&mut app, "a\n\nb\n\nc\n");
+        app.reading_cursor = ReadingCursor::default();
+        plan(&app);
+        app.block_heights.borrow_mut().heights = vec![px(100.0), px(200.0), px(300.0)];
+        assert_eq!(count, 3);
+        // A block inserted in the middle is estimated; the others keep their heights.
+        parse(&mut app, "a\n\nnew\n\nb\n\nc\n");
+        app.remap_block_heights();
+        let heights = plan(&app);
+        assert_eq!(heights[0], px(100.0));
+        assert_eq!(heights[1], px(24.0));
+        assert_eq!(heights[2..], [px(200.0), px(300.0)]);
+        // Heights stay as estimates when something else changed, until measured.
+        app.invalidate_block_heights();
+        assert_eq!(plan(&app)[3], px(300.0));
     }
 
     #[test]
