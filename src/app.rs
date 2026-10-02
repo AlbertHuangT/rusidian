@@ -445,8 +445,9 @@ struct RusidianApp {
     embeds: HashMap<PathBuf, EmbeddedNote>,
     /// Link destinations in the note that name no existing file, shown dimmed like Obsidian.
     unresolved_links: HashSet<String>,
-    /// Lines of other notes linking to the note shown, found for that note's path.
-    backlinks: Option<(PathBuf, Vec<TextHit>)>,
+    /// Lines of other notes linking to the note shown, for that note's path; `None` while they
+    /// are being found.
+    backlinks: Option<(PathBuf, Option<Vec<TextHit>>)>,
     /// Vaults whose remote images load automatically.
     remote_image_vaults: Vec<PathBuf>,
     auto_update: bool,
@@ -1092,7 +1093,7 @@ impl RusidianApp {
         {
             return;
         }
-        self.backlinks = Some((note.clone(), Vec::new()));
+        self.backlinks = Some((note.clone(), None));
         let files = vault.files.clone();
         let root = vault.root.clone();
         let executor = cx.background_executor().clone();
@@ -1105,7 +1106,7 @@ impl RusidianApp {
                 if let Some((path, found)) = &mut this.backlinks
                     && *path == note
                 {
-                    *found = hits;
+                    *found = Some(hits);
                     cx.notify();
                 }
             })
@@ -4117,7 +4118,7 @@ impl RusidianApp {
     /// Notes linking to this one, under its last block.
     fn render_backlinks(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = self.theme;
-        let (_, hits) = self.backlinks.as_ref()?;
+        let hits = self.backlinks.as_ref()?.1.as_ref()?;
         let vault_root = self.vault.as_ref().map(|vault| vault.root.clone());
         let rows = hits.iter().enumerate().map(|(index, hit)| {
             let path = hit.path.clone();
