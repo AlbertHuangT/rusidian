@@ -30,6 +30,8 @@ pub struct Block {
     pub quote: Option<usize>,
     /// The outermost blockquote containing this block; blocks sharing it read as one quote.
     pub quote_root: Option<usize>,
+    /// That outermost quote is inside a list item, whose marker and indent go outside it.
+    pub quote_in_list: bool,
     /// The callout kind (`note`, `tip`, ...) of the innermost blockquote, if it is a callout.
     pub callout: Option<String>,
     /// The callout's title, on the first block of the callout only.
@@ -126,6 +128,8 @@ struct Quote {
     depth: usize,
     id: Option<usize>,
     root: Option<usize>,
+    /// The outermost quote is inside a list item.
+    in_list: bool,
 }
 
 struct ListState {
@@ -217,12 +221,18 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                 }
                 Tag::BlockQuote(kind) => {
                     push_current(&mut blocks, &mut current);
+                    let in_list = if quotes.is_empty() {
+                        !items.is_empty()
+                    } else {
+                        quote.in_list
+                    };
                     quotes.push(alerts.len());
                     alerts.push(kind);
                     quote = Quote {
                         depth: quotes.len(),
                         id: quotes.last().copied(),
                         root: quotes.first().copied(),
+                        in_list,
                     };
                 }
                 Tag::List(start) => {
@@ -320,6 +330,7 @@ pub fn parse_with_options(source: &str, strict_line_breaks: bool) -> MarkdownDoc
                         depth: quotes.len(),
                         id: quotes.last().copied(),
                         root: quotes.first().copied(),
+                        in_list: quote.in_list && !quotes.is_empty(),
                     };
                 }
                 TagEnd::List(_) => {
@@ -653,6 +664,7 @@ fn new_block(kind: BlockKind, quote: Quote, items: &mut [ItemState]) -> Block {
         quote_depth: quote.depth,
         quote: quote.id,
         quote_root: quote.root,
+        quote_in_list: quote.in_list,
         callout: None,
         callout_title: None,
         callout_quote: None,

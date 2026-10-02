@@ -7218,13 +7218,24 @@ fn decorate_block(
     inner_gap: Pixels,
     continued: usize,
 ) -> AnyElement {
-    let theme = context.theme;
+    // A quote inside a list item sits in the item; a list inside a quote sits in the quote.
+    if block.quote_in_list {
+        let quoted = quote_levels(context, block, content, inner_gap, continued);
+        list_item(block, quoted)
+    } else {
+        let item = list_item(block, content);
+        quote_levels(context, block, item, inner_gap, continued)
+    }
+}
+
+/// A list item's marker, or the indent of its later blocks, around `content`.
+fn list_item(block: &Block, content: AnyElement) -> AnyElement {
     let marker: Option<SharedString> = if let Some(checked) = block.task {
         Some(if checked { "☑" } else { "☐" }.into())
     } else {
         block.list_marker.clone().map(Into::into)
     };
-    let content = if let Some(marker) = marker {
+    if let Some(marker) = marker {
         div()
             .flex()
             .ml(px(block.list_depth as f32 * 24.0))
@@ -7239,7 +7250,18 @@ fn decorate_block(
             .into_any_element()
     } else {
         content
-    };
+    }
+}
+
+/// The quotes and callouts around a block, each level in its own style.
+fn quote_levels(
+    context: RenderContext,
+    block: &Block,
+    content: AnyElement,
+    inner_gap: Pixels,
+    continued: usize,
+) -> AnyElement {
+    let theme = context.theme;
     if block.quote_depth == 0 {
         return content;
     }
