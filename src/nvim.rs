@@ -230,11 +230,7 @@ impl Client {
                 if clean {
                     command.arg("--clean");
                 }
-                command.args([
-                    "--cmd",
-                    "lua local g=vim.api.nvim_create_augroup('RusidianStartupSwap',{clear=true}); vim.api.nvim_create_autocmd('SwapExists',{group=g,callback=function() vim.g.rusidian_swapname=vim.v.swapname; vim.v.swapchoice='q' end})",
-                    "--",
-                ]).arg(&path);
+                command.args(["--cmd", STARTUP_SWAP_LUA, "--"]).arg(&path);
                 let (nvim, io, _child) = match create::new_child_cmd(&mut command, handler).await {
                     Ok(session) => session,
                     Err(error) => {
@@ -262,6 +258,10 @@ impl Client {
                     .await
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned));
+                let swap_owner_running = nvim
+                    .get_var("rusidian_swap_running")
+                    .await
+                    .is_ok_and(|value| value.as_bool() == Some(true));
                 let _ = nvim
                     .exec_lua(
                         "pcall(vim.api.nvim_del_augroup_by_name, 'RusidianStartupSwap')",
@@ -269,13 +269,21 @@ impl Client {
                     )
                     .await;
                 if let Some(swap) = swap {
+                    if !swap_owner_running {
+                        let _ = event_sender
+                            .send(Event::Error(format!(
+                                "Neovim 检测到 swap 文件，已停止打开以保护未恢复内容：{swap}。请先用 Neovim 的恢复模式检查该文件：{}",
+                                path.display()
+                            )))
+                            .await;
+                        return;
+                    }
                     let _ = event_sender
-                        .send(Event::Error(format!(
-                            "Neovim 检测到 swap 文件，已停止打开以保护未恢复内容：{swap}。请先用 Neovim 的恢复模式检查该文件：{}",
-                            path.display()
-                        )))
+                        .send(Event::Notice {
+                            text: "已只读打开：另一个窗口或 Neovim 正在编辑这篇笔记".into(),
+                            error: true,
+                        })
                         .await;
-                    return;
                 }
                 let target = path.canonicalize().unwrap_or_else(|_| path.clone());
                 let mut buffer = None;
@@ -599,6 +607,21 @@ async fn send_input(nvim: &Neovim<Compat<ChildStdin>>, mut keys: &str) -> Result
     .await
     .map_err(|_| "Neovim 输入超时，部分文字可能未送达".to_owned())?
 }
+
+/// Runs before the file loads. A swap file whose Neovim is still running (another Rusidian
+/// window, or a terminal) opens the file read-only; any other swap file may hold unrecovered
+/// changes, so startup stops instead. One line: `--cmd` runs a single Ex command.
+const STARTUP_SWAP_LUA: &str = concat!(
+    "lua local g = vim.api.nvim_create_augroup('RusidianStartupSwap', { clear = true }); ",
+    "vim.api.nvim_create_autocmd('SwapExists', { group = g, callback = function() ",
+    "vim.g.rusidian_swapname = vim.v.swapname; ",
+    "local info = vim.fn.swapinfo(vim.v.swapname); ",
+    "local pid = type(info) == 'table' and tonumber(info.pid) or 0; ",
+    "local running = pid > 0 and (vim.uv or vim.loop).kill(pid, 0) == 0; ",
+    "vim.g.rusidian_swap_running = running; ",
+    "vim.v.swapchoice = running and 'o' or 'q' ",
+    "end })",
+);
 
 /// `:edit` a path; a swap file opens it read-only instead of prompting, which would stall the
 /// reading view. Returns the swap file name when that happened.
@@ -1699,7 +1722,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the external Neovim installation"]
-    fn refuses_swap_conflicts_without_overwriting_the_file() {
+    fn opens_live_swap_conflicts_read_only_and_refuses_leftovers() {
         let path = std::env::temp_dir().join(format!(
             "rusidian-swap-test-{}-{}.md",
             std::process::id(),
@@ -1754,30 +1777,67 @@ mod tests {
         owner.input(":preserve<CR>");
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(100)).await });
 
+        // Another running Neovim (a second window) owns the swap file: open read-only.
         let contender = Client::start(path.clone(), None, true, (120, 40));
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut notice = false;
+                loop {
+                    match contender.events.recv().await.unwrap() {
+                        Event::Notice { text, .. } if text.contains("只读") => notice = true,
+                        Event::BufferLines { lines, .. }
+                            if notice && lines.iter().any(|line| line == "original") =>
+                        {
+                            break;
+                        }
+                        Event::Error(error) => panic!("{error}"),
+                        Event::Exited => panic!("second Neovim exited unexpectedly"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("second Neovim did not open the file read-only");
+        });
+        contender.input(":qall!<CR>");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(contender.events.recv().await.unwrap(), Event::Exited) {}
+            })
+            .await
+            .expect("second Neovim did not exit");
+        });
+
+        // A crash leaves the swap file behind with unrecovered changes: refuse to open.
+        let killed = std::process::Command::new("pkill")
+            .args(["-9", "-f"])
+            .arg(path.as_os_str())
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        drop(owner);
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(300)).await });
+        let recovery = Client::start(path.clone(), None, true, (120, 40));
         let error = runtime
             .block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        if let Event::Error(error) = contender.events.recv().await.unwrap() {
+                        if let Event::Error(error) = recovery.events.recv().await.unwrap() {
                             break error;
                         }
                     }
                 })
                 .await
             })
-            .expect("second Neovim did not report the swap conflict");
+            .expect("Neovim did not refuse the leftover swap file");
         assert!(error.contains("swap 文件"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
-
-        owner.input(":qall!<CR>");
-        runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !matches!(owner.events.recv().await.unwrap(), Event::Exited) {}
-            })
-            .await
-            .expect("owner Neovim did not exit");
-        });
+        let swap = error
+            .split("内容：")
+            .nth(1)
+            .and_then(|rest| rest.split("。请先").next())
+            .expect("the refusal names the swap file");
+        fs::remove_file(swap).unwrap();
         fs::remove_file(path).unwrap();
     }
 }
