@@ -2064,11 +2064,22 @@ impl Render for RusidianApp {
                         .iter()
                         .enumerate()
                         .map(|(index, block)| {
+                            // Table rows are separate blocks; space the table as a whole.
+                            let table_end = matches!(block.kind, BlockKind::Table { .. })
+                                && !matches!(
+                                    document
+                                        .markdown
+                                        .blocks
+                                        .get(index + 1)
+                                        .map(|next| &next.kind),
+                                    Some(BlockKind::Table { header: false })
+                                );
                             div()
                                 .id(("block", index))
                                 .mx_auto()
                                 .w_full()
                                 .max_w(px(820.0))
+                                .when(table_end, |element| element.mb_4())
                                 .child(render_block(
                                     block,
                                     self.tikz.get(&block.text),
@@ -2520,6 +2531,7 @@ fn render_block(
         BlockKind::Table { header } => div()
             .flex()
             .w_full()
+            .when(*header, |element| element.bg(rgb(0x1a1f25)))
             .children(block.cells.iter().enumerate().map(|(index, range)| {
                 div()
                     .flex_1()
