@@ -4,6 +4,7 @@ mod markdown;
 mod math;
 mod nvim;
 mod paths;
+mod remote;
 mod settings;
 mod theme;
 mod tikz;

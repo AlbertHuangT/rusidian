@@ -306,6 +306,10 @@ struct RusidianApp {
     place_initial_cursor: bool,
     /// Notes open in Neovim (its listed buffers), shown as tabs, with unsaved flags.
     open_buffers: Vec<(PathBuf, bool)>,
+    /// Remote images the user asked to load, by URL.
+    remote_images: HashMap<String, RemoteImage>,
+    /// Vaults whose remote images load automatically.
+    remote_image_vaults: Vec<PathBuf>,
     auto_update: bool,
     update_status: UpdateStatus,
     available_update: Option<Update>,
@@ -435,6 +439,8 @@ impl RusidianApp {
             pending_fragment: None,
             place_initial_cursor: false,
             open_buffers: Vec::new(),
+            remote_images: HashMap::new(),
+            remote_image_vaults: crate::settings::load().remote_image_vaults,
             auto_update: update::auto_update_enabled(),
             update_status: UpdateStatus::Idle,
             available_update: None,
@@ -614,6 +620,89 @@ impl RusidianApp {
     fn compile_visuals(&mut self, cx: &mut Context<Self>) {
         self.compile_tikz(cx);
         self.compile_math(cx);
+        self.load_allowed_remote_images(cx);
+    }
+
+    /// Remote image URLs in the current note.
+    fn remote_sources(&self) -> Vec<String> {
+        let Some(document) = &self.document else {
+            return Vec::new();
+        };
+        document
+            .markdown
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                let own = match &block.kind {
+                    BlockKind::Image(source) => Some(source.clone()),
+                    _ => None,
+                };
+                own.into_iter()
+                    .chain(block.images.iter().map(|image| image.source.clone()))
+            })
+            .filter(|source| crate::remote::is_remote(source))
+            .collect()
+    }
+
+    /// Load the note's remote images when its vault allows them automatically.
+    fn load_allowed_remote_images(&mut self, cx: &mut Context<Self>) {
+        let allowed = self
+            .vault
+            .as_ref()
+            .is_some_and(|vault| self.remote_image_vaults.contains(&vault.root));
+        if allowed {
+            for url in self.remote_sources() {
+                self.load_remote_image(url, cx);
+            }
+        }
+    }
+
+    fn load_remote_image(&mut self, url: String, cx: &mut Context<Self>) {
+        if matches!(
+            self.remote_images.get(&url),
+            Some(RemoteImage::Loading | RemoteImage::Ready(_))
+        ) {
+            return;
+        }
+        self.remote_images.insert(url.clone(), RemoteImage::Loading);
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let request = url.clone();
+            let result = executor
+                .spawn(async move { crate::remote::fetch_image(&request) })
+                .await;
+            this.update(cx, |this, cx| {
+                let state = match result {
+                    Ok((format, bytes)) => {
+                        RemoteImage::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                    }
+                    Err(error) => RemoteImage::Failed(error.into()),
+                };
+                this.remote_images.insert(url, state);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Remember that this vault's remote images may load, then load the current note's.
+    fn allow_vault_remote_images(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.vault.as_ref().map(|vault| vault.root.clone()) else {
+            return;
+        };
+        match crate::settings::update(|settings| {
+            if !settings.remote_image_vaults.contains(&root) {
+                settings.remote_image_vaults.push(root.clone());
+            }
+        }) {
+            Ok(settings) => {
+                self.remote_image_vaults = settings.remote_image_vaults;
+                self.load_allowed_remote_images(cx);
+            }
+            Err(error) => self.show_notice(error, true, cx),
+        }
     }
 
     fn show_notice(&mut self, text: impl Into<SharedString>, error: bool, cx: &mut Context<Self>) {
@@ -991,6 +1080,8 @@ impl RusidianApp {
         next.settings_open = self.settings_open;
         next.appearance = self.appearance;
         next.recent = std::mem::take(&mut self.recent);
+        next.remote_images = std::mem::take(&mut self.remote_images);
+        next.remote_image_vaults = std::mem::take(&mut self.remote_image_vaults);
         next.sidebar_visible = self.sidebar_visible;
         next.expanded_folders = std::mem::take(&mut self.expanded_folders);
         next.theme = self.theme;
@@ -3473,6 +3564,17 @@ impl Render for RusidianApp {
                 },
                 view: &view,
                 layouts: &self.fragment_layouts,
+                remote: &self.remote_images,
+                remote_vault: self
+                    .vault
+                    .as_ref()
+                    .map(|vault| vault.root.as_path())
+                    .filter(|root| {
+                        !self
+                            .remote_image_vaults
+                            .iter()
+                            .any(|allowed| allowed == root)
+                    }),
                 block_index: 0,
             };
             let selection = self.reading_selection.and_then(|selection| {
@@ -3889,6 +3991,115 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
     }
 }
 
+enum RemoteImage {
+    Loading,
+    Ready(Arc<Image>),
+    Failed(SharedString),
+}
+
+/// A remote image: shown once loaded, otherwise a placeholder that loads it only when asked.
+fn remote_image(context: RenderContext, url: &str, alt: &str, inline: bool) -> AnyElement {
+    let theme = context.theme;
+    match context.remote.get(url) {
+        Some(RemoteImage::Ready(image)) => {
+            let image = img(image.clone()).max_w_full();
+            if inline {
+                image.h(px(24.0)).into_any_element()
+            } else {
+                image.into_any_element()
+            }
+        }
+        Some(RemoteImage::Loading) => div()
+            .px_2()
+            .rounded_md()
+            .bg(rgb(theme.block))
+            .text_color(rgb(theme.muted))
+            .child("正在加载远程图片…")
+            .into_any_element(),
+        state => {
+            let failure = match state {
+                Some(RemoteImage::Failed(error)) => Some(error.clone()),
+                _ => None,
+            };
+            let load = |label: &'static str, id: &'static str, allow_vault: bool| {
+                let view = context.view.clone();
+                let url = url.to_owned();
+                div()
+                    .id(SharedString::from(format!("{id}-{url}")))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(rgb(theme.accent))
+                    .hover(|element| element.bg(rgb(theme.hover)))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            if allow_vault {
+                                this.allow_vault_remote_images(cx);
+                            } else {
+                                this.load_remote_image(url.clone(), cx);
+                            }
+                        })
+                        .ok();
+                    })
+                    .child(label)
+            };
+            let label = if alt.is_empty() { url } else { alt };
+            if inline {
+                return div()
+                    .flex()
+                    .px_1()
+                    .rounded_md()
+                    .bg(rgb(theme.inline_code))
+                    .child(format!("🌐 {label}"))
+                    .child(load("加载", "load-remote-inline", false))
+                    .into_any_element();
+            }
+            div()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(theme.block))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(format!("远程图片：{label}")),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(theme.faint))
+                        .child(url.to_owned()),
+                )
+                .when_some(failure, |element, error| {
+                    element.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme.error_text))
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(load("加载一次", "load-remote", false))
+                        .when(context.remote_vault.is_some(), |element| {
+                            element.child(load("总是加载此 vault 的远程图片", "allow-remote", true))
+                        }),
+                )
+                .into_any_element()
+        }
+    }
+}
+
 /// Where a block's text fragment was laid out in the last frame.
 struct FragmentLayout {
     block: usize,
@@ -3907,6 +4118,9 @@ struct RenderContext<'a> {
     view: &'a WeakEntity<RusidianApp>,
     /// Collects every text fragment's layout for screen-line motions.
     layouts: &'a RefCell<Vec<FragmentLayout>>,
+    remote: &'a HashMap<String, RemoteImage>,
+    /// The vault that could allow remote images automatically, if not already allowed.
+    remote_vault: Option<&'a Path>,
     /// The block being rendered.
     block_index: usize,
 }
@@ -3955,10 +4169,19 @@ fn render_block(
             render_inline_paragraph(context, block, cursor, selection)
         }
         BlockKind::Paragraph => div().mb_4().child(text()).into_any_element(),
+        BlockKind::Image(source) if crate::remote::is_remote(source) => div()
+            .mb_4()
+            .when(object_cursor, |element| {
+                element.border_2().border_color(rgb(theme.accent))
+            })
+            .child(remote_image(context, source, &block.text, false))
+            .into_any_element(),
         BlockKind::Image(source) => {
             let source_label = source.clone();
             let alt = block.text.clone();
             let Some(path) = links.image(source) else {
+                // Files outside the note's folder and vault need a permission Rusidian does not
+                // grant yet; show the reference instead.
                 return decorate_block(
                     theme,
                     block,
@@ -3970,6 +4193,7 @@ fn render_block(
                             element.border_2().border_color(rgb(theme.accent))
                         })
                         .bg(rgb(theme.block))
+                        .on_mouse_down(MouseButton::Left, context.click_at(0))
                         .child(format!("![{alt}]({source_label})"))
                         .into_any_element(),
                 );
@@ -4532,6 +4756,10 @@ fn render_inline_paragraph(
         let active = cursor == Some(offset)
             || selection.is_some_and(|(from, to)| from <= offset && offset <= to);
         let child = match atom {
+            InlineAtom::Image(image) if crate::remote::is_remote(&image.source) => div()
+                .pt(px(ascent - 24.0))
+                .child(remote_image(context, &image.source, &image.alt, true))
+                .into_any_element(),
             InlineAtom::Image(image) => {
                 let alt = image.alt.clone();
                 let source = image.source.clone();

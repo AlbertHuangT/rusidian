@@ -5230,6 +5230,7 @@ dependencies = [
  "ratex-parser",
  "ratex-render",
  "ratex-types",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",

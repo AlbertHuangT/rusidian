@@ -23,6 +23,8 @@ ratex-layout = "=0.1.14"
 ratex-parser = "=0.1.14"
 ratex-render = { version = "=0.1.14", features = ["embed-fonts"] }
 ratex-types = "=0.1.14"
+# Already built for the updater; used to fetch remote images the user chooses to load.
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 # Keep RaTeX fonts self-contained in debug builds, too (feature unification).
 rust-embed = { version = "8.12.0", features = ["debug-embed"] }
 serde = { version = "1.0.229", features = ["derive"] }

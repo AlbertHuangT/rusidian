@@ -14,6 +14,8 @@ pub struct Settings {
     pub appearance: Appearance,
     /// Recently opened files and folders, newest first.
     pub recent: Vec<PathBuf>,
+    /// Vaults whose remote images load without asking each time.
+    pub remote_image_vaults: Vec<PathBuf>,
 }
 
 const RECENT_LIMIT: usize = 10;
@@ -81,6 +83,7 @@ mod tests {
                 auto_update: true,
                 appearance: Appearance::System,
                 recent: Vec::new(),
+                remote_image_vaults: Vec::new(),
             }
         );
         update_at(&path, |settings| settings.appearance = Appearance::Dark).unwrap();
