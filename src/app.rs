@@ -52,7 +52,8 @@ actions!(
         QuickSwitcher,
         SearchVault,
         EnterSourceNormal,
-        CopySelection
+        CopySelection,
+        RenameNote
     ]
 );
 
@@ -98,6 +99,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", EnterSourceNormal, Some("Reading")),
         // The source view leaves copying to Neovim.
         KeyBinding::new(&format!("{modifier}-c"), CopySelection, Some("Reading")),
+        KeyBinding::new("f2", RenameNote, Some("Reading")),
     ]
 }
 
@@ -136,6 +138,7 @@ pub fn run(initial_path: Option<PathBuf>) {
                 MenuItem::action("在笔记中搜索…", SearchVault),
                 MenuItem::action("打开文件…", OpenFile),
                 MenuItem::action("打开文件夹…", OpenFolder),
+                MenuItem::action("重命名笔记…", RenameNote),
                 MenuItem::separator(),
                 MenuItem::action("关闭标签", CloseTab),
                 MenuItem::action("关闭窗口", CloseWindow),
@@ -642,6 +645,8 @@ struct Switcher {
     hits: Vec<TextHit>,
     /// For the query `#`: every tag and how many notes use it.
     tags: Vec<(String, usize)>,
+    /// Renaming the note shown: the query is its new name.
+    rename: bool,
     /// Counts searches, so a slower earlier one cannot replace newer results.
     generation: u64,
 }
@@ -1529,6 +1534,150 @@ impl RusidianApp {
         cx.notify();
     }
 
+    /// Ask for a new name for the note shown, starting from its current one.
+    fn show_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self
+            .document
+            .as_ref()
+            .filter(|document| document.is_markdown)
+        else {
+            return;
+        };
+        let name = document
+            .file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.settings_open = false;
+        self.marked_text.clear();
+        self.switcher = Some(Switcher {
+            query: name,
+            rename: true,
+            ..Switcher::default()
+        });
+        cx.notify();
+    }
+
+    /// Rename the note shown to `name` beside it, and update the links to it in the vault's
+    /// notes, as Obsidian does. Notes with unsaved changes here are left alone and named.
+    fn rename_note(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        let Some(document) = &self.document else {
+            return;
+        };
+        let old = document.file.clone();
+        if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+            self.show_notice(
+                "笔记名称不能为空，不能以 . 开头，也不能包含 / 或 \\",
+                true,
+                cx,
+            );
+            return;
+        }
+        if !document.on_disk {
+            self.show_notice("这篇笔记还没有保存：先用 :w 保存，再重命名", true, cx);
+            return;
+        }
+        if self.modified {
+            self.show_notice("这篇笔记有未保存的修改：先用 :w 保存，再重命名", true, cx);
+            return;
+        }
+        let Some(nvim) = &self.nvim else {
+            self.show_notice("Neovim 未运行，无法重命名", true, cx);
+            return;
+        };
+        let new = old.with_file_name(format!("{name}.md"));
+        if new == old {
+            return;
+        }
+        // Only a change of case may land on the same file (on a case-insensitive disk).
+        let same = new.exists() && same_file(&new, &old);
+        if new.exists() && !same {
+            self.show_notice(format!("已有同名笔记：{name}.md"), true, cx);
+            return;
+        }
+        // Links are found before the note moves, while they still resolve to it.
+        let stem = old
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let files = match &self.vault {
+            Some(vault) => vault
+                .files
+                .iter()
+                .filter(|path| crate::vault::is_markdown(path))
+                .cloned()
+                .collect(),
+            None => vec![old.clone()],
+        };
+        let mut rewrites = Vec::new();
+        let mut skipped = Vec::new();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !text.to_lowercase().contains(&stem) {
+                continue;
+            }
+            let (text, links) =
+                crate::vault::retarget_links(&text, &path, self.vault.as_ref(), &old, name);
+            if links == 0 {
+                continue;
+            }
+            if self
+                .open_buffers
+                .iter()
+                .any(|(open, modified)| *modified && same_file(open, &path))
+            {
+                skipped.push(display_name(&path));
+                continue;
+            }
+            rewrites.push((path, text, links));
+        }
+        if let Err(error) = std::fs::rename(&old, &new) {
+            self.show_notice(format!("无法重命名：{error}"), true, cx);
+            return;
+        }
+        // Moved on purpose: no warning that it went missing before Neovim follows.
+        if let Some(document) = &mut self.document {
+            document.on_disk = false;
+        }
+        let (mut notes, mut links) = (0, 0);
+        for (path, text, count) in rewrites {
+            // The note's own links to itself moved with it.
+            let path = if path == old { new.clone() } else { path };
+            match write_replacing(&path, &text) {
+                Ok(()) => {
+                    notes += 1;
+                    links += count;
+                }
+                Err(_) => skipped.push(display_name(&path)),
+            }
+        }
+        // Neovim follows: the renamed file in place of the old buffer, other notes reloaded.
+        nvim.edit(new.clone());
+        // Where only the case changed, Neovim sees one buffer for both names: keep it.
+        if !same {
+            nvim.close_buffer(old);
+        }
+        nvim.check_time();
+        self.switcher = None;
+        self.refresh_vault(cx);
+        let mut message = format!("已重命名为 {name}");
+        if links > 0 {
+            message.push_str(&format!("，更新了 {notes} 篇笔记中的 {links} 个链接"));
+        }
+        if !skipped.is_empty() {
+            message.push_str(&format!(
+                "；{} 有未保存的修改或无法写入，其中的链接未更新",
+                skipped.join("、")
+            ));
+        }
+        self.show_notice(message, !skipped.is_empty(), cx);
+    }
+
     /// The notes the switcher searches: the vault's, or recent files without a vault.
     fn switcher_files(&self) -> Vec<PathBuf> {
         match &self.vault {
@@ -1545,6 +1694,7 @@ impl RusidianApp {
     /// Rows the switcher lists now.
     fn switcher_rows(&self) -> usize {
         match &self.switcher {
+            Some(switcher) if switcher.rename => 0,
             Some(switcher) if switcher.text && switcher.query.trim() == ALL_TAGS => {
                 switcher.tags.len()
             }
@@ -1753,6 +1903,12 @@ impl RusidianApp {
     }
 
     fn open_switcher_selection(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(switcher) = self.switcher.as_ref().filter(|switcher| switcher.rename) {
+            let name = switcher.query.clone();
+            self.rename_note(&name, cx);
+            cx.notify();
+            return;
+        }
         let selected = index
             .or_else(|| self.switcher.as_ref().map(|switcher| switcher.selected))
             .unwrap_or(0);
@@ -4972,6 +5128,7 @@ impl RusidianApp {
         let query = switcher.query.clone();
         let typed = format!("{query}{}", self.marked_text);
         let placeholder = match (switcher.text, self.vault.is_some()) {
+            _ if switcher.rename => "新的笔记名称…",
             (true, true) => "搜索所有笔记的文字…",
             (true, false) => "搜索最近打开的笔记的文字…",
             (false, true) => "输入笔记名称…",
@@ -4991,7 +5148,9 @@ impl RusidianApp {
             .child(div().ml_px().w(px(2.0)).h(px(18.0)).bg(rgb(theme.accent)));
         // Each row: a title (note name), its folder, and for text hits the matching line.
         let all_tags = switcher.text && query.trim() == ALL_TAGS;
-        let entries: Vec<(String, String, Option<String>)> = if all_tags {
+        let entries: Vec<(String, String, Option<String>)> = if switcher.rename {
+            Vec::new()
+        } else if all_tags {
             switcher
                 .tags
                 .iter()
@@ -5092,7 +5251,13 @@ impl RusidianApp {
                     })
             },
         );
-        let status = if !empty {
+        let status = if switcher.rename {
+            Some(if self.vault.is_some() {
+                "重命名这篇笔记，并更新 vault 中链接到它的笔记"
+            } else {
+                "重命名这篇笔记"
+            })
+        } else if !empty {
             None
         } else if query.trim().is_empty() {
             (!switcher.text).then_some("没有可打开的笔记")
@@ -5158,7 +5323,9 @@ impl RusidianApp {
                             .border_color(rgb(theme.border))
                             .text_xs()
                             .text_color(rgb(theme.faint))
-                            .child(if all_tags {
+                            .child(if switcher.rename {
+                                "Enter 重命名 · Esc 取消"
+                            } else if all_tags {
                                 "↑↓ 选择 · Enter 搜索该标签 · Esc 关闭"
                             } else if switcher.text {
                                 "↑↓ 选择 · Enter 打开到该行 · 只输入 # 列出所有标签 · Esc 关闭"
@@ -5451,6 +5618,7 @@ impl RusidianApp {
                         "关闭标签 / 窗口".to_owned(),
                     ),
                     (format!("{command}\\"), "显示或隐藏文件列表".to_owned()),
+                    ("F2".to_owned(), "重命名笔记并更新链接到它的笔记".to_owned()),
                     ("Enter".to_owned(), "编辑：进入 Neovim Normal".to_owned()),
                     (
                         self.reading_key.label().to_owned(),
@@ -6333,6 +6501,7 @@ impl Render for RusidianApp {
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                 this.copy_selection(cx);
             }))
+            .on_action(cx.listener(|this, _: &RenameNote, _, cx| this.show_rename(cx)))
             .on_key_down(cx.listener(Self::key_down))
             .flex()
             .flex_col()
@@ -8061,6 +8230,19 @@ fn same_file(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+/// Write `text` to `path` through a temporary file beside it, so a failed write leaves the
+/// note as it was.
+fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
+    let temporary = path.with_file_name(format!(
+        ".{}.rusidian-tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
 }
 
 fn display_name(path: &Path) -> String {

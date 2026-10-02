@@ -367,6 +367,135 @@ pub fn percent_decode(text: &str) -> String {
     String::from_utf8(decoded).unwrap_or_else(|_| text.to_owned())
 }
 
+/// Point the links in `text` (the note at `note`) that lead to the note at `old` to a note named
+/// `new_name` in the same folder: wikilinks and embeds by name or path, and Markdown links by
+/// relative path, keeping each link's folder, `.md` and fragment. Code is left alone. Returns
+/// the new text and how many links changed.
+pub fn retarget_links(
+    text: &str,
+    note: &Path,
+    vault: Option<&Vault>,
+    old: &Path,
+    new_name: &str,
+) -> (String, usize) {
+    let old = old.canonicalize().unwrap_or_else(|_| old.to_path_buf());
+    let points_to_old = |target: &str| {
+        resolve_target(note, vault, target)
+            .and_then(|path| path.canonicalize().ok())
+            .is_some_and(|path| path == old)
+    };
+    let mut result = String::with_capacity(text.len());
+    let mut count = 0;
+    let mut fence: Option<&str> = None;
+    for line in text.split_inclusive('\n') {
+        let opening = line.trim_start();
+        match fence {
+            Some(marker) => {
+                if opening.starts_with(marker) {
+                    fence = None;
+                }
+                result.push_str(line);
+            }
+            None if opening.starts_with("```") || opening.starts_with("~~~") => {
+                fence = Some(&opening[..3]);
+                result.push_str(line);
+            }
+            None => {
+                let (line, changed) = retarget_line(line, &points_to_old, new_name);
+                result.push_str(&line);
+                count += changed;
+            }
+        }
+    }
+    (result, count)
+}
+
+fn retarget_line(
+    line: &str,
+    points_to_old: &dyn Fn(&str) -> bool,
+    new_name: &str,
+) -> (String, usize) {
+    // Byte ranges inside `code` spans, which are left alone.
+    let ticks: Vec<usize> = line.match_indices('`').map(|(at, _)| at).collect();
+    let in_code = |at: usize| {
+        ticks
+            .chunks(2)
+            .any(|pair| pair.len() == 2 && pair[0] < at && at < pair[1])
+    };
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    // [[target#fragment|alias]] and ![[...]]
+    let mut from = 0;
+    while let Some(open) = line[from..].find("[[") {
+        let start = from + open + 2;
+        let Some(close) = line[start..].find("]]") else {
+            break;
+        };
+        let inside = &line[start..start + close];
+        let target = &inside[..inside.find('|').unwrap_or(inside.len())];
+        let name = &target[..target.find('#').unwrap_or(target.len())];
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !in_code(start) && points_to_old(trimmed) {
+            let at = start + (name.len() - name.trim_start().len());
+            edits.push((at..at + trimmed.len(), renamed(trimmed, new_name, false)));
+        }
+        from = start + close + 2;
+    }
+    // [text](path/to/note.md#fragment "title") and [text](<path with spaces.md>)
+    let mut from = 0;
+    while let Some(open) = line[from..].find("](") {
+        let start = from + open + 2;
+        let rest = &line[start..];
+        let (offset, destination) = match rest.strip_prefix('<') {
+            Some(inner) => (1, &inner[..inner.find('>').unwrap_or(0)]),
+            None => (
+                0,
+                &rest[..rest
+                    .find(|character: char| character == ')' || character.is_whitespace())
+                    .unwrap_or(0)],
+            ),
+        };
+        let path = &destination[..destination.find('#').unwrap_or(destination.len())];
+        if !path.is_empty()
+            && !path.contains("://")
+            && !path.starts_with("mailto:")
+            && !in_code(start)
+            && points_to_old(path)
+        {
+            let at = start + offset;
+            // Angle brackets allow spaces; elsewhere they are written %20.
+            let encoded = offset == 0;
+            edits.push((at..at + path.len(), renamed(path, new_name, encoded)));
+        }
+        from = start + destination.len().max(1);
+    }
+    let count = edits.len();
+    let mut line = line.to_owned();
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, replacement) in edits {
+        line.replace_range(range, &replacement);
+    }
+    (line, count)
+}
+
+/// A link target to the old note with its name replaced, keeping its folder and `.md`.
+fn renamed(target: &str, new_name: &str, encoded: bool) -> String {
+    let (folder, file) = match target.rfind('/') {
+        Some(slash) => target.split_at(slash + 1),
+        None => ("", target),
+    };
+    let suffix = if file.to_lowercase().ends_with(".md") {
+        &file[file.len() - 3..]
+    } else {
+        ""
+    };
+    let name = if encoded {
+        new_name.replace('%', "%25").replace(' ', "%20")
+    } else {
+        new_name.to_owned()
+    };
+    format!("{folder}{name}{suffix}")
+}
+
 pub fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -469,6 +598,43 @@ fn visit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retargets_links_to_a_renamed_note() {
+        let root = std::env::temp_dir().join(format!("rusidian-rename-{}", std::process::id()));
+        fs::create_dir_all(root.join(".obsidian")).unwrap();
+        fs::create_dir_all(root.join("folder")).unwrap();
+        fs::write(root.join("Old.md"), "# Old").unwrap();
+        fs::write(root.join("Older.md"), "# Older").unwrap();
+        fs::write(root.join("folder/other.md"), "").unwrap();
+        let root = root.canonicalize().unwrap();
+        let vault = Vault::open(&root).unwrap();
+        let old = root.join("Old.md");
+        let retarget = |note: &str, text: &str| {
+            retarget_links(text, &root.join(note), Some(&vault), &old, "New name")
+        };
+        let text = "See [[Old]], [[old|alias]], [[Old#Heading]] and ![[Old.md]].\n\
+                    Not [[Older]], `[[Old]]` or [web](https://x.org/Old.md).\n\
+                    ```\n[[Old]]\n```\n\
+                    [md](Old.md#part) and [angle](<Old.md>).\n";
+        let (changed, count) = retarget("folder/../Older.md", text);
+        assert_eq!(count, 6);
+        assert_eq!(
+            changed,
+            "See [[New name]], [[New name|alias]], [[New name#Heading]] and ![[New name.md]].\n\
+             Not [[Older]], `[[Old]]` or [web](https://x.org/Old.md).\n\
+             ```\n[[Old]]\n```\n\
+             [md](New%20name.md#part) and [angle](<New name.md>).\n"
+        );
+        // Relative Markdown links from another folder keep their path.
+        let (changed, count) = retarget("folder/other.md", "[up](../Old.md) [[Old]]");
+        assert_eq!(
+            (changed.as_str(), count),
+            ("[up](../New%20name.md) [[New name]]", 2)
+        );
+        assert_eq!(retarget("Older.md", "no links").1, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn scans_markdown_without_vault_state() {
