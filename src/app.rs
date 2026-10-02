@@ -2019,6 +2019,10 @@ impl RusidianApp {
         if !self.place_reading_cursor(block, offset) {
             return;
         }
+        if let Some(tag) = self.current_tag() {
+            self.search_tag(tag, cx);
+            return;
+        }
         if let Some(destination) = self.current_link() {
             if is_external_link(&destination) {
                 cx.open_url(&destination);
@@ -2694,6 +2698,31 @@ impl RusidianApp {
             .map(|link| link.destination.clone())
     }
 
+    /// The `#tag` under the reading cursor.
+    fn current_tag(&self) -> Option<String> {
+        let block = self
+            .document
+            .as_ref()?
+            .markdown
+            .blocks
+            .get(self.reading_cursor.block)?;
+        let byte = text_range(&block.text, self.reading_cursor.offset)?.start;
+        block
+            .spans
+            .iter()
+            .find(|span| span.tag && span.range.contains(&byte))
+            .map(|span| block.text[span.range.clone()].to_owned())
+    }
+
+    /// Search all notes for a tag, as Obsidian's tag search does.
+    fn search_tag(&mut self, tag: String, cx: &mut Context<Self>) {
+        self.show_switcher(true, cx);
+        if let Some(switcher) = &mut self.switcher {
+            switcher.query = tag;
+        }
+        self.search_text(cx);
+    }
+
     /// What `gf` and `gx` open: the link under the cursor, or the embedded note or image the
     /// cursor is on. Clicking only follows links, so clicking an image does not open it.
     fn cursor_target(&self) -> Option<String> {
@@ -2712,6 +2741,10 @@ impl RusidianApp {
     }
 
     fn open_internal_link(&mut self, cx: &mut Context<Self>) {
+        if let Some(tag) = self.current_tag() {
+            self.search_tag(tag, cx);
+            return;
+        }
         let Some(destination) = self.cursor_target() else {
             self.show_notice("光标处没有链接", false, cx);
             return;

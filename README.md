@@ -99,7 +99,7 @@ cargo run --locked -- examples/markdown.md
 | 打开光标处的内部 / 外部链接 | `gf` / `gx`，或直接点击 | 同左 |
 | 切换标签 | `⌘ {` / `⌘ }`、`Ctrl+Tab` | `Ctrl+PageUp/PageDown`、`Ctrl+Tab` |
 | 快速打开笔记（按名称模糊查找） | `⌘ P` | `Ctrl+P` |
-| 在所有笔记中搜索文字 | `⌘ ⇧ F` | `Ctrl+Shift+F` |
+| 在所有笔记中搜索文字（点击 `#标签` 或在标签上按 `gf` 搜索该标签） | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | 新建窗口 | `⌘ N` | `Ctrl+N` |
 | 关闭标签 / 窗口 | `⌘ W` / `⌘ ⇧ W` | `Ctrl+W` / `Ctrl+Shift+W` |
 | 显示 / 隐藏文件列表 | `⌘ \` | `Ctrl+\` |
