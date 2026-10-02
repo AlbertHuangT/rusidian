@@ -1136,9 +1136,12 @@ impl Grid {
             return;
         };
         let old = self.cells.clone();
+        // Clamp to the grid so a region sent around a resize cannot index past it.
+        let bottom = bottom.min(self.height).min(old.len());
+        let right = right.min(self.width);
 
-        for row in top..bottom.min(self.height) {
-            for column in left..right.min(self.width) {
+        for row in top..bottom {
+            for column in left..right {
                 let source_row = row as i64 + rows;
                 let source_column = column as i64 + columns;
                 // Rows scrolled in from outside the region are left for Neovim to redraw.
@@ -1146,6 +1149,8 @@ impl Grid {
                     && source_row < bottom as i64
                     && source_column >= left as i64
                     && source_column < right as i64
+                    && column < self.cells[row].len()
+                    && (source_column as usize) < old[source_row as usize].len()
                 {
                     self.cells[row][column] =
                         old[source_row as usize][source_column as usize].clone();
@@ -1393,6 +1398,29 @@ mod tests {
             close_refusal("Error processing request: 0 - 'Vim(qall):E999: Other'"),
             "Neovim 未能关闭：E999: Other"
         );
+    }
+
+    #[test]
+    fn ignores_scroll_regions_outside_the_grid() {
+        let mut grid = Grid::default();
+        grid.apply_redraw(&[Value::Array(vec![
+            "grid_resize".into(),
+            Value::Array(vec![1.into(), 4.into(), 2.into()]),
+        ])]);
+        // A region taller and wider than the grid must not panic.
+        grid.apply_redraw(&[Value::Array(vec![
+            "grid_scroll".into(),
+            Value::Array(vec![
+                1.into(),
+                0.into(),
+                9.into(),
+                0.into(),
+                9.into(),
+                1.into(),
+                0.into(),
+            ]),
+        ])]);
+        assert_eq!(grid.size(), (4, 2));
     }
 
     #[test]
