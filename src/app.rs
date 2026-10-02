@@ -2582,9 +2582,14 @@ impl Render for RusidianApp {
             ),
         );
         let reading = if let Some(document) = &self.document {
-            let links = Links {
-                note: &document.file,
-                vault: self.vault.as_ref(),
+            let context = RenderContext {
+                theme: &theme,
+                math: &self.math,
+                text_baseline,
+                links: Links {
+                    note: &document.file,
+                    vault: self.vault.as_ref(),
+                },
             };
             let selection = self.reading_selection.and_then(|selection| {
                 selection_bounds(&document.markdown.blocks, selection, self.reading_cursor)
@@ -2623,12 +2628,9 @@ impl Render for RusidianApp {
                                 .max_w(px(820.0))
                                 .when(table_end, |element| element.mb_4())
                                 .child(render_block(
-                                    &theme,
+                                    context,
                                     block,
                                     self.tikz.get(&block.text),
-                                    &self.math,
-                                    text_baseline,
-                                    links,
                                     (reading_cursor.block == index)
                                         .then_some(reading_cursor.offset),
                                     selection.and_then(|bounds| {
@@ -2946,16 +2948,24 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
     }
 }
 
+/// Inputs shared by every block in one render of the reading view.
+#[derive(Clone, Copy)]
+struct RenderContext<'a> {
+    theme: &'a Theme,
+    math: &'a HashMap<(String, bool), MathState>,
+    text_baseline: f32,
+    links: Links<'a>,
+}
+
 fn render_block(
-    theme: &Theme,
+    context: RenderContext,
     block: &Block,
     tikz: Option<&TikzState>,
-    math: &HashMap<(String, bool), MathState>,
-    text_baseline: f32,
-    links: Links,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
+    let theme = context.theme;
+    let links = context.links;
     let object_cursor = (cursor.is_some() || selection.is_some()) && is_object(block);
     let text = styled_fragment(theme, block, 0..block.text.len(), cursor, selection);
 
@@ -2972,10 +2982,10 @@ fn render_block(
             .child(text)
             .into_any_element(),
         BlockKind::Paragraph if !block.images.is_empty() => {
-            render_inline_paragraph(theme, block, math, text_baseline, links, cursor, selection)
+            render_inline_paragraph(context, block, cursor, selection)
         }
         BlockKind::Paragraph if !block.maths.is_empty() => {
-            render_inline_paragraph(theme, block, math, text_baseline, links, cursor, selection)
+            render_inline_paragraph(context, block, cursor, selection)
         }
         BlockKind::Paragraph => div().mb_4().child(text).into_any_element(),
         BlockKind::Image(source) => {
@@ -3120,7 +3130,7 @@ fn render_block(
                     ))
             }))
             .into_any_element(),
-        BlockKind::Math => match math.get(&(block.text.clone(), true)) {
+        BlockKind::Math => match context.math.get(&(block.text.clone(), true)) {
             Some(MathState::Ready(formula)) => div()
                 .mb_4()
                 .p_4()
@@ -3349,6 +3359,7 @@ fn inline_extents(
     (ascent, descent)
 }
 
+/// Push wrappable text pieces of `range`; `(top, height)` aligns them on the shared baseline.
 fn push_inline_text(
     theme: &Theme,
     children: &mut Vec<AnyElement>,
@@ -3356,8 +3367,7 @@ fn push_inline_text(
     range: std::ops::Range<usize>,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
-    top: f32,
-    height: f32,
+    (top, height): (f32, f32),
 ) {
     let text = &block.text[range.clone()];
     let mut start = 0;
@@ -3392,14 +3402,17 @@ fn push_inline_text(
 }
 
 fn render_inline_paragraph(
-    theme: &Theme,
+    context: RenderContext,
     block: &Block,
-    math: &HashMap<(String, bool), MathState>,
-    text_baseline: f32,
-    links: Links,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
 ) -> AnyElement {
+    let RenderContext {
+        theme,
+        math,
+        text_baseline,
+        links,
+    } = context;
     let (ascent, descent) = inline_extents(block, math, text_baseline);
     let row_height = ascent + descent;
     let mut children = Vec::new();
@@ -3426,8 +3439,7 @@ fn render_inline_paragraph(
                 start..range.start,
                 cursor,
                 selection,
-                ascent - text_baseline,
-                row_height,
+                (ascent - text_baseline, row_height),
             );
         }
         let offset = block.text[..range.start]
@@ -3494,8 +3506,7 @@ fn render_inline_paragraph(
             start..block.text.len(),
             cursor,
             selection,
-            ascent - text_baseline,
-            row_height,
+            (ascent - text_baseline, row_height),
         );
     }
     div()
